@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 
@@ -187,6 +188,29 @@ class FakeSender:
         )
 
 
+class TrackingSender:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str]] = []
+        self.active = 0
+        self.max_active = 0
+        self.release = asyncio.Event()
+
+    async def send(self, account: Account, *, model: str, prompt: str) -> LimitWarmupSendResult:
+        self.calls.append((account.id, model))
+        self.active += 1
+        self.max_active = max(self.max_active, self.active)
+        if self.max_active >= 4:
+            self.release.set()
+        await self.release.wait()
+        await asyncio.sleep(0)
+        self.active -= 1
+        return LimitWarmupSendResult(
+            request_id=f"warmup-{len(self.calls)}",
+            success=True,
+            latency_ms=12,
+        )
+
+
 @pytest.mark.asyncio
 async def test_reset_confirmed_candidate_sends_one_warmup() -> None:
     repo = FakeWarmupRepo()
@@ -216,6 +240,29 @@ async def test_reset_confirmed_candidate_sends_one_warmup() -> None:
     assert len(repo.rows) == 1
     assert repo.rows[0].status == "succeeded"
     assert logs.logs[0]["source"] == "limit_warmup"
+
+
+@pytest.mark.asyncio
+async def test_warmup_sends_use_bounded_concurrency() -> None:
+    repo = FakeWarmupRepo()
+    logs = FakeRequestLogsRepo()
+    sender = TrackingSender()
+    service = LimitWarmupService(repo, logs, sender=sender)
+    accounts = [_account(f"acc_{index}") for index in range(6)]
+
+    await service.run_after_usage_refresh(
+        accounts=accounts,
+        settings=_settings(),
+        before_primary={account.id: _usage(account.id, used_percent=100, reset_at=1000) for account in accounts},
+        before_secondary={},
+        after_primary={account.id: _usage(account.id, used_percent=0, reset_at=2000) for account in accounts},
+        after_secondary={},
+    )
+
+    assert len(sender.calls) == 6
+    assert sender.max_active == 4
+    assert len(logs.logs) == 6
+    assert [row.status for row in repo.rows] == ["succeeded"] * 6
 
 
 @pytest.mark.asyncio

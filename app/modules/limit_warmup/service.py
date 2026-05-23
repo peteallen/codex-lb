@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 import uuid
@@ -30,6 +31,7 @@ LIMIT_WARMUP_HEADER = "x-codex-lb-limit-warmup"
 _DEFAULT_WARMUP_INSTRUCTIONS = "Reply with OK only."
 _TERMINAL_ERROR_EVENTS = {"response.failed", "response.incomplete", "error"}
 _QUOTA_ERROR_CODES = {"insufficient_quota", "quota_exceeded", "rate_limit_exceeded", "usage_limit_reached"}
+_MAX_CONCURRENT_WARMUP_SENDS = 4
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,6 +41,15 @@ class LimitWarmupSendResult:
     latency_ms: int
     usage: ResponseUsage | None = None
     error_code: str | None = None
+    error_message: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class LimitWarmupSendOutcome:
+    attempt: AccountLimitWarmup
+    account: Account
+    model: str
+    result: LimitWarmupSendResult | None
     error_message: str | None = None
 
 
@@ -104,12 +115,16 @@ class StreamingLimitWarmupSender:
         self._accounts_repo = accounts_repo
         self._auth_manager = AuthManager(accounts_repo)
         self._encryptor = TokenEncryptor()
+        self._auth_lock = asyncio.Lock()
 
     async def send(self, account: Account, *, model: str, prompt: str) -> LimitWarmupSendResult:
         request_id = f"limit-warmup-{uuid.uuid4().hex}"
         started = time.monotonic()
         try:
-            fresh_account = await self._auth_manager.ensure_fresh(account)
+            async with self._auth_lock:
+                fresh_account = await self._auth_manager.ensure_fresh(account)
+                access_token = self._encryptor.decrypt(fresh_account.access_token_encrypted)
+                chatgpt_account_id = fresh_account.chatgpt_account_id
         except RefreshError as exc:
             return LimitWarmupSendResult(
                 request_id=request_id,
@@ -145,7 +160,6 @@ class StreamingLimitWarmupSender:
             LIMIT_WARMUP_HEADER: "1",
             "user-agent": "codex-lb-limit-warmup",
         }
-        access_token = self._encryptor.decrypt(fresh_account.access_token_encrypted)
         usage: ResponseUsage | None = None
         with override_stream_timeouts(
             connect_timeout_seconds=5.0,
@@ -156,7 +170,7 @@ class StreamingLimitWarmupSender:
                 payload,
                 headers,
                 access_token,
-                fresh_account.chatgpt_account_id,
+                chatgpt_account_id,
                 upstream_stream_transport_override="http",
             ):
                 event = parse_sse_event(event_block)
@@ -225,6 +239,8 @@ class LimitWarmupService:
         sender = self._sender
         if sender is None:
             raise RuntimeError("LimitWarmupService requires a sender")
+        send_tasks: list[asyncio.Task[LimitWarmupSendOutcome]] = []
+        send_semaphore = asyncio.Semaphore(_MAX_CONCURRENT_WARMUP_SENDS)
 
         for account in accounts:
             if not _account_is_safe_candidate(account):
@@ -281,14 +297,23 @@ class LimitWarmupService:
                 if attempt is None:
                     continue
 
-                completed = await self._send_and_complete(
-                    attempt,
-                    account=account,
-                    model=model,
-                    prompt=settings.limit_warmup_prompt,
-                    sender=sender,
+                send_tasks.append(
+                    asyncio.create_task(
+                        self._send_warmup(
+                            attempt,
+                            account=account,
+                            model=model,
+                            prompt=settings.limit_warmup_prompt,
+                            sender=sender,
+                            semaphore=send_semaphore,
+                        )
+                    )
                 )
-                latest_attempts[account.id] = completed or attempt
+
+        for send_task in asyncio.as_completed(send_tasks):
+            outcome = await send_task
+            completed = await self._complete_warmup(outcome)
+            latest_attempts[outcome.account.id] = completed or outcome.attempt
 
     def _resolve_model(self, configured_model: str, account: Account) -> str | None:
         normalized = configured_model.strip()
@@ -314,7 +339,7 @@ class LimitWarmupService:
             return None
         return min(candidates, key=lambda item: (item[0], item[1]))[1]
 
-    async def _send_and_complete(
+    async def _send_warmup(
         self,
         attempt: AccountLimitWarmup,
         *,
@@ -322,25 +347,39 @@ class LimitWarmupService:
         model: str,
         prompt: str,
         sender: LimitWarmupSender,
-    ) -> AccountLimitWarmup | None:
+        semaphore: asyncio.Semaphore,
+    ) -> LimitWarmupSendOutcome:
         try:
-            result = await sender.send(account, model=model, prompt=prompt)
+            async with semaphore:
+                result = await sender.send(account, model=model, prompt=prompt)
         except Exception as exc:
             logger.warning(
                 "Limit warm-up send failed account_id=%s window=%s", account.id, attempt.window, exc_info=True
             )
-            completed_at = utcnow()
-            return await self._warmup_repo.complete_attempt(
-                attempt.id,
-                status="failed",
-                completed_at=completed_at,
-                error_code="warmup_send_failed",
-                error_message=_truncate(str(exc)),
+            return LimitWarmupSendOutcome(
+                attempt=attempt,
+                account=account,
+                model=model,
+                result=None,
+                error_message=str(exc),
             )
 
+        return LimitWarmupSendOutcome(attempt=attempt, account=account, model=model, result=result)
+
+    async def _complete_warmup(self, outcome: LimitWarmupSendOutcome) -> AccountLimitWarmup | None:
+        if outcome.result is None:
+            return await self._warmup_repo.complete_attempt(
+                outcome.attempt.id,
+                status="failed",
+                completed_at=utcnow(),
+                error_code="warmup_send_failed",
+                error_message=_truncate(outcome.error_message),
+            )
+
+        result = outcome.result
         await self._record_request_log(
-            account=account,
-            model=model,
+            account=outcome.account,
+            model=outcome.model,
             result=result,
         )
         status = "succeeded" if result.success else "failed"
@@ -348,7 +387,7 @@ class LimitWarmupService:
         if error_code in _QUOTA_ERROR_CODES:
             error_code = "quota_still_exhausted"
         return await self._warmup_repo.complete_attempt(
-            attempt.id,
+            outcome.attempt.id,
             status=status,
             completed_at=utcnow(),
             error_code=error_code,
