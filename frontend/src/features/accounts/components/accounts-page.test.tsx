@@ -93,6 +93,8 @@ describe("AccountsPage", () => {
       resumeMutation: idleMutation(),
       deleteMutation: idleMutation(),
       exportMutation: idleMutation(),
+      setAliasMutation: idleMutation(),
+      limitWarmupMutation: idleMutation(),
       updateMutation: idleMutation(),
     } as unknown as ReturnType<typeof useAccounts>);
 
