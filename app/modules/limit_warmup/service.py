@@ -347,29 +347,34 @@ class LimitWarmupService:
                     raise completion_error
         finally:
             if pending_send_tasks:
-                finished_send_tasks = {send_task for send_task in pending_send_tasks if send_task.done()}
-                pending_send_tasks -= finished_send_tasks
-                for send_task in finished_send_tasks:
-                    try:
-                        outcome = await send_task
-                        completed = await self._complete_warmup(outcome)
-                    except Exception:
-                        await self._mark_aborted_warmup(
-                            send_tasks[send_task],
-                            error_code="warmup_completion_failed",
-                            error_message="Limit warm-up completion failed",
-                        )
-                        continue
-                    latest_attempts[outcome.account.id] = completed or outcome.attempt
-
                 for send_task in pending_send_tasks:
                     send_task.cancel()
-                await asyncio.gather(*pending_send_tasks, return_exceptions=True)
-                for send_task in pending_send_tasks:
+                drained_results = await asyncio.gather(*pending_send_tasks, return_exceptions=True)
+                for send_task, drained_result in zip(pending_send_tasks, drained_results, strict=True):
+                    if isinstance(drained_result, LimitWarmupSendOutcome):
+                        try:
+                            completed = await self._complete_warmup(drained_result)
+                        except Exception:
+                            await self._mark_aborted_warmup(
+                                drained_result.attempt,
+                                error_code="warmup_completion_failed",
+                                error_message="Limit warm-up completion failed",
+                            )
+                            continue
+                        latest_attempts[drained_result.account.id] = completed or drained_result.attempt
+                        continue
                     await self._mark_aborted_warmup(
                         send_tasks[send_task],
-                        error_code="warmup_cancelled",
-                        error_message="Limit warm-up cancelled after another warm-up completion failed",
+                        error_code=(
+                            "warmup_cancelled"
+                            if isinstance(drained_result, asyncio.CancelledError)
+                            else "warmup_send_failed"
+                        ),
+                        error_message=(
+                            "Limit warm-up cancelled after another warm-up completion failed"
+                            if isinstance(drained_result, asyncio.CancelledError)
+                            else _truncate(str(drained_result))
+                        ),
                     )
 
     def _resolve_model(self, configured_model: str, account: Account) -> str | None:
