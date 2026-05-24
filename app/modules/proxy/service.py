@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import gzip
+import inspect
 import json
 import logging
 import math
@@ -2033,7 +2034,7 @@ class ProxyService:
             excluded_account_ids: set[str] = set()
             require_security_work_authorized = False
             for _account_attempt in range(_COMPACT_MAX_ACCOUNT_ATTEMPTS):
-                selection = await self._select_account_with_budget(
+                selection = await self._select_account_with_budget_compatible(
                     deadline,
                     request_id=request_id,
                     kind="compact",
@@ -2395,7 +2396,7 @@ class ProxyService:
         request_kind = f"thread_goal_{operation}"
 
         try:
-            selection = await self._select_account_with_budget(
+            selection = await self._select_account_with_budget_compatible(
                 deadline,
                 request_id=request_id,
                 kind=request_kind,
@@ -2507,7 +2508,7 @@ class ProxyService:
                         except ProxyResponseError as retry_exc:
                             await self._handle_proxy_error(account, retry_exc)
                             if retry_exc.status_code == 401:
-                                selection = await self._select_account_with_budget(
+                                selection = await self._select_account_with_budget_compatible(
                                     deadline,
                                     request_id=request_id,
                                     kind=request_kind,
@@ -2606,7 +2607,7 @@ class ProxyService:
         request_kind = f"codex_control_{path.strip('/').replace('/', '_')}"
 
         try:
-            selection = await self._select_account_with_budget(
+            selection = await self._select_account_with_budget_compatible(
                 deadline,
                 request_id=request_id,
                 kind=request_kind,
@@ -2925,7 +2926,7 @@ class ProxyService:
                 except ProxyResponseError as retry_exc:
                     await self._handle_proxy_error(account, retry_exc)
                     if retry_exc.status_code == 401:
-                        selection = await self._select_account_with_budget(
+                        selection = await self._select_account_with_budget_compatible(
                             deadline,
                             request_id=request_id,
                             kind="transcribe",
@@ -3250,7 +3251,7 @@ class ProxyService:
         prefer_earlier_reset = settings.prefer_earlier_reset_accounts
         routing_strategy = _routing_strategy(settings)
         try:
-            selection = await self._select_account_with_budget(
+            selection = await self._select_account_with_budget_compatible(
                 deadline,
                 request_id=request_id,
                 kind=kind,
@@ -4603,7 +4604,7 @@ class ProxyService:
         defer_no_account_error: bool = False,
     ) -> Account | None:
         try:
-            selection = await self._select_account_with_budget(
+            selection = await self._select_account_with_budget_compatible(
                 deadline,
                 request_id=request_state.request_log_id or request_state.request_id,
                 kind="websocket",
@@ -5026,6 +5027,24 @@ class ProxyService:
                 if _http_bridge_request_counts_against_queue(request_state)
             )
             return max(visible_pending_count, session.queued_request_count)
+
+    async def _select_account_with_budget_compatible(
+        self,
+        deadline: float,
+        **kwargs: object,
+    ) -> AccountSelection:
+        select_account = self._select_account_with_budget
+        select_account_any = cast(Any, select_account)
+        try:
+            signature = inspect.signature(select_account)
+        except (TypeError, ValueError):
+            return await select_account_any(deadline, **kwargs)
+
+        if any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in signature.parameters.values()):
+            return await select_account_any(deadline, **kwargs)
+
+        supported_kwargs = {name: value for name, value in kwargs.items() if name in signature.parameters}
+        return await select_account_any(deadline, **supported_kwargs)
 
     async def _select_codex_control_account_without_budget(
         self,
@@ -6406,7 +6425,7 @@ class ProxyService:
         retry_same_account_once = preferred_account_id is not None
         preferred_candidate_id = preferred_account_id
         while True:
-            selection = await self._select_account_with_budget(
+            selection = await self._select_account_with_budget_compatible(
                 deadline,
                 request_id=request_state.request_log_id or request_state.request_id,
                 kind="http_bridge",
@@ -7250,7 +7269,7 @@ class ProxyService:
         retry_same_account_once = not skip_same_account
         preferred_candidate_id: str | None = None if skip_same_account else session.account.id
         while True:
-            selection = await self._select_account_with_budget(
+            selection = await self._select_account_with_budget_compatible(
                 deadline,
                 request_id=request_state.request_log_id or request_state.request_id,
                 kind="http_bridge",
@@ -9900,55 +9919,56 @@ class ProxyService:
                     )
                     yield format_sse_event(_proxy_request_timeout_event(request_id))
                     return
-                try:
-                    selection = await self._select_account_with_budget(
-                        deadline,
-                        request_id=request_id,
-                        kind="stream",
-                        api_key=api_key,
-                        sticky_key=affinity.key,
-                        sticky_kind=affinity.kind,
-                        reallocate_sticky=affinity.reallocate_sticky,
-                        sticky_max_age_seconds=affinity.max_age_seconds,
-                        prefer_earlier_reset_accounts=prefer_earlier_reset,
-                        routing_strategy=routing_strategy,
-                        model=payload.model,
-                        exclude_account_ids=excluded_account_ids,
-                        preferred_account_id=preferred_account_id,
-                        require_security_work_authorized=require_security_work_authorized,
-                    )
-                except ProxyResponseError as exc:
-                    error = _parse_openai_error(exc.payload)
-                    error_code = _normalize_error_code(error.code if error else None, error.type if error else None)
-                    error_message = error.message if error else None
-                    if _is_proxy_budget_exhausted_error(exc):
-                        await self._write_stream_preflight_error(
-                            account_id=None,
-                            api_key=api_key,
+                while True:
+                    try:
+                        selection = await self._select_account_with_budget_compatible(
+                            deadline,
                             request_id=request_id,
+                            kind="stream",
+                            api_key=api_key,
+                            sticky_key=affinity.key,
+                            sticky_kind=affinity.kind,
+                            reallocate_sticky=affinity.reallocate_sticky,
+                            sticky_max_age_seconds=affinity.max_age_seconds,
+                            prefer_earlier_reset_accounts=prefer_earlier_reset,
+                            routing_strategy=routing_strategy,
                             model=payload.model,
-                            start=start,
-                            error_code="upstream_request_timeout",
-                            error_message="Proxy request budget exhausted",
-                            reasoning_effort=payload.reasoning.effort if payload.reasoning else None,
-                            service_tier=payload.service_tier,
-                            transport=request_transport,
+                            exclude_account_ids=excluded_account_ids,
+                            preferred_account_id=preferred_account_id,
+                            require_security_work_authorized=require_security_work_authorized,
                         )
-                        yield format_sse_event(_proxy_request_timeout_event(request_id))
+                    except ProxyResponseError as exc:
+                        error = _parse_openai_error(exc.payload)
+                        error_code = _normalize_error_code(error.code if error else None, error.type if error else None)
+                        error_message = error.message if error else None
+                        if error_code == "upstream_unavailable" and error_message == "Proxy request budget exhausted":
+                            await self._write_stream_preflight_error(
+                                account_id=None,
+                                api_key=api_key,
+                                request_id=request_id,
+                                model=payload.model,
+                                start=start,
+                                error_code="upstream_request_timeout",
+                                error_message="Proxy request budget exhausted",
+                                reasoning_effort=payload.reasoning.effort if payload.reasoning else None,
+                                service_tier=payload.service_tier,
+                                transport=request_transport,
+                            )
+                            yield format_sse_event(_proxy_request_timeout_event(request_id))
+                            return
+                        event = response_failed_event(
+                            error_code,
+                            error_message or "Upstream unavailable",
+                            error_type=(error.type or "server_error") if error else "server_error",
+                            response_id=request_id,
+                        )
+                        _apply_error_metadata(event["response"]["error"], error)
+                        yield format_sse_event(event)
                         return
-                    event = response_failed_event(
-                        error_code,
-                        error_message or "Upstream unavailable",
-                        error_type=(error.type or "server_error") if error else "server_error",
-                        response_id=request_id,
-                    )
-                    _apply_error_metadata(event["response"]["error"], error)
-                    yield format_sse_event(event)
-                    return
-                account = selection.account
-                if not account:
+                    account = selection.account
                     if (
-                        require_security_work_authorized
+                        not account
+                        and require_security_work_authorized
                         and selection.error_code == _NO_SECURITY_WORK_AUTHORIZED_ACCOUNTS_CODE
                     ):
                         logger.info(
@@ -9966,6 +9986,8 @@ class ProxyService:
                         )
                         require_security_work_authorized = False
                         continue
+                    break
+                if not account:
                     if require_preferred_account and preferred_account_id is not None:
                         message = "Previous response owner account is unavailable; retry later."
                         _record_continuity_fail_closed(
