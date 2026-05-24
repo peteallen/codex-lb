@@ -15753,6 +15753,82 @@ async def test_inline_http_bridge_image_urls_converts_external_urls(monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_inline_http_bridge_image_urls_rechecks_expanded_payload_size(monkeypatch):
+    original_payload = {
+        "type": "response.create",
+        "model": "gpt-5.5",
+        "input": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_image", "image_url": "https://example.com/photo.png"},
+                ],
+            }
+        ],
+    }
+    expanded_payload = {
+        "type": "response.create",
+        "model": "gpt-5.5",
+        "input": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_image", "image_url": "data:image/png;base64," + ("A" * 256)},
+                ],
+            }
+        ],
+    }
+
+    async def fake_inline(payload_dict, _session, _timeout):
+        assert payload_dict == original_payload
+        return expanded_payload
+
+    class FakeSettings:
+        image_inline_fetch_enabled = True
+        upstream_connect_timeout_seconds = 5.0
+
+    class FakeSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+    text_data = json.dumps(original_payload, ensure_ascii=True, separators=(",", ":"))
+    request_state = proxy_service._WebSocketRequestState(
+        request_id="req_img_size",
+        model="gpt-5.5",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=0.0,
+        awaiting_response_created=True,
+        request_text=text_data,
+    )
+
+    monkeypatch.setattr(proxy_service, "get_settings", lambda: FakeSettings())
+    monkeypatch.setattr(proxy_service, "_inline_input_image_urls", fake_inline)
+    monkeypatch.setattr(proxy_service, "lease_http_session", lambda: FakeSession())
+    monkeypatch.setattr(proxy_service, "_as_image_fetch_session", lambda s: s)
+    monkeypatch.setattr(proxy_service, "_UPSTREAM_RESPONSE_CREATE_WARN_BYTES", 1)
+    monkeypatch.setattr(
+        proxy_service,
+        "_UPSTREAM_RESPONSE_CREATE_MAX_BYTES",
+        len(text_data.encode("utf-8")) + 32,
+    )
+    monkeypatch.setattr(proxy_service, "_write_response_create_dump", lambda *args, **kwargs: None)
+
+    service = proxy_service.ProxyService.__new__(proxy_service.ProxyService)
+    with pytest.raises(proxy_module.ProxyResponseError) as exc_info:
+        await service._inline_http_bridge_image_urls(text_data, request_state)
+
+    assert exc_info.value.status_code == 413
+    assert exc_info.value.failure_phase == "validation"
+    assert request_state.request_text is not None
+    assert "data:image/png;base64," in request_state.request_text
+
+
+@pytest.mark.asyncio
 async def test_inline_http_bridge_image_urls_skips_when_disabled(monkeypatch):
     """When image_inline_fetch_enabled is False, no inlining should happen."""
 

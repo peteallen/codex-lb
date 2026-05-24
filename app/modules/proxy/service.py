@@ -4309,6 +4309,7 @@ class ProxyService:
         if updated_text == text_data:
             return text_data
         request_state.request_text = updated_text
+        _enforce_response_create_size_limit(request_state)
         return updated_text
 
     async def _acquire_request_state_response_create_admission(
