@@ -1849,6 +1849,9 @@ class ProxyService:
                     "HTTP bridge owner relay timed out",
                     error_type="server_error",
                 ),
+                failure_phase="owner_forward",
+                failure_detail="relay_timeout",
+                failure_exception_type=type(exc).__name__,
             ) from exc
         except ProxyResponseError as exc:
             if PROMETHEUS_AVAILABLE and bridge_owner_forward_total is not None:
@@ -1907,6 +1910,9 @@ class ProxyService:
                     "HTTP bridge owner request failed",
                     error_type="server_error",
                 ),
+                failure_phase="owner_forward",
+                failure_detail=str(exc) or "owner_forward_request_failed",
+                failure_exception_type=type(exc).__name__,
             ) from exc
         else:
             if PROMETHEUS_AVAILABLE and bridge_owner_forward_total is not None:
@@ -1945,6 +1951,7 @@ class ProxyService:
         log_status = "error"
         log_error_code: str | None = None
         log_error_message: str | None = None
+        failure_metadata = _RequestLogFailureMetadata()
         response: CompactResponsePayload | None = None
         request_service_tier: str | None = None
         actual_service_tier: str | None = None
@@ -2260,6 +2267,7 @@ class ProxyService:
                 openai_error("upstream_unavailable", "All account attempts exhausted"),
             )
         except ProxyResponseError as exc:
+            failure_metadata = _request_log_failure_metadata(exc)
             error = _parse_openai_error(exc.payload)
             log_error_code = log_error_code or _normalize_error_code(
                 error.code if error else None,
@@ -2292,6 +2300,12 @@ class ProxyService:
                 service_tier=_effective_service_tier(request_service_tier, actual_service_tier),
                 requested_service_tier=request_service_tier,
                 actual_service_tier=actual_service_tier,
+                failure_phase=failure_metadata.failure_phase,
+                failure_detail=failure_metadata.failure_detail,
+                failure_exception_type=failure_metadata.failure_exception_type,
+                upstream_status_code=failure_metadata.upstream_status_code,
+                upstream_error_code=failure_metadata.upstream_error_code,
+                bridge_stage=failure_metadata.bridge_stage,
             )
             _maybe_log_proxy_service_tier_trace(
                 "compact",
@@ -10356,6 +10370,7 @@ class ProxyService:
         status = "success"
         error_code = None
         error_message = None
+        failure_metadata = _RequestLogFailureMetadata()
         response_id = request_id
         usage = None
         saw_text_delta = False
@@ -10695,6 +10710,7 @@ class ProxyService:
                 yield line
         except ProxyResponseError as exc:
             response_create_lease.release()
+            failure_metadata = _request_log_failure_metadata(exc)
             error = _parse_openai_error(exc.payload)
             rewritten_error = _rewrite_previous_response_stream_error(
                 previous_response_id=payload.previous_response_id,
@@ -10776,6 +10792,12 @@ class ProxyService:
                 actual_service_tier=actual_service_tier,
                 latency_first_token_ms=latency_first_token_ms,
                 session_id=session_id,
+                failure_phase=failure_metadata.failure_phase,
+                failure_detail=failure_metadata.failure_detail,
+                failure_exception_type=failure_metadata.failure_exception_type,
+                upstream_status_code=failure_metadata.upstream_status_code,
+                upstream_error_code=failure_metadata.upstream_error_code,
+                bridge_stage=failure_metadata.bridge_stage,
             )
             _maybe_log_proxy_service_tier_trace(
                 "stream",
@@ -10805,6 +10827,12 @@ class ProxyService:
         requested_service_tier: str | None = None,
         actual_service_tier: str | None = None,
         session_id: str | None = None,
+        failure_phase: str | None = None,
+        failure_detail: str | None = None,
+        failure_exception_type: str | None = None,
+        upstream_status_code: int | None = None,
+        upstream_error_code: str | None = None,
+        bridge_stage: str | None = None,
     ) -> None:
         task = asyncio.create_task(
             self._persist_request_log(
@@ -10827,6 +10855,12 @@ class ProxyService:
                 requested_service_tier=requested_service_tier,
                 actual_service_tier=actual_service_tier,
                 session_id=session_id,
+                failure_phase=failure_phase,
+                failure_detail=failure_detail,
+                failure_exception_type=failure_exception_type,
+                upstream_status_code=upstream_status_code,
+                upstream_error_code=upstream_error_code,
+                bridge_stage=bridge_stage,
             ),
             name=f"proxy-request-log-{request_id}",
         )
@@ -10887,6 +10921,12 @@ class ProxyService:
         requested_service_tier: str | None = None,
         actual_service_tier: str | None = None,
         session_id: str | None = None,
+        failure_phase: str | None = None,
+        failure_detail: str | None = None,
+        failure_exception_type: str | None = None,
+        upstream_status_code: int | None = None,
+        upstream_error_code: str | None = None,
+        bridge_stage: str | None = None,
     ) -> None:
         try:
             async with self._repo_factory() as repos:
@@ -10910,6 +10950,12 @@ class ProxyService:
                     status=status,
                     error_code=error_code,
                     error_message=error_message,
+                    failure_phase=failure_phase,
+                    failure_detail=failure_detail,
+                    failure_exception_type=failure_exception_type,
+                    upstream_status_code=upstream_status_code,
+                    upstream_error_code=upstream_error_code,
+                    bridge_stage=bridge_stage,
                 )
         except Exception:
             logger.warning(
@@ -11476,6 +11522,16 @@ def _prepare_websocket_request_state_for_visible_output_replay(
 class _FilePinEntry:
     account_id: str
     expires_at: float
+
+
+@dataclass(frozen=True, slots=True)
+class _RequestLogFailureMetadata:
+    failure_phase: str | None = None
+    failure_detail: str | None = None
+    failure_exception_type: str | None = None
+    upstream_status_code: int | None = None
+    upstream_error_code: str | None = None
+    bridge_stage: str | None = None
 
 
 @dataclass
@@ -12383,6 +12439,28 @@ def _proxy_response_error_code(exc: ProxyResponseError) -> str | None:
     if error is None:
         return None
     return _normalize_error_code(error.code, error.type)
+
+
+def _request_log_failure_metadata(
+    exc: ProxyResponseError,
+    *,
+    bridge_stage: str | None = None,
+) -> _RequestLogFailureMetadata:
+    upstream_error_code = _proxy_response_error_code(exc)
+    resolved_bridge_stage = bridge_stage
+    if resolved_bridge_stage is None and (
+        exc.failure_phase in {"owner_forward", "owner_forward_status"}
+        or upstream_error_code in {"bridge_owner_unreachable", "bridge_owner_forward_failed"}
+    ):
+        resolved_bridge_stage = "owner_forward"
+    return _RequestLogFailureMetadata(
+        failure_phase=exc.failure_phase,
+        failure_detail=exc.failure_detail,
+        failure_exception_type=exc.failure_exception_type,
+        upstream_status_code=exc.upstream_status_code or exc.status_code,
+        upstream_error_code=upstream_error_code,
+        bridge_stage=resolved_bridge_stage,
+    )
 
 
 def _refresh_websocket_request_input_fingerprint_from_text(request_state: _WebSocketRequestState) -> None:
