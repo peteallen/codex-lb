@@ -9941,7 +9941,7 @@ class ProxyService:
                         error = _parse_openai_error(exc.payload)
                         error_code = _normalize_error_code(error.code if error else None, error.type if error else None)
                         error_message = error.message if error else None
-                        if error_code == "upstream_unavailable" and error_message == "Proxy request budget exhausted":
+                        if _is_proxy_budget_exhausted_error(exc):
                             await self._write_stream_preflight_error(
                                 account_id=None,
                                 api_key=api_key,

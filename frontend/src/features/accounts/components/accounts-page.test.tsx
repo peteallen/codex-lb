@@ -93,6 +93,7 @@ describe("AccountsPage", () => {
       resumeMutation: idleMutation(),
       deleteMutation: idleMutation(),
       exportMutation: idleMutation(),
+      exportOpenCodeAuthMutation: idleMutation(),
       setAliasMutation: idleMutation(),
       limitWarmupMutation: idleMutation(),
       updateMutation: idleMutation(),
