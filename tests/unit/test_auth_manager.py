@@ -101,7 +101,7 @@ async def test_ensure_fresh_detached_refresh_owns_session_on_caller_cancel(monke
     started = asyncio.Event()
     release = asyncio.Event()
 
-    async def _fake_refresh(_: str) -> TokenRefreshResult:
+    async def _fake_refresh(_: str, **_kwargs: object) -> TokenRefreshResult:
         started.set()
         await release.wait()
         return TokenRefreshResult(
@@ -168,7 +168,7 @@ async def test_ensure_fresh_detached_refresh_owns_session_on_caller_cancel(monke
 
 @pytest.mark.asyncio
 async def test_refresh_account_preserves_plan_type_when_missing(monkeypatch):
-    async def _fake_refresh(_: str) -> TokenRefreshResult:
+    async def _fake_refresh(_: str, **_kwargs: object) -> TokenRefreshResult:
         return TokenRefreshResult(
             access_token="new-access",
             refresh_token="new-refresh",
@@ -394,7 +394,7 @@ async def test_ensure_fresh_singleflights_concurrent_refreshes(monkeypatch):
     release = asyncio.Event()
     refresh_calls = 0
 
-    async def _fake_refresh(_: str) -> TokenRefreshResult:
+    async def _fake_refresh(_: str, **_kwargs: object) -> TokenRefreshResult:
         nonlocal refresh_calls
         refresh_calls += 1
         started.set()
@@ -446,7 +446,7 @@ async def test_ensure_fresh_singleflights_refresh_admission_for_same_account(mon
     refresh_calls = 0
     admission_calls = 0
 
-    async def _fake_refresh(_: str) -> TokenRefreshResult:
+    async def _fake_refresh(_: str, **_kwargs: object) -> TokenRefreshResult:
         nonlocal refresh_calls
         refresh_calls += 1
         started.set()
@@ -504,7 +504,7 @@ async def test_ensure_fresh_singleflights_refresh_admission_for_same_account(mon
 async def test_ensure_fresh_reuses_recent_failure_without_reissuing_refresh(monkeypatch):
     refresh_calls = 0
 
-    async def _fake_refresh(_: str) -> TokenRefreshResult:
+    async def _fake_refresh(_: str, **_kwargs: object) -> TokenRefreshResult:
         nonlocal refresh_calls
         refresh_calls += 1
         raise RefreshError("invalid_grant", "refresh failed", False)
@@ -544,7 +544,7 @@ async def test_ensure_fresh_reuses_recent_failure_without_reissuing_refresh(monk
 async def test_ensure_fresh_does_not_reuse_recent_transport_failure(monkeypatch):
     refresh_calls = 0
 
-    async def _fake_refresh(_: str) -> TokenRefreshResult:
+    async def _fake_refresh(_: str, **_kwargs: object) -> TokenRefreshResult:
         nonlocal refresh_calls
         refresh_calls += 1
         raise RefreshError("transport_error", "temporary dns failure", False, transport_error=True)
@@ -585,7 +585,7 @@ async def test_ensure_fresh_does_not_reuse_recent_transport_failure(monkeypatch)
 async def test_ensure_fresh_does_not_reuse_failure_after_refresh_token_changes(monkeypatch):
     refresh_calls = 0
 
-    async def _fake_refresh(refresh_token: str) -> TokenRefreshResult:
+    async def _fake_refresh(refresh_token: str, **_kwargs: object) -> TokenRefreshResult:
         nonlocal refresh_calls
         refresh_calls += 1
         raise RefreshError("invalid_grant", f"refresh failed for {refresh_token}", False)
@@ -627,7 +627,7 @@ async def test_ensure_fresh_does_not_reuse_failure_after_refresh_token_changes(m
 
 @pytest.mark.asyncio
 async def test_refresh_account_does_not_deactivate_when_repo_has_newer_refresh_token(monkeypatch):
-    async def _fake_refresh(_: str) -> TokenRefreshResult:
+    async def _fake_refresh(_: str, **_kwargs: object) -> TokenRefreshResult:
         raise RefreshError("invalid_grant", "refresh failed", True)
 
     monkeypatch.setattr(auth_manager_module, "refresh_access_token", _fake_refresh)
@@ -662,7 +662,7 @@ async def test_refresh_account_does_not_deactivate_when_repo_has_newer_refresh_t
 
 @pytest.mark.asyncio
 async def test_refresh_account_deactivates_when_repo_only_reencrypted_same_refresh_token(monkeypatch):
-    async def _fake_refresh(_: str) -> TokenRefreshResult:
+    async def _fake_refresh(_: str, **_kwargs: object) -> TokenRefreshResult:
         raise RefreshError("invalid_grant", "refresh failed", True)
 
     monkeypatch.setattr(auth_manager_module, "refresh_access_token", _fake_refresh)
@@ -703,7 +703,7 @@ async def test_refresh_account_deactivates_when_upstream_returns_token_expired(m
     not loop retries forever while the account stays ``ACTIVE``.
     """
 
-    async def _fake_refresh(_: str) -> TokenRefreshResult:
+    async def _fake_refresh(_: str, **_kwargs: object) -> TokenRefreshResult:
         # Real upstream-observed shape: HTTP 4xx body whose error code is
         # ``token_expired`` and message is the user-facing "Provided
         # authentication token is expired" wording. classify_refresh_error
