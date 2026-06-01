@@ -320,9 +320,7 @@ async def connect_responses_websocket(
         proxy_arg: str | bool | None = account_proxy_uri
     elif settings.upstream_websocket_trust_env:
         proxy_env = (
-            settings.upstream_websocket_proxy_env()
-            if hasattr(settings, "upstream_websocket_proxy_env")
-            else os.environ
+            settings.upstream_websocket_proxy_env() if hasattr(settings, "upstream_websocket_proxy_env") else os.environ
         )
         proxy_arg = resolve_websocket_proxy_from_env(url, proxy_env)
     else:
