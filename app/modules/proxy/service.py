@@ -2077,14 +2077,14 @@ class ProxyService:
                         connect_timeout_seconds=remaining_budget,
                         total_timeout_seconds=remaining_budget,
                     )
-                if account_response_create_lease is None:
-                    account_response_create_lease = await self._acquire_account_response_create_lease_or_overload(
-                        account_id=target.id,
-                        request_id=request_id,
-                        surface="compact",
-                    )
                 create_lease: AdmissionLease | None = None
                 try:
+                    if account_response_create_lease is None:
+                        account_response_create_lease = await self._acquire_account_response_create_lease_or_overload(
+                            account_id=target.id,
+                            request_id=request_id,
+                            surface="compact",
+                        )
                     create_lease = await self._get_work_admission().acquire_response_create(compact=True)
                     return await core_compact_responses(payload, filtered, access_token, account_id)
                 finally:
@@ -4666,6 +4666,8 @@ class ProxyService:
                 error = _parse_openai_error(exc.payload)
                 error_code = _normalize_error_code(error.code if error else None, error.type if error else None)
                 error_message = error.message if error else None
+                await self._load_balancer.release_account_lease(selected_stream_lease)
+                selected_stream_lease = None
                 await self._emit_websocket_connect_failure(
                     websocket,
                     client_send_lock=client_send_lock,
@@ -4677,7 +4679,6 @@ class ProxyService:
                     error_code=error_code or "upstream_error",
                     error_message=error_message or "Upstream error",
                 )
-                await self._load_balancer.release_account_lease(selected_stream_lease)
                 return None, None
             except BaseException:
                 await self._load_balancer.release_account_lease(selected_stream_lease)

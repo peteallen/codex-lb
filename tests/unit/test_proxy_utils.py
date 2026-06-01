@@ -6765,6 +6765,56 @@ async def test_connect_proxy_websocket_cancellation_before_handoff_releases_stre
 
 
 @pytest.mark.asyncio
+async def test_connect_proxy_websocket_releases_stream_lease_when_failure_emit_raises(monkeypatch):
+    service = proxy_service.ProxyService(_repo_factory(_RequestLogsRecorder()))
+    account = _make_account("acc_ws_emit_failure_release")
+    request_state = proxy_service._WebSocketRequestState(
+        request_id="ws_req_emit_failure_release",
+        model="gpt-5.1",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=0.0,
+    )
+    selected_lease = await service._load_balancer.acquire_account_lease(account.id, kind="stream")
+
+    async def fake_select_websocket_connect_account(*args: object, **kwargs: object) -> Account:
+        del args, kwargs
+        request_state.websocket_stream_lease = selected_lease
+        return account
+
+    async def failing_connect_attempt(*args: object, **kwargs: object) -> tuple[Account, object]:
+        del args, kwargs
+        raise proxy_module.ProxyResponseError(502, openai_error("upstream_unavailable", "connect failed"))
+
+    async def failing_emit(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise RuntimeError("downstream closed during connect failure emit")
+
+    monkeypatch.setattr(service, "_select_websocket_connect_account", fake_select_websocket_connect_account)
+    monkeypatch.setattr(service, "_try_open_websocket_connect_attempt", failing_connect_attempt)
+    monkeypatch.setattr(service, "_decide_websocket_failover_action", AsyncMock(return_value="emit"))
+    monkeypatch.setattr(service, "_emit_websocket_connect_failure", failing_emit)
+    monkeypatch.setattr(proxy_service, "get_settings", lambda: _make_proxy_settings(log_proxy_service_tier_trace=False))
+
+    with pytest.raises(RuntimeError, match="downstream closed"):
+        await service._connect_proxy_websocket(
+            {},
+            sticky_key=None,
+            sticky_kind=None,
+            prefer_earlier_reset=False,
+            routing_strategy="usage_weighted",
+            model="gpt-5.1",
+            request_state=request_state,
+            api_key=None,
+            client_send_lock=anyio.Lock(),
+            websocket=cast(WebSocket, SimpleNamespace()),
+        )
+
+    assert await service._load_balancer.account_pressure_snapshot(account.id) == (0, 0, 0.0)
+
+
+@pytest.mark.asyncio
 async def test_connect_proxy_websocket_maps_handshake_budget_exhaustion_to_timeout_error(monkeypatch):
     request_logs = _RequestLogsRecorder()
     service = proxy_service.ProxyService(_repo_factory(request_logs))
@@ -14100,6 +14150,44 @@ async def test_compact_responses_account_create_cap_is_local_overload(monkeypatc
     ensure_fresh.assert_not_awaited()
     upstream.assert_not_awaited()
     assert request_logs.calls[0]["error_code"] == "account_response_create_cap"
+
+
+@pytest.mark.asyncio
+async def test_compact_responses_pops_timeout_overrides_when_account_create_cap_raises(monkeypatch):
+    settings = _make_proxy_settings(log_proxy_service_tier_trace=False)
+    settings.proxy_account_response_create_limit = 1
+    settings.upstream_compact_timeout_seconds = None
+    request_logs = _RequestLogsRecorder()
+    service = proxy_service.ProxyService(_repo_factory(request_logs))
+    account = _make_account("acc_compact_timeout_pop_on_cap")
+    timeout_tokens = object()
+    popped_tokens: list[object] = []
+
+    monkeypatch.setattr(proxy_service, "get_settings_cache", lambda: _SettingsCache(settings))
+    monkeypatch.setattr(proxy_service, "get_settings", lambda: settings)
+    monkeypatch.setattr("app.modules.proxy.load_balancer.get_settings", lambda: settings)
+    monkeypatch.setattr(
+        service._load_balancer,
+        "select_account",
+        AsyncMock(return_value=AccountSelection(account=account, error_message=None)),
+    )
+    monkeypatch.setattr(service, "_ensure_fresh", AsyncMock(return_value=account))
+    monkeypatch.setattr(proxy_service, "core_compact_responses", AsyncMock())
+    monkeypatch.setattr(proxy_service, "push_compact_timeout_overrides", lambda **kwargs: timeout_tokens)
+    monkeypatch.setattr(proxy_service, "pop_compact_timeout_overrides", lambda token: popped_tokens.append(token))
+
+    held_lease = await service._load_balancer.acquire_account_lease(account.id, kind="response_create")
+    payload = ResponsesCompactRequest.model_validate({"model": "gpt-5.1", "instructions": "hi", "input": []})
+    try:
+        with pytest.raises(proxy_module.ProxyResponseError) as exc_info:
+            await service.compact_responses(payload, {"session_id": "sid-compact"})
+    finally:
+        await service._load_balancer.release_account_lease(held_lease)
+
+    exc = _assert_proxy_response_error(exc_info.value)
+    assert exc.status_code == 429
+    assert _proxy_error_code(exc) == "account_response_create_cap"
+    assert popped_tokens == [timeout_tokens]
 
 
 @pytest.mark.asyncio
