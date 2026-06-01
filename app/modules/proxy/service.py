@@ -3985,7 +3985,7 @@ class ProxyService:
                     error_message = error.message if error and error.message else "Upstream error"
                     error_type = error.type if error and error.type else "server_error"
                     if request_state is not None:
-                        self._cancel_request_state_api_key_reservation_heartbeat(request_state)
+                        await self._release_websocket_request_state_reservation(request_state)
                         if request_state_registered:
                             async with pending_lock:
                                 if request_state in pending_requests:

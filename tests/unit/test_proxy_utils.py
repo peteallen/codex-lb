@@ -11527,6 +11527,116 @@ async def test_proxy_responses_websocket_masks_prepare_previous_response_not_fou
 
 
 @pytest.mark.asyncio
+async def test_proxy_responses_websocket_releases_reservation_on_local_account_create_cap(monkeypatch):
+    service = proxy_service.ProxyService(_repo_factory(_RequestLogsRecorder()))
+    settings = _make_proxy_settings(log_proxy_service_tier_trace=False)
+    settings.stream_idle_timeout_seconds = 300.0
+    settings.proxy_downstream_websocket_idle_timeout_seconds = 120.0
+    monkeypatch.setattr(proxy_service, "get_settings_cache", lambda: _SettingsCache(settings))
+    monkeypatch.setattr(proxy_service, "get_settings", lambda: settings)
+
+    class _FakeDownstreamWebSocket:
+        def __init__(self, request_text: str) -> None:
+            self._request_text = request_text
+            self._request_sent = False
+            self._done = asyncio.Event()
+            self.sent_text: list[str] = []
+
+        async def receive(self) -> dict[str, object]:
+            if not self._request_sent:
+                self._request_sent = True
+                return {"type": "websocket.receive", "text": self._request_text}
+            await self._done.wait()
+            return {"type": "websocket.disconnect"}
+
+        async def send_text(self, text: str) -> None:
+            self.sent_text.append(text)
+            self._done.set()
+
+        async def send_bytes(self, _data: bytes) -> None:
+            return None
+
+        async def close(self, code: int = 1000, reason: str | None = None) -> None:
+            del code, reason
+            self._done.set()
+
+    request_payload = {
+        "type": "response.create",
+        "model": "gpt-5.1",
+        "instructions": "",
+        "input": [{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+        "stream": True,
+    }
+    request_text = json.dumps(request_payload, separators=(",", ":"))
+    reservation = proxy_service.ApiKeyUsageReservationData(
+        reservation_id="resv_ws_account_cap",
+        key_id="key_ws_account_cap",
+        model="gpt-5.1",
+    )
+    request_state = proxy_service._WebSocketRequestState(
+        request_id="req_ws_account_cap",
+        model="gpt-5.1",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=reservation,
+        started_at=10.0,
+        request_text=request_text,
+        awaiting_response_created=True,
+    )
+    prepared_request = proxy_service._PreparedWebSocketRequest(
+        text_data=request_text,
+        request_state=request_state,
+        affinity_policy=proxy_service._AffinityPolicy(),
+    )
+    release_reservation = AsyncMock()
+    start_heartbeat = MagicMock()
+    upstream = SimpleNamespace(send_text=AsyncMock(), send_bytes=AsyncMock(), close=AsyncMock())
+    account = _make_account("acc_ws_account_cap")
+
+    async def fake_connect_proxy_websocket(*args, **kwargs):
+        del args, kwargs
+        return account, upstream
+
+    async def fail_account_response_create_lease(*args, **kwargs):
+        del args, kwargs
+        raise proxy_module.ProxyResponseError(
+            429,
+            proxy_module.openai_error(
+                "account_response_create_cap",
+                "Account response-create concurrency limit reached",
+                error_type="server_error",
+            ),
+        )
+
+    monkeypatch.setattr(service, "_prepare_websocket_response_create_request", AsyncMock(return_value=prepared_request))
+    monkeypatch.setattr(service, "_connect_proxy_websocket", fake_connect_proxy_websocket)
+    monkeypatch.setattr(service, "_relay_upstream_websocket_messages", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        service, "_acquire_account_response_create_lease_or_overload", fail_account_response_create_lease
+    )
+    monkeypatch.setattr(service, "_release_websocket_reservation", release_reservation)
+    monkeypatch.setattr(service, "_start_request_state_api_key_reservation_heartbeat", start_heartbeat)
+
+    downstream = _FakeDownstreamWebSocket(request_text)
+
+    await service.proxy_responses_websocket(
+        cast(WebSocket, downstream),
+        {},
+        codex_session_affinity=False,
+        openai_cache_affinity=False,
+        api_key=None,
+    )
+
+    release_reservation.assert_awaited_once_with(reservation)
+    start_heartbeat.assert_called_once()
+    upstream.send_text.assert_not_awaited()
+    assert len(downstream.sent_text) == 1
+    payload = json.loads(downstream.sent_text[0])
+    assert payload["type"] == "response.failed"
+    assert payload["response"]["error"]["code"] == "account_response_create_cap"
+
+
+@pytest.mark.asyncio
 async def test_stream_with_retry_releases_api_key_reservation_when_owner_lookup_fails(monkeypatch):
     request_logs = _RequestLogsRecorder()
     get_usage_reservation_mock = AsyncMock(return_value=SimpleNamespace(status="reserved", items=[]))

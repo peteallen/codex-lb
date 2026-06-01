@@ -27,6 +27,14 @@ Every account-local lease acquired for a Responses request MUST be idempotently 
 - **THEN** the account stream lease is released exactly once
 - **AND** later routing pressure no longer includes that stream
 
+#### Scenario: WebSocket local account cap releases API-key reservation
+
+- **GIVEN** a WebSocket `response.create` has reserved API-key usage
+- **AND** account-local response-create lease acquisition fails with `account_response_create_cap`
+- **WHEN** the proxy emits the local terminal failure
+- **THEN** the API-key usage reservation is released
+- **AND** the pending request is removed from websocket local state
+
 #### Scenario: Stale watchdog recovers orphaned lease
 
 - **WHEN** a request task exits unexpectedly after acquiring an account lease
