@@ -11,6 +11,14 @@ For Responses API requests, usage-based routing MUST include immediate in-proces
 - **THEN** selected accounts are distributed according to immediate in-flight pressure and caps
 - **AND** one account does not receive all requests solely because persisted usage was stale
 
+#### Scenario: File-pinned bridge request does not reroute under local pressure
+
+- **GIVEN** an HTTP bridge `/v1/responses` request references an `input_file.file_id` pinned to an upstream account
+- **AND** that owner account or bridge session rejects admission with local pressure before output starts
+- **WHEN** the proxy handles the admission failure
+- **THEN** it returns the owner account overload instead of soft-rerouting the payload to another account
+- **AND** the file-scoped request is not replayed to an account that does not own the file
+
 #### Scenario: Runtime lock excludes blocking I/O
 
 - **WHEN** account selection holds the balancer runtime lock

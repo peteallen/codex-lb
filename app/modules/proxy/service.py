@@ -1348,10 +1348,13 @@ class ProxyService:
                     default_message="Upstream error",
                 )
                 return
-            if _http_bridge_should_attempt_soft_affinity_reroute(
-                exc,
-                key=bridge_session_key,
-                previous_response_id=effective_payload.previous_response_id,
+            if (
+                _http_bridge_should_attempt_soft_affinity_reroute(
+                    exc,
+                    key=bridge_session_key,
+                    previous_response_id=effective_payload.previous_response_id,
+                )
+                and not file_required_preferred_account
             ):
                 _log_http_bridge_event(
                     "internal_soft_affinity_reroute",

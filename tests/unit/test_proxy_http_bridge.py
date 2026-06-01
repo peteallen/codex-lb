@@ -969,6 +969,89 @@ async def test_stream_via_http_bridge_soft_prompt_cache_queue_full_reroutes(
 
 
 @pytest.mark.asyncio
+async def test_stream_via_http_bridge_file_pin_queue_full_does_not_reroute(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    payload = proxy_service.ResponsesRequest.model_validate(
+        {
+            "model": "gpt-5.4",
+            "instructions": "hi",
+            "input": [{"type": "input_file", "file_id": "file_doc"}],
+        }
+    )
+    saturated_session = _make_bridge_session(key_value="file-pin-queue-full", queued_request_count=8)
+    get_or_create = AsyncMock(return_value=saturated_session)
+
+    async def fake_stream_events(
+        session: proxy_service._HTTPBridgeSession,
+        *,
+        request_state: proxy_service._WebSocketRequestState,
+        text_data: str,
+        queue_limit: int,
+        propagate_http_errors: bool,
+        downstream_turn_state: str | None,
+    ):
+        del session, request_state, text_data, queue_limit, propagate_http_errors, downstream_turn_state
+        raise ProxyResponseError(
+            429,
+            proxy_service.openai_error(
+                "bridge_queue_full",
+                "HTTP responses session bridge queue is full",
+                error_type="rate_limit_error",
+            ),
+        )
+        yield ""
+
+    monkeypatch.setattr(
+        proxy_service,
+        "get_settings_cache",
+        lambda: cast(
+            Any,
+            SimpleNamespace(
+                get=AsyncMock(
+                    return_value=SimpleNamespace(
+                        sticky_threads_enabled=False,
+                        openai_cache_affinity_max_age_seconds=1800,
+                        http_responses_session_bridge_prompt_cache_idle_ttl_seconds=3600,
+                        http_responses_session_bridge_gateway_safe_mode=False,
+                    )
+                )
+            ),
+        ),
+    )
+    monkeypatch.setattr(proxy_service, "get_settings", lambda: _make_app_settings())
+    monkeypatch.setattr(service._durable_bridge, "lookup_request_targets", AsyncMock(return_value=None))
+    monkeypatch.setattr(service, "_get_or_create_http_bridge_session", get_or_create)
+    monkeypatch.setattr(service, "_stream_http_bridge_session_events", fake_stream_events)
+
+    with pytest.raises(ProxyResponseError) as info:
+        async for _ in service._stream_via_http_bridge(
+            payload,
+            headers={},
+            codex_session_affinity=False,
+            propagate_http_errors=True,
+            openai_cache_affinity=False,
+            api_key=None,
+            api_key_reservation=None,
+            suppress_text_done_events=False,
+            idle_ttl_seconds=120.0,
+            codex_idle_ttl_seconds=1800.0,
+            max_sessions=8,
+            queue_limit=4,
+            rewritten_file_account_id="acc-file",
+        ):
+            pass
+
+    assert info.value.status_code == 429
+    assert get_or_create.await_count == 1
+    create_call = get_or_create.await_args
+    assert create_call is not None
+    assert create_call.kwargs["preferred_account_id"] == "acc-file"
+    assert create_call.kwargs["fallback_on_preferred_account_unavailable"] is False
+
+
+@pytest.mark.asyncio
 async def test_select_account_with_budget_prefers_durable_account_id_when_available(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
