@@ -13,6 +13,7 @@ import pytest
 import app.modules.oauth.service as oauth_module
 from app.core.auth import generate_unique_account_id
 from app.core.clients.oauth import DeviceCode, OAuthTokens
+from app.core.config.settings import Settings
 from app.core.crypto import TokenEncryptor
 from app.core.utils.time import utcnow
 from app.db.models import Account, AccountStatus
@@ -48,11 +49,15 @@ def _proxy_user_fixture() -> str:
     return "proxy-user-fixture"
 
 
+def _oauth_redirect_test_settings() -> Settings:
+    return cast(Settings, SimpleNamespace(oauth_redirect_uri="http://localhost:1455/auth/callback"))
+
+
 def test_oauth_redirect_uri_uses_callback_host_when_present() -> None:
     assert (
         oauth_module._oauth_redirect_uri(
             "dashboard.example.test",
-            settings=SimpleNamespace(oauth_redirect_uri="http://localhost:1455/auth/callback"),
+            settings=_oauth_redirect_test_settings(),
         )
         == "http://dashboard.example.test:1455/auth/callback"
     )
@@ -62,7 +67,7 @@ def test_oauth_redirect_uri_preserves_configured_uri_without_callback_host() -> 
     assert (
         oauth_module._oauth_redirect_uri(
             None,
-            settings=SimpleNamespace(oauth_redirect_uri="http://localhost:1455/auth/callback"),
+            settings=_oauth_redirect_test_settings(),
         )
         == "http://localhost:1455/auth/callback"
     )
