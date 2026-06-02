@@ -4,6 +4,7 @@ import asyncio
 from collections.abc import Collection
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
 
@@ -11,6 +12,7 @@ import pytest
 
 from app.core.auth.refresh import RefreshError
 from app.core.crypto import TokenEncryptor
+from app.core.upstream_proxy import ResolvedProxyEndpoint, ResolvedUpstreamRoute
 from app.core.usage import refresh_scheduler as refresh_scheduler_module
 from app.core.usage.models import UsagePayload
 from app.db.models import Account, AccountStatus, UsageHistory
@@ -340,6 +342,41 @@ def _make_account(account_id: str, chatgpt_account_id: str, email: str = "a@exam
         status=AccountStatus.ACTIVE,
         deactivation_reason=None,
     )
+
+
+def _route() -> ResolvedUpstreamRoute:
+    return ResolvedUpstreamRoute(
+        mode="account_bound",
+        pool_id="pool_1",
+        endpoint=ResolvedProxyEndpoint("ep_1", "http", "proxy.test", 8080),
+    )
+
+
+@pytest.mark.asyncio
+async def test_usage_updater_passes_resolved_route_to_fetch_usage(monkeypatch: pytest.MonkeyPatch) -> None:
+    account = _make_account("acc_route", "chatgpt_acc_route")
+    repo = StubUsageRepository()
+    updater = UsageUpdater(repo)
+    route = _route()
+    calls: list[dict[str, object]] = []
+
+    async def _fetch_usage(**kwargs: object) -> UsagePayload:
+        calls.append(kwargs)
+        return UsagePayload(plan_type="plus")
+
+    resolve_upstream_route = AsyncMock(return_value=route)
+
+    monkeypatch.setattr(usage_updater_module, "fetch_usage", _fetch_usage)
+    monkeypatch.setattr(usage_updater_module, "resolve_upstream_route", resolve_upstream_route)
+
+    result = await updater._refresh_account(account, usage_account_id=account.chatgpt_account_id)
+
+    assert result.fetch_succeeded is True
+    assert calls[0]["route"] is route
+    assert calls[0]["account_id"] == "chatgpt_acc_route"
+    assert calls[0]["lease_account_id"] == "acc_route"
+    assert resolve_upstream_route.await_args is not None
+    assert resolve_upstream_route.await_args.kwargs["account_id"] == "acc_route"
 
 
 @pytest.mark.asyncio
@@ -1357,11 +1394,22 @@ async def test_usage_updater_deactivates_on_account_invalid_4xx(monkeypatch) -> 
     from app.core.config.settings import get_settings
 
     get_settings.cache_clear()
+    invalidated_accounts: list[str] = []
+    cache_invalidations: list[str] = []
+
+    async def _invalidate_account_client(account_id: str) -> None:
+        invalidated_accounts.append(account_id)
 
     async def stub_fetch_usage_402(**_: Any) -> UsagePayload:
         raise UsageFetchError(402, "Payment Required")
 
     monkeypatch.setattr("app.modules.usage.updater.fetch_usage", stub_fetch_usage_402)
+    monkeypatch.setattr(usage_updater_module, "invalidate_account_client", _invalidate_account_client)
+    monkeypatch.setattr(
+        usage_updater_module,
+        "get_account_selection_cache",
+        lambda: SimpleNamespace(invalidate=lambda: cache_invalidations.append("cache")),
+    )
 
     usage_repo = StubUsageRepository()
     accounts_repo = StubAccountsRepository()
@@ -1378,6 +1426,8 @@ async def test_usage_updater_deactivates_on_account_invalid_4xx(monkeypatch) -> 
     assert update["status"] == AccountStatus.DEACTIVATED
     assert "402" in update["deactivation_reason"]
     assert "Payment Required" in update["deactivation_reason"]
+    assert invalidated_accounts == [acc.id]
+    assert cache_invalidations == ["cache"]
 
 
 @pytest.mark.asyncio
@@ -1442,6 +1492,18 @@ async def test_usage_updater_does_not_deactivate_on_401(monkeypatch) -> None:
         raise UsageFetchError(401, "Unauthorized")
 
     monkeypatch.setattr("app.modules.usage.updater.fetch_usage", stub_fetch_usage_401)
+
+    # Transport-level failure in the token refresh that usage triggers on
+    # 401 — should mark a cooldown and return without deactivating.
+    from app.core.auth.refresh import RefreshError
+
+    async def stub_refresh_transport(*_: Any, **__: Any) -> object:
+        raise RefreshError("transport_error", "connect", False, transport_error=True)
+
+    monkeypatch.setattr(
+        "app.modules.accounts.auth_manager.refresh_access_token",
+        stub_refresh_transport,
+    )
 
     usage_repo = StubUsageRepository()
     accounts_repo = StubAccountsRepository()

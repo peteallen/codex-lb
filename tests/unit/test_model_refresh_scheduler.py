@@ -12,6 +12,7 @@ import app.core.auth.refresh as refresh_module
 import app.core.clients.model_fetcher as model_fetcher_module
 import app.core.openai.model_refresh_scheduler as scheduler_module
 from app.core.openai.model_registry import ReasoningLevel, UpstreamModel
+from app.core.upstream_proxy import ResolvedProxyEndpoint, ResolvedUpstreamRoute
 from app.db.models import Account, AccountStatus
 
 pytestmark = pytest.mark.unit
@@ -61,6 +62,14 @@ class _StubAuthManager:
         return account
 
 
+def _route() -> ResolvedUpstreamRoute:
+    return ResolvedUpstreamRoute(
+        mode="account_bound",
+        pool_id="pool_1",
+        endpoint=ResolvedProxyEndpoint("ep_1", "http", "proxy.test", 8080),
+    )
+
+
 @pytest.mark.asyncio
 async def test_fetch_models_for_plan_marks_transport_errors(monkeypatch: pytest.MonkeyPatch) -> None:
     session = MagicMock()
@@ -73,10 +82,10 @@ async def test_fetch_models_for_plan_marks_transport_errors(monkeypatch: pytest.
     )
 
     @contextlib.asynccontextmanager
-    async def lease_session():
+    async def lease_session(account_id: str):
         yield session
 
-    monkeypatch.setattr(model_fetcher_module, "lease_http_session", lease_session)
+    monkeypatch.setattr(model_fetcher_module, "lease_account_http_session", lease_session)
     monkeypatch.setattr(
         model_fetcher_module,
         "get_settings",
@@ -84,7 +93,7 @@ async def test_fetch_models_for_plan_marks_transport_errors(monkeypatch: pytest.
     )
 
     with pytest.raises(model_fetcher_module.ModelFetchError) as excinfo:
-        await model_fetcher_module.fetch_models_for_plan("access-token", "account-1")
+        await model_fetcher_module.fetch_models_for_plan("access-token", "account-1", allow_direct_egress=True)
 
     exc = excinfo.value
     assert exc.status_code == 0
@@ -109,7 +118,7 @@ async def test_refresh_access_token_marks_transport_errors(monkeypatch: pytest.M
     )
 
     with pytest.raises(refresh_module.RefreshError) as excinfo:
-        await refresh_module.refresh_access_token("refresh-token", session=session)
+        await refresh_module.refresh_access_token("refresh-token", session=session, allow_direct_egress=True)
 
     exc = excinfo.value
     assert exc.code == "transport_error"
@@ -133,18 +142,51 @@ async def test_fetch_with_failover_refreshes_http_client_after_transport_error(
             expected_models,
         ]
     )
-    refresh_http_client = AsyncMock()
+    invalidate_account_client = AsyncMock()
 
     monkeypatch.setattr(scheduler_module, "AuthManager", _StubAuthManager)
     monkeypatch.setattr(scheduler_module, "fetch_models_for_plan", fetch_models_for_plan)
-    monkeypatch.setattr(scheduler_module, "refresh_http_client", refresh_http_client)
+    monkeypatch.setattr(scheduler_module, "invalidate_account_client", invalidate_account_client)
 
     result = await scheduler_module._fetch_with_failover([account], encryptor, MagicMock())
 
     assert result == expected_models
-    refresh_http_client.assert_awaited_once()
+    invalidate_account_client.assert_awaited_once_with(account.id)
     assert fetch_models_for_plan.await_count == 2
     assert encryptor.decrypt.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_fetch_models_with_transport_recovery_passes_resolved_route(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    account = _account()
+    encryptor = MagicMock()
+    encryptor.decrypt.return_value = "access-token"
+    route = _route()
+    expected_models = [_model("gpt-5.4")]
+    fetch_models_for_plan = AsyncMock(return_value=expected_models)
+    resolve_upstream_route = AsyncMock(return_value=route)
+
+    monkeypatch.setattr(scheduler_module, "fetch_models_for_plan", fetch_models_for_plan)
+    monkeypatch.setattr(scheduler_module, "resolve_upstream_route", resolve_upstream_route)
+
+    result = await scheduler_module._fetch_models_with_transport_recovery(
+        account,
+        encryptor,
+        transport_recovery=scheduler_module._TransportRecoveryState(),
+    )
+
+    assert result == expected_models
+    fetch_models_for_plan.assert_awaited_once_with(
+        "access-token",
+        "chatgpt-account-1",
+        lease_account_id="account-1",
+        route=route,
+        allow_direct_egress=False,
+    )
+    assert resolve_upstream_route.await_args is not None
+    assert resolve_upstream_route.await_args.kwargs["account_id"] == "account-1"
 
 
 @pytest.mark.asyncio
@@ -174,16 +216,16 @@ async def test_fetch_with_failover_refreshes_http_client_after_token_refresh_tra
             return account
 
     fetch_models_for_plan = AsyncMock(return_value=expected_models)
-    refresh_http_client = AsyncMock()
+    invalidate_account_client = AsyncMock()
 
     monkeypatch.setattr(scheduler_module, "AuthManager", TransportFailingAuthManager)
     monkeypatch.setattr(scheduler_module, "fetch_models_for_plan", fetch_models_for_plan)
-    monkeypatch.setattr(scheduler_module, "refresh_http_client", refresh_http_client)
+    monkeypatch.setattr(scheduler_module, "invalidate_account_client", invalidate_account_client)
 
     result = await scheduler_module._fetch_with_failover([account], encryptor, MagicMock())
 
     assert result == expected_models
-    refresh_http_client.assert_awaited_once()
+    invalidate_account_client.assert_awaited_once_with(account.id)
     assert ensure_fresh_calls == 2
     fetch_models_for_plan.assert_awaited_once()
 
@@ -203,15 +245,15 @@ async def test_fetch_with_failover_attempts_transport_recovery_once_when_retry_f
             scheduler_module.ModelFetchError(0, "temporary dns failure", transport_error=True),
         ]
     )
-    refresh_http_client = AsyncMock()
+    invalidate_account_client = AsyncMock()
 
     monkeypatch.setattr(scheduler_module, "AuthManager", _StubAuthManager)
     monkeypatch.setattr(scheduler_module, "fetch_models_for_plan", fetch_models_for_plan)
-    monkeypatch.setattr(scheduler_module, "refresh_http_client", refresh_http_client)
+    monkeypatch.setattr(scheduler_module, "invalidate_account_client", invalidate_account_client)
 
     result = await scheduler_module._fetch_with_failover(accounts, encryptor, MagicMock())
 
     assert result is None
-    refresh_http_client.assert_awaited_once()
+    invalidate_account_client.assert_awaited_once_with("account-1")
     assert fetch_models_for_plan.await_count == 3
     assert encryptor.decrypt.call_count == 3

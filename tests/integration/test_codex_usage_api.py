@@ -177,6 +177,40 @@ async def test_codex_usage_header_ignored(async_client, db_setup):
 
 
 @pytest.mark.asyncio
+async def test_codex_usage_identity_fails_closed_for_duplicate_workspace(async_client, db_setup, monkeypatch):
+    async def stub_fetch_usage(**_: object) -> UsagePayload:
+        raise AssertionError("duplicate account identity must not fall back to direct usage fetch")
+
+    monkeypatch.setattr("app.core.auth.dependencies.fetch_usage", stub_fetch_usage)
+
+    async with SessionLocal() as session:
+        accounts_repo = AccountsRepository(session)
+        usage_repo = UsageRepository(session)
+
+        await accounts_repo.upsert(_make_account("acc_dup_a", "dup-a@example.com", chatgpt_account_id="workspace_dup"))
+        await accounts_repo.upsert(_make_account("acc_dup_b", "dup-b@example.com", chatgpt_account_id="workspace_dup"))
+        await usage_repo.add_entry(
+            "acc_dup_a",
+            25.0,
+            window="primary",
+            reset_at=0,
+            window_minutes=300,
+        )
+
+    response = await async_client.get(
+        "/api/codex/usage",
+        headers={
+            "Authorization": "Bearer chatgpt-token",
+            "chatgpt-account-id": "workspace_dup",
+        },
+    )
+
+    assert response.status_code == 401
+    body = response.json()
+    assert body["error"]["message"] == "Ambiguous chatgpt-account-id"
+
+
+@pytest.mark.asyncio
 async def test_codex_usage_prefers_newer_weekly_primary_over_stale_secondary(async_client, db_setup):
     now = utcnow()
     async with SessionLocal() as session:

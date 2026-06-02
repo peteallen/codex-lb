@@ -31,6 +31,7 @@ from app.core.openai.requests import ResponsesCompactRequest, ResponsesRequest
 from app.core.resilience.circuit_breaker import CircuitState
 from app.core.resilience.overload import local_overload_error
 from app.core.types import JsonValue
+from app.core.upstream_proxy import ResolvedProxyEndpoint, ResolvedUpstreamRoute
 from app.core.utils.request_id import get_request_id, reset_request_id, set_request_id
 from app.core.utils.sse import parse_sse_data_json
 from app.core.utils.time import utcnow
@@ -43,7 +44,7 @@ from app.modules.proxy import affinity as proxy_affinity
 from app.modules.proxy import api as proxy_api
 from app.modules.proxy import request_policy as proxy_request_policy
 from app.modules.proxy import service as proxy_service
-from app.modules.proxy.load_balancer import AccountLease, AccountSelection
+from app.modules.proxy.load_balancer import AccountSelection
 from app.modules.proxy.repo_bundle import ProxyRepositories
 from app.modules.proxy.sticky_repository import StickySessionsRepository
 from app.modules.request_logs.repository import RequestLogsRepository
@@ -2436,6 +2437,44 @@ async def test_stream_responses_starts_upstream_timer_after_image_inlining(monke
 
 
 @pytest.mark.asyncio
+async def test_stream_responses_honors_explicit_direct_egress_opt_out(monkeypatch):
+    class Settings:
+        upstream_base_url = "https://chatgpt.com/backend-api"
+        upstream_connect_timeout_seconds = 1.0
+        stream_idle_timeout_seconds = 1.0
+        max_sse_event_bytes = 1024
+        image_inline_fetch_enabled = False
+        log_upstream_request_payload = False
+        proxy_request_budget_seconds = 15.0
+        upstream_stream_transport = "http"
+        log_upstream_request_summary = False
+
+    payload = ResponsesRequest.model_validate(
+        {"model": "gpt-5.4", "instructions": "hi", "input": [{"role": "user", "content": "hi"}]}
+    )
+    session = _SseSession(_SsePostResponse([b'data: {"type":"response.completed","response":{"id":"resp_1"}}\n\n']))
+
+    monkeypatch.setattr(proxy_module, "get_settings", lambda: Settings())
+    monkeypatch.setattr(proxy_module, "_maybe_log_upstream_request_start", lambda **kwargs: None)
+    monkeypatch.setattr(proxy_module, "_maybe_log_upstream_request_complete", lambda **kwargs: None)
+
+    with pytest.raises(ValueError, match="allow_direct_egress=True"):
+        _ = [
+            event
+            async for event in proxy_module.stream_responses(
+                payload,
+                headers={},
+                access_token="token",
+                account_id="acc_1",
+                session=cast(proxy_module.aiohttp.ClientSession, session),
+                allow_direct_egress=False,
+            )
+        ]
+
+    assert session.calls == []
+
+
+@pytest.mark.asyncio
 async def test_stream_responses_archives_http_error_before_raising(monkeypatch):
     class Settings:
         upstream_base_url = "https://chatgpt.com/backend-api"
@@ -4193,11 +4232,12 @@ async def test_stream_responses_auto_transport_falls_back_to_http_when_websocket
     registry = SimpleNamespace(
         get_snapshot=lambda: SimpleNamespace(models={"gpt-5.4": SimpleNamespace(prefer_websockets=True)})
     )
-    attempts = {"websocket": 0}
+    attempts: dict[str, Any] = {"websocket": 0, "headers": None}
     request_info = cast(RequestInfo, SimpleNamespace(real_url="wss://chatgpt.com/backend-api/codex/responses"))
 
     async def fake_open_upstream_websocket(**kwargs):
         attempts["websocket"] += 1
+        attempts["headers"] = kwargs["headers"]
         raise proxy_module.aiohttp.WSServerHandshakeError(request_info, (), status=426, message="Upgrade Required")
 
     monkeypatch.setattr(proxy_module, "get_settings", lambda: Settings())
@@ -4217,13 +4257,16 @@ async def test_stream_responses_auto_transport_falls_back_to_http_when_websocket
             payload,
             headers={},
             access_token="token",
-            account_id="acc_1",
+            account_id="db-account-1",
+            chatgpt_account_id="chatgpt-account-1",
             session=cast(proxy_module.aiohttp.ClientSession, session),
         )
     ]
 
     assert attempts["websocket"] == 1
     assert session.calls
+    assert attempts["headers"]["chatgpt-account-id"] == "chatgpt-account-1"
+    assert session.calls[0]["headers"]["chatgpt-account-id"] == "chatgpt-account-1"
     assert events == ['data: {"type":"response.completed","response":{"id":"resp_http"}}\n\n']
 
 
@@ -5001,7 +5044,7 @@ async def test_service_compact_budget_does_not_override_unbounded_read_timeout(m
     monkeypatch.setattr(service, "_ensure_fresh", AsyncMock(return_value=account))
     monkeypatch.setattr(service, "_settle_compact_api_key_usage", AsyncMock())
 
-    async def fake_compact(payload, headers, access_token, account_id):
+    async def fake_compact(payload, headers, access_token, account_id, **_kwargs):
         captured["connect_timeout"] = proxy_module._COMPACT_CONNECT_TIMEOUT_OVERRIDE.get()
         captured["total_timeout"] = proxy_module._COMPACT_TOTAL_TIMEOUT_OVERRIDE.get()
         return OpenAIResponsePayload.model_validate({"output": []})
@@ -5066,7 +5109,7 @@ async def test_stream_responses_logs_actual_service_tier_and_requested_tier_trac
     monkeypatch.setattr(service, "_ensure_fresh", AsyncMock(return_value=account))
     monkeypatch.setattr(service, "_settle_stream_api_key_usage", AsyncMock(return_value=True))
 
-    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False):
+    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False, **_kwargs):
         yield 'data: {"type":"response.completed","response":{"id":"resp_trace_stream","service_tier":"default"}}\n\n'
 
     monkeypatch.setattr(proxy_service, "core_stream_responses", fake_stream)
@@ -5127,6 +5170,7 @@ async def test_service_stream_responses_forces_http_upstream_for_http_stream_cli
         base_url=None,
         raise_for_status=False,
         upstream_stream_transport_override=None,
+        **_kwargs,
     ):
         captured["override"] = upstream_stream_transport_override
         yield 'data: {"type":"response.completed","response":{"id":"resp_transport_override"}}\n\n'
@@ -5167,7 +5211,7 @@ async def test_service_stream_responses_does_not_infer_previous_response_id_from
     monkeypatch.setattr(service, "_ensure_fresh", AsyncMock(return_value=account))
     monkeypatch.setattr(service, "_settle_stream_api_key_usage", AsyncMock(return_value=True))
 
-    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False):
+    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False, **_kwargs):
         del headers, access_token, account_id, base_url, raise_for_status
         captured["previous_response_id"] = payload.previous_response_id
         yield 'data: {"type":"response.completed","response":{"id":"resp_stream_scope"}}\n\n'
@@ -5207,7 +5251,7 @@ async def test_compact_responses_logs_service_tier_trace_and_generates_request_i
     monkeypatch.setattr(service, "_ensure_fresh", AsyncMock(return_value=account))
     monkeypatch.setattr(service, "_settle_compact_api_key_usage", AsyncMock())
 
-    async def fake_compact(payload, headers, access_token, account_id):
+    async def fake_compact(payload, headers, access_token, account_id, **_kwargs):
         return OpenAIResponsePayload.model_validate({"output": [], "service_tier": "default"})
 
     monkeypatch.setattr(proxy_service, "core_compact_responses", fake_compact)
@@ -5260,7 +5304,7 @@ async def test_compact_responses_does_not_infer_previous_response_id_from_sessio
     monkeypatch.setattr(service, "_ensure_fresh", AsyncMock(return_value=account))
     monkeypatch.setattr(service, "_settle_compact_api_key_usage", AsyncMock())
 
-    async def fake_compact(payload, headers, access_token, account_id):
+    async def fake_compact(payload, headers, access_token, account_id, **_kwargs):
         del headers, access_token, account_id
         captured["previous_response_id"] = getattr(payload, "previous_response_id", None)
         return OpenAIResponsePayload.model_validate({"output": []})
@@ -5344,7 +5388,7 @@ async def test_stream_responses_first_idle_timeout_fails_over_to_next_account(mo
     monkeypatch.setattr(service._load_balancer, "record_success", record_success)
     monkeypatch.setattr(service, "_ensure_fresh", AsyncMock(side_effect=[account_a, account_b]))
 
-    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False):
+    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False, **_kwargs):
         if account_id == account_a.chatgpt_account_id:
             yield (
                 'data: {"type":"response.failed","response":{"error":'
@@ -5397,7 +5441,7 @@ async def test_stream_responses_first_idle_timeout_surfaces_timeout_when_no_fail
     monkeypatch.setattr(service._load_balancer, "record_success", record_success)
     monkeypatch.setattr(service, "_ensure_fresh", AsyncMock(return_value=account))
 
-    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False):
+    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False, **_kwargs):
         del payload, headers, access_token, account_id, base_url, raise_for_status
         yield (
             'data: {"type":"response.failed","response":{"error":{"code":"stream_idle_timeout","message":"idle"}}}\n\n'
@@ -5439,7 +5483,7 @@ async def test_stream_responses_empty_upstream_emits_terminal_failure(monkeypatc
     monkeypatch.setattr(service._load_balancer, "record_success", record_success)
     monkeypatch.setattr(service, "_ensure_fresh", AsyncMock(return_value=account))
 
-    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False):
+    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False, **_kwargs):
         if False:
             yield ""
         return
@@ -5483,7 +5527,7 @@ async def test_stream_responses_first_event_connection_reset_fails_over(monkeypa
     monkeypatch.setattr(service._load_balancer, "record_success", record_success)
     monkeypatch.setattr(service, "_ensure_fresh", AsyncMock(side_effect=[account_a, account_b]))
 
-    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False):
+    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False, **_kwargs):
         if account_id == account_a.chatgpt_account_id:
             raise aiohttp.ClientConnectionError("[Errno 104] Connection reset by peer")
             yield ""
@@ -5535,7 +5579,7 @@ async def test_stream_responses_first_event_upstream_unavailable_fails_over(monk
     monkeypatch.setattr(service._load_balancer, "record_success", record_success)
     monkeypatch.setattr(service, "_ensure_fresh", AsyncMock(side_effect=[account_a, account_b]))
 
-    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False):
+    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False, **_kwargs):
         if account_id == account_a.chatgpt_account_id:
             for _ in range(3):
                 yield (
@@ -6383,6 +6427,30 @@ async def test_connect_proxy_websocket_previous_response_owner_usage_limit_fails
     assert request_logs.calls[0]["request_id"] == "ws_req_prev_owner_handshake_429"
     assert request_logs.calls[0]["error_code"] == "previous_response_owner_unavailable"
     assert request_logs.calls[0]["account_id"] == account_owner.id
+
+
+@pytest.mark.asyncio
+async def test_open_upstream_websocket_filters_fallback_chatgpt_account_id(monkeypatch):
+    service = proxy_service.ProxyService(_repo_factory(_RequestLogsRecorder()))
+    account = _make_account("acc_ws_fallback_header")
+    account.chatgpt_account_id = "email_ws_fallback_header"
+    seen_call: dict[str, object] = {}
+    upstream = SimpleNamespace()
+
+    monkeypatch.setattr(service, "_resolve_upstream_route_for_account", AsyncMock(return_value=None))
+
+    async def connect_upstream(headers, access_token, account_id, *, chatgpt_account_id=None, **_kwargs):
+        del headers, access_token
+        seen_call["account_id"] = account_id
+        seen_call["chatgpt_account_id"] = chatgpt_account_id
+        return upstream
+
+    monkeypatch.setattr(proxy_service, "connect_responses_websocket", connect_upstream)
+
+    result = await service._open_upstream_websocket(account, {})
+
+    assert result is upstream
+    assert seen_call == {"account_id": account.id, "chatgpt_account_id": None}
 
 
 @pytest.mark.asyncio
@@ -13452,6 +13520,51 @@ async def test_stream_selection_budget_exhaustion_emits_timeout_event(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_stream_responses_filters_fallback_chatgpt_account_id(monkeypatch):
+    settings = _make_proxy_settings(log_proxy_service_tier_trace=False)
+    request_logs = _RequestLogsRecorder()
+    service = proxy_service.ProxyService(_repo_factory(request_logs))
+    account = _make_account("acc_stream_fallback_header")
+    account.chatgpt_account_id = "local_stream_fallback_header"
+    seen_call: dict[str, object] = {}
+
+    monkeypatch.setattr(proxy_service, "get_settings_cache", lambda: _SettingsCache(settings))
+    monkeypatch.setattr(proxy_service, "get_settings", lambda: settings)
+    monkeypatch.setattr(
+        service._load_balancer,
+        "select_account",
+        AsyncMock(return_value=AccountSelection(account=account, error_message=None)),
+    )
+    monkeypatch.setattr(service, "_ensure_fresh", AsyncMock(return_value=account))
+    monkeypatch.setattr(service, "_resolve_upstream_route_for_account", AsyncMock(return_value=None))
+    monkeypatch.setattr(service, "_settle_stream_api_key_usage", AsyncMock(return_value=True))
+
+    async def fake_stream(
+        payload,
+        headers,
+        access_token,
+        account_id,
+        *,
+        chatgpt_account_id=None,
+        **_kwargs,
+    ):
+        del payload, headers, access_token
+        seen_call["account_id"] = account_id
+        seen_call["chatgpt_account_id"] = chatgpt_account_id
+        yield 'data: {"type":"response.completed","response":{"id":"resp_stream_fallback_header"}}\n\n'
+
+    monkeypatch.setattr(proxy_service, "core_stream_responses", fake_stream)
+
+    payload = ResponsesRequest.model_validate({"model": "gpt-5.1", "instructions": "hi", "input": [], "stream": True})
+
+    chunks = [chunk async for chunk in service.stream_responses(payload, {"session_id": "sid-stream"})]
+
+    event = json.loads(chunks[0].split("data: ", 1)[1])
+    assert event["response"]["id"] == "resp_stream_fallback_header"
+    assert seen_call == {"account_id": account.id, "chatgpt_account_id": None}
+
+
+@pytest.mark.asyncio
 async def test_stream_refresh_timeout_before_visible_output_fails_over(monkeypatch):
     settings = _make_proxy_settings(log_proxy_service_tier_trace=False)
     request_logs = _RequestLogsRecorder()
@@ -13501,7 +13614,184 @@ async def test_stream_refresh_timeout_before_visible_output_fails_over(monkeypat
 
 
 @pytest.mark.asyncio
-async def test_stream_forced_refresh_timeout_before_visible_output_fails_over(monkeypatch):
+async def test_stream_route_fail_closed_does_not_mark_account_unhealthy(monkeypatch):
+    settings = _make_proxy_settings(log_proxy_service_tier_trace=False)
+    request_logs = _RequestLogsRecorder()
+    service = proxy_service.ProxyService(_repo_factory(request_logs))
+    account = _make_account("acc_stream_route_fail_closed")
+
+    monkeypatch.setattr(proxy_service, "get_settings_cache", lambda: _SettingsCache(settings))
+    monkeypatch.setattr(proxy_service, "get_settings", lambda: settings)
+
+    async def fake_select_account_with_budget(*args: object, **kwargs: object) -> AccountSelection:
+        return AccountSelection(account=account, error_message=None)
+
+    async def fake_ensure_fresh(account: Account, **kwargs: object) -> Account:
+        return account
+
+    async def fail_route(*args: object, **kwargs: object) -> None:
+        raise proxy_service.UpstreamProxyRouteError("pool_unavailable", account_id=account.id)
+
+    handle_stream_error = AsyncMock()
+    record_success = AsyncMock()
+    monkeypatch.setattr(service, "_select_account_with_budget", fake_select_account_with_budget)
+    monkeypatch.setattr(service, "_ensure_fresh_with_budget", fake_ensure_fresh)
+    monkeypatch.setattr(service, "_resolve_upstream_route_for_account", fail_route)
+    monkeypatch.setattr(service, "_handle_stream_error", handle_stream_error)
+    monkeypatch.setattr(service._load_balancer, "record_success", record_success)
+
+    payload = ResponsesRequest.model_validate({"model": "gpt-5.1", "instructions": "hi", "input": [], "stream": True})
+
+    chunks = [chunk async for chunk in service.stream_responses(payload, {"session_id": "sid-stream"})]
+
+    event = json.loads(chunks[0].split("data: ", 1)[1])
+    assert event["response"]["error"]["code"] == "upstream_proxy_unavailable"
+    assert request_logs.calls[-1]["account_id"] == account.id
+    assert request_logs.calls[-1]["status"] == "error"
+    assert request_logs.calls[-1]["error_code"] == "upstream_proxy_unavailable"
+    assert request_logs.calls[-1]["upstream_proxy_fail_closed_reason"] == "pool_unavailable"
+    handle_stream_error.assert_not_awaited()
+    record_success.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_stream_early_route_failure_logs_resolved_route_metadata(monkeypatch):
+    settings = _make_proxy_settings(log_proxy_service_tier_trace=False)
+    request_logs = _RequestLogsRecorder()
+    service = proxy_service.ProxyService(_repo_factory(request_logs))
+    account = _make_account("acc_stream_early_route_failure")
+    route = ResolvedUpstreamRoute(
+        mode="account_bound",
+        pool_id="pool_1",
+        endpoint=ResolvedProxyEndpoint("ep_1", "http", "proxy.test", 8080),
+    )
+
+    monkeypatch.setattr(proxy_service, "get_settings_cache", lambda: _SettingsCache(settings))
+    monkeypatch.setattr(proxy_service, "get_settings", lambda: settings)
+
+    async def fake_select_account_with_budget(*args: object, **kwargs: object) -> AccountSelection:
+        return AccountSelection(account=account, error_message=None)
+
+    async def fake_ensure_fresh(account: Account, **kwargs: object) -> Account:
+        return account
+
+    async def resolve_route(*args: object, **kwargs: object) -> ResolvedUpstreamRoute:
+        return route
+
+    async def stream_without_route_trace(*args: object, **kwargs: object):
+        yield (
+            'data: {"type":"response.failed","response":{"id":"resp_fail",'
+            '"error":{"code":"upstream_unavailable","message":"proxy connect failed"}}}\n\n'
+        )
+
+    monkeypatch.setattr(service, "_select_account_with_budget", fake_select_account_with_budget)
+    monkeypatch.setattr(service, "_ensure_fresh_with_budget", fake_ensure_fresh)
+    monkeypatch.setattr(service, "_resolve_upstream_route_for_account", resolve_route)
+    monkeypatch.setattr(proxy_service, "core_stream_responses", stream_without_route_trace)
+    monkeypatch.setattr(service, "_handle_stream_error", AsyncMock())
+
+    payload = ResponsesRequest.model_validate({"model": "gpt-5.1", "instructions": "hi", "input": [], "stream": True})
+
+    chunks = [chunk async for chunk in service.stream_responses(payload, {"session_id": "sid-stream"})]
+
+    assert chunks
+    log = request_logs.calls[-1]
+    assert log["upstream_proxy_route_mode"] == "account_bound"
+    assert log["upstream_proxy_pool_id"] == "pool_1"
+    assert log["upstream_proxy_endpoint_id"] == "ep_1"
+    assert log["upstream_proxy_fallback_used"] is False
+
+
+@pytest.mark.asyncio
+async def test_transcribe_early_route_failure_logs_resolved_route_metadata(monkeypatch):
+    settings = _make_proxy_settings(log_proxy_service_tier_trace=False)
+    request_logs = _RequestLogsRecorder()
+    service = proxy_service.ProxyService(_repo_factory(request_logs))
+    account = _make_account("acc_transcribe_early_route_failure")
+    route = ResolvedUpstreamRoute(
+        mode="account_bound",
+        pool_id="pool_1",
+        endpoint=ResolvedProxyEndpoint("ep_1", "http", "proxy.test", 8080),
+    )
+
+    monkeypatch.setattr(proxy_service, "get_settings_cache", lambda: _SettingsCache(settings))
+    monkeypatch.setattr(proxy_service, "get_settings", lambda: settings)
+
+    async def fake_select_account_with_budget(*args: object, **kwargs: object) -> AccountSelection:
+        return AccountSelection(account=account, error_message=None)
+
+    async def fake_ensure_fresh(account: Account, **kwargs: object) -> Account:
+        return account
+
+    async def resolve_route(*args: object, **kwargs: object) -> ResolvedUpstreamRoute:
+        return route
+
+    async def fail_transcribe(*args: object, **kwargs: object) -> dict[str, JsonValue]:
+        raise proxy_module.ProxyResponseError(502, openai_error("upstream_unavailable", "proxy connect failed"))
+
+    monkeypatch.setattr(service, "_select_account_with_budget", fake_select_account_with_budget)
+    monkeypatch.setattr(service, "_ensure_fresh_with_budget", fake_ensure_fresh)
+    monkeypatch.setattr(service, "_resolve_upstream_route_for_account", resolve_route)
+    monkeypatch.setattr(proxy_service, "core_transcribe_audio", fail_transcribe)
+    monkeypatch.setattr(service, "_handle_proxy_error", AsyncMock())
+
+    with pytest.raises(proxy_module.ProxyResponseError):
+        await service.transcribe(
+            audio_bytes=b"audio",
+            filename="audio.wav",
+            content_type="audio/wav",
+            prompt=None,
+            headers={},
+        )
+
+    log = request_logs.calls[-1]
+    assert log["upstream_proxy_route_mode"] == "account_bound"
+    assert log["upstream_proxy_pool_id"] == "pool_1"
+    assert log["upstream_proxy_endpoint_id"] == "ep_1"
+    assert log["upstream_proxy_fallback_used"] is False
+
+
+@pytest.mark.asyncio
+async def test_stream_refresh_route_fail_closed_surfaces_proxy_error(monkeypatch):
+    settings = _make_proxy_settings(log_proxy_service_tier_trace=False)
+    request_logs = _RequestLogsRecorder()
+    service = proxy_service.ProxyService(_repo_factory(request_logs))
+    account = _make_account("acc_stream_refresh_route_fail_closed")
+
+    monkeypatch.setattr(proxy_service, "get_settings_cache", lambda: _SettingsCache(settings))
+    monkeypatch.setattr(proxy_service, "get_settings", lambda: settings)
+
+    async def fake_select_account_with_budget(*args: object, **kwargs: object) -> AccountSelection:
+        return AccountSelection(account=account, error_message=None)
+
+    async def fail_refresh(account: Account, **kwargs: object) -> Account:
+        raise proxy_service.RefreshError(
+            "upstream_proxy_unavailable",
+            "Upstream proxy route unavailable: pool_unavailable",
+            False,
+            transport_error=True,
+            upstream_proxy_fail_closed_reason="pool_unavailable",
+        )
+
+    handle_stream_error = AsyncMock()
+    monkeypatch.setattr(service, "_select_account_with_budget", fake_select_account_with_budget)
+    monkeypatch.setattr(service, "_ensure_fresh", fail_refresh)
+    monkeypatch.setattr(service, "_handle_stream_error", handle_stream_error)
+
+    payload = ResponsesRequest.model_validate({"model": "gpt-5.1", "instructions": "hi", "input": [], "stream": True})
+
+    chunks = [chunk async for chunk in service.stream_responses(payload, {"session_id": "sid-stream"})]
+
+    event = json.loads(chunks[0].split("data: ", 1)[1])
+    assert event["response"]["error"]["code"] == "upstream_proxy_unavailable"
+    assert request_logs.calls[-1]["account_id"] == account.id
+    assert request_logs.calls[-1]["error_code"] == "upstream_proxy_unavailable"
+    assert request_logs.calls[-1]["upstream_proxy_fail_closed_reason"] == "pool_unavailable"
+    handle_stream_error.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_stream_forced_refresh_timeout_emits_upstream_unavailable_and_logs(monkeypatch):
     settings = _make_proxy_settings(log_proxy_service_tier_trace=False)
     request_logs = _RequestLogsRecorder()
     service = proxy_service.ProxyService(_repo_factory(request_logs))
@@ -13526,7 +13816,9 @@ async def test_stream_forced_refresh_timeout_before_visible_output_fails_over(mo
             raise asyncio.TimeoutError
         return account
 
-    async def failing_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False):
+    async def failing_stream(
+        payload, headers, access_token, account_id, base_url=None, raise_for_status=False, **_kwargs
+    ):
         del payload, headers, access_token, base_url, raise_for_status
         stream_account_ids.append(account_id)
         if account_id == account_a.chatgpt_account_id:
@@ -13571,7 +13863,7 @@ async def test_stream_post_refresh_401_fails_over_instead_of_retrying_same_accou
             return AccountSelection(account=account_a, error_message=None)
         return AccountSelection(account=account_b, error_message=None)
 
-    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False):
+    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False, **_kwargs):
         del payload, headers, access_token, base_url, raise_for_status
         stream_account_ids.append(account_id)
         if account_id == account_a.chatgpt_account_id:
@@ -13623,7 +13915,7 @@ async def test_stream_refresh_budget_is_recomputed_after_selection(monkeypatch):
         captured["timeout_seconds"] = timeout_seconds
         return account
 
-    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False):
+    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False, **_kwargs):
         yield 'data: {"type":"response.completed","response":{"id":"resp_budget"}}\n\n'
 
     monkeypatch.setattr(proxy_service, "get_settings_cache", lambda: _SettingsCache(settings))
@@ -13664,7 +13956,7 @@ async def test_stream_attempt_timeout_overrides_follow_remaining_budget(monkeypa
         except StopIteration:
             return 3.0
 
-    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False):
+    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False, **_kwargs):
         yield 'data: {"type":"response.completed","response":{"id":"resp_budget"}}\n\n'
 
     def fake_push_stream_timeout_overrides(
@@ -13727,7 +14019,7 @@ async def test_stream_forced_refresh_reapplies_idle_and_total_budget_overrides(m
         del timeout_seconds
         return account
 
-    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False):
+    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False, **_kwargs):
         stream_call_count["count"] += 1
         if stream_call_count["count"] == 1:
             raise proxy_module.ProxyResponseError(401, openai_error("invalid_api_key", "token expired"))
@@ -13794,7 +14086,7 @@ async def test_stream_midstream_generic_failure_is_neutral_to_account_health(mon
     monkeypatch.setattr(service, "_ensure_fresh", AsyncMock(return_value=account))
     monkeypatch.setattr(service, "_settle_stream_api_key_usage", AsyncMock(return_value=True))
 
-    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False):
+    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False, **_kwargs):
         yield 'data: {"type":"response.output_text.delta","delta":"hi"}\n\n'
         yield (
             'data: {"type":"response.failed","response":{"error":{"code":"upstream_request_timeout",'
@@ -13857,7 +14149,7 @@ async def test_stream_midstream_proxy_failure_records_health_and_keeps_settled(m
     monkeypatch.setattr(service, "_settle_stream_api_key_usage", settle)
     monkeypatch.setattr(service, "_release_unsettled_stream_api_key_usage", release_unsettled)
 
-    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False):
+    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False, **_kwargs):
         del payload, headers, access_token, account_id, base_url, raise_for_status
         yield (
             'data: {"type":"response.created","response":{"id":"resp_midstream_proxy_failure",'
@@ -13921,7 +14213,7 @@ async def test_stream_incomplete_records_success_without_account_error(monkeypat
     monkeypatch.setattr(service, "_ensure_fresh", AsyncMock(return_value=account))
     monkeypatch.setattr(service, "_settle_stream_api_key_usage", AsyncMock(return_value=True))
 
-    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False):
+    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False, **_kwargs):
         yield (
             'data: {"type":"response.incomplete","response":{"status":"incomplete","usage":'
             '{"input_tokens":1,"output_tokens":1},"incomplete_details":{"reason":"max_output_tokens"}}}\n\n'
@@ -14153,53 +14445,6 @@ async def test_stream_previous_response_owner_usage_limit_fails_closed(monkeypat
 
 
 @pytest.mark.asyncio
-async def test_stream_prompt_cache_key_does_not_soften_previous_response_owner(monkeypatch):
-    settings = _make_proxy_settings(log_proxy_service_tier_trace=False)
-    request_logs = _RequestLogsRecorder()
-    service = proxy_service.ProxyService(_repo_factory(request_logs))
-    account_owner = _make_account("acc_prev_owner_stream")
-    account_cache = _make_account("acc_prompt_cache_stream")
-    request_logs.response_owner_by_id[("resp_prev_anchor", None, "sid-stream")] = account_owner.id
-    select_account = AsyncMock(return_value=AccountSelection(account=account_cache, error_message=None))
-    stream_calls: list[str | None] = []
-
-    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False, **kwargs):
-        del payload, headers, access_token, base_url, raise_for_status, kwargs
-        stream_calls.append(account_id)
-        yield 'data: {"type":"response.completed","response":{"id":"resp_wrong_cache_account"}}\n\n'
-
-    monkeypatch.setattr(proxy_service, "get_settings_cache", lambda: _SettingsCache(settings))
-    monkeypatch.setattr(proxy_service, "get_settings", lambda: settings)
-    monkeypatch.setattr(service._load_balancer, "select_account", select_account)
-    monkeypatch.setattr(service, "_ensure_fresh", AsyncMock(return_value=account_cache))
-    monkeypatch.setattr(service, "_settle_stream_api_key_usage", AsyncMock(return_value=True))
-    monkeypatch.setattr(proxy_service, "core_stream_responses", fake_stream)
-
-    payload = ResponsesRequest.model_validate(
-        {
-            "model": "gpt-5.1",
-            "instructions": "hi",
-            "input": [],
-            "stream": True,
-            "previous_response_id": "resp_prev_anchor",
-            "prompt_cache_key": "cache-soft-affinity",
-        }
-    )
-
-    chunks = [chunk async for chunk in service.stream_responses(payload, {"session_id": "sid-stream"})]
-
-    event = json.loads(chunks[0].split("data: ", 1)[1])
-    assert event["type"] == "response.failed"
-    assert event["response"]["error"]["code"] == "previous_response_owner_unavailable"
-    assert event["response"]["error"]["message"] == "Previous response owner account is unavailable; retry later."
-    assert request_logs.lookup_calls == [("resp_prev_anchor", None, "sid-stream")]
-    assert request_logs.calls[0]["error_code"] == "previous_response_owner_unavailable"
-    assert request_logs.calls[0]["account_id"] == account_owner.id
-    select_account.assert_awaited_once()
-    assert stream_calls == []
-
-
-@pytest.mark.asyncio
 async def test_stream_selection_fail_closed_records_owner_unavailable_metric(monkeypatch, caplog):
     settings = _make_proxy_settings(log_proxy_service_tier_trace=False)
     request_logs = _RequestLogsRecorder()
@@ -14246,33 +14491,17 @@ async def test_stream_selection_fail_closed_records_owner_unavailable_metric(mon
 
 
 @pytest.mark.asyncio
-async def test_stream_previous_response_owner_miss_fails_closed_before_unpinned_selection(monkeypatch):
+async def test_stream_previous_response_owner_lookup_miss_fails_before_selection(monkeypatch):
     settings = _make_proxy_settings(log_proxy_service_tier_trace=False)
     request_logs = _RequestLogsRecorder()
     service = proxy_service.ProxyService(_repo_factory(request_logs))
-    account_other = _make_account("acc_other_stream")
-    select_account = AsyncMock(return_value=AccountSelection(account=account_other, error_message=None))
-    stream_calls: list[str | None] = []
-    counter = _ObservedCounter()
-
-    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False, **kwargs):
-        del payload, headers, access_token, base_url, raise_for_status, kwargs
-        stream_calls.append(account_id)
-        yield 'data: {"type":"response.completed","response":{"id":"resp_wrong_account"}}\n\n'
 
     monkeypatch.setattr(proxy_service, "get_settings_cache", lambda: _SettingsCache(settings))
     monkeypatch.setattr(proxy_service, "get_settings", lambda: settings)
-    monkeypatch.setattr(proxy_service, "PROMETHEUS_AVAILABLE", True)
-    monkeypatch.setattr(proxy_service, "continuity_fail_closed_total", counter, raising=False)
+    monkeypatch.setattr(service, "_resolve_websocket_previous_response_owner", AsyncMock(return_value=None))
+    monkeypatch.setattr(service, "_previous_response_owner_miss_can_continue", AsyncMock(return_value=False))
+    select_account = AsyncMock(return_value=AccountSelection(account=_make_account("acc_other"), error_message=None))
     monkeypatch.setattr(service._load_balancer, "select_account", select_account)
-    monkeypatch.setattr(
-        service._load_balancer,
-        "_load_selection_inputs",
-        AsyncMock(return_value=SimpleNamespace(accounts=[account_other, _make_account("acc_second_stream")])),
-    )
-    monkeypatch.setattr(service, "_ensure_fresh", AsyncMock(return_value=account_other))
-    monkeypatch.setattr(service, "_settle_stream_api_key_usage", AsyncMock(return_value=True))
-    monkeypatch.setattr(proxy_service, "core_stream_responses", fake_stream)
 
     payload = ResponsesRequest.model_validate(
         {
@@ -14280,7 +14509,7 @@ async def test_stream_previous_response_owner_miss_fails_closed_before_unpinned_
             "instructions": "hi",
             "input": [],
             "stream": True,
-            "previous_response_id": "resp_missing_owner",
+            "previous_response_id": "resp_prev_missing",
         }
     )
 
@@ -14290,17 +14519,9 @@ async def test_stream_previous_response_owner_miss_fails_closed_before_unpinned_
     assert event["type"] == "response.failed"
     assert event["response"]["error"]["code"] == "previous_response_owner_unavailable"
     assert event["response"]["error"]["message"] == "Previous response owner account is unavailable; retry later."
-    assert request_logs.lookup_calls == [("resp_missing_owner", None, "sid-stream")]
-    assert request_logs.calls[0]["error_code"] == "previous_response_owner_unavailable"
     assert request_logs.calls[0]["account_id"] is None
+    assert request_logs.calls[0]["error_code"] == "previous_response_owner_unavailable"
     select_account.assert_not_awaited()
-    assert stream_calls == []
-    assert counter.samples == [
-        {
-            "labels": {"surface": "http_stream", "reason": "owner_account_unavailable"},
-            "value": 1.0,
-        }
-    ]
 
 
 @pytest.mark.asyncio
@@ -14336,6 +14557,49 @@ async def test_compact_responses_budget_exhaustion_returns_request_timeout(monke
 
 
 @pytest.mark.asyncio
+async def test_compact_responses_filters_fallback_chatgpt_account_id(monkeypatch):
+    settings = _make_proxy_settings(log_proxy_service_tier_trace=False)
+    request_logs = _RequestLogsRecorder()
+    service = proxy_service.ProxyService(_repo_factory(request_logs))
+    account = _make_account("acc_compact_fallback_header")
+    account.chatgpt_account_id = "email_user_example_com"
+    seen_call: dict[str, object] = {}
+
+    monkeypatch.setattr(proxy_service, "get_settings_cache", lambda: _SettingsCache(settings))
+    monkeypatch.setattr(proxy_service, "get_settings", lambda: settings)
+    monkeypatch.setattr(
+        service._load_balancer,
+        "select_account",
+        AsyncMock(return_value=AccountSelection(account=account, error_message=None)),
+    )
+    monkeypatch.setattr(service, "_ensure_fresh", AsyncMock(return_value=account))
+    monkeypatch.setattr(service, "_settle_compact_api_key_usage", AsyncMock())
+
+    async def fake_compact(
+        payload,
+        headers,
+        access_token,
+        account_id,
+        *,
+        chatgpt_account_id=None,
+        **_kwargs,
+    ):
+        del payload, headers, access_token
+        seen_call["account_id"] = account_id
+        seen_call["chatgpt_account_id"] = chatgpt_account_id
+        return CompactResponsePayload.model_validate({"object": "response.compaction", "output": []})
+
+    monkeypatch.setattr(proxy_service, "core_compact_responses", fake_compact)
+
+    payload = ResponsesCompactRequest.model_validate({"model": "gpt-5.1", "instructions": "hi", "input": []})
+
+    response = await service.compact_responses(payload, {"session_id": "sid-compact"})
+
+    assert response.model_extra == {"output": []}
+    assert seen_call == {"account_id": account.id, "chatgpt_account_id": None}
+
+
+@pytest.mark.asyncio
 async def test_compact_responses_refresh_connection_reset_fails_over(monkeypatch):
     settings = _make_proxy_settings(log_proxy_service_tier_trace=False)
     request_logs = _RequestLogsRecorder()
@@ -14366,7 +14630,7 @@ async def test_compact_responses_refresh_connection_reset_fails_over(monkeypatch
     )
     monkeypatch.setattr(service, "_settle_compact_api_key_usage", AsyncMock())
 
-    async def fake_compact(payload, headers, access_token, account_id):
+    async def fake_compact(payload, headers, access_token, account_id, **_kwargs):
         del payload, headers, access_token
         assert account_id == account_b.chatgpt_account_id
         return CompactResponsePayload.model_validate({"object": "response.compaction", "output": []})
@@ -14595,7 +14859,7 @@ async def test_compact_responses_records_transient_error_for_generic_upstream_fa
     monkeypatch.setattr(service._load_balancer, "record_success", record_success)
     monkeypatch.setattr(service, "_ensure_fresh", AsyncMock(return_value=account))
 
-    async def failing_compact(payload, headers, access_token, account_id):
+    async def failing_compact(payload, headers, access_token, account_id, **_kwargs):
         raise proxy_module.ProxyResponseError(502, openai_error("upstream_unavailable", "late"))
 
     monkeypatch.setattr(proxy_service, "core_compact_responses", failing_compact)
@@ -14635,7 +14899,7 @@ async def test_compact_previous_response_not_found_is_masked_without_account_pen
     monkeypatch.setattr(service._load_balancer, "record_success", record_success)
     monkeypatch.setattr(service, "_ensure_fresh", AsyncMock(return_value=account))
 
-    async def failing_compact(payload, headers, access_token, account_id):
+    async def failing_compact(payload, headers, access_token, account_id, **_kwargs):
         del payload, headers, access_token, account_id
         error_payload = openai_error(
             "invalid_request_error",
@@ -14915,7 +15179,7 @@ async def test_ensure_fresh_same_stale_account_joins_singleflight_before_refresh
     release = asyncio.Event()
     refresh_calls = 0
 
-    async def fake_refresh_access_token(_: str):
+    async def fake_refresh_access_token(_: str, **_kwargs):
         nonlocal refresh_calls
         refresh_calls += 1
         started.set()
@@ -15145,9 +15409,9 @@ async def test_response_create_admission_waits_on_session_gate_before_shared_cap
 
 
 @pytest.mark.asyncio
-async def test_response_create_gate_release_waits_for_account_lease_release():
+async def test_response_create_gate_waits_for_account_lease_release_before_reopening() -> None:
     request_state = proxy_service._WebSocketRequestState(
-        request_id="ws_req_gate_order",
+        request_id="ws_req_release",
         model="gpt-5.1",
         service_tier=None,
         reasoning_effort=None,
@@ -15156,41 +15420,45 @@ async def test_response_create_gate_release_waits_for_account_lease_release():
     )
     response_create_gate = asyncio.Semaphore(1)
     await response_create_gate.acquire()
-    request_state.response_create_gate_acquired = True
     request_state.response_create_gate = response_create_gate
-    lease = AccountLease(
-        lease_id="lease_gate_order",
-        account_id="acc_gate_order",
+    request_state.response_create_gate_acquired = True
+    request_state.awaiting_response_created = True
+    account_lease = proxy_service.AccountLease(
+        lease_id="lease-response-create",
+        account_id="acc_release",
         kind="response_create",
         acquired_at=0.0,
     )
-    request_state.account_response_create_lease = lease
+    request_state.account_response_create_lease = account_lease
+    release_can_finish = asyncio.Event()
     release_started = asyncio.Event()
-    release_allowed = asyncio.Event()
+    released: list[proxy_service.AccountLease | None] = []
 
-    async def release_account_lease(received_lease: AccountLease | None) -> None:
-        assert received_lease == lease
+    async def release_account_lease(lease: proxy_service.AccountLease | None) -> None:
+        released.append(lease)
         release_started.set()
-        await release_allowed.wait()
+        await release_can_finish.wait()
 
     request_state.account_response_create_release = release_account_lease
-
     release_task = asyncio.create_task(
         proxy_service._release_websocket_response_create_gate(request_state, response_create_gate)
     )
-    await release_started.wait()
+
+    await asyncio.wait_for(release_started.wait(), timeout=1.0)
     await asyncio.sleep(0)
 
     assert response_create_gate.locked() is True
     assert request_state.response_create_gate_acquired is True
 
-    release_allowed.set()
+    release_can_finish.set()
     await release_task
 
     assert response_create_gate.locked() is False
     assert request_state.response_create_gate_acquired is False
+    assert request_state.response_create_gate is None
     assert request_state.account_response_create_lease is None
     assert request_state.account_response_create_release is None
+    assert released == [account_lease]
 
 
 @pytest.mark.asyncio
@@ -15245,29 +15513,52 @@ async def test_select_account_with_budget_times_out_during_settings_fetch(monkey
 
 
 @pytest.mark.asyncio
-async def test_select_account_with_budget_forwards_estimated_lease_tokens(monkeypatch):
+async def test_transcribe_filters_fallback_chatgpt_account_id(monkeypatch):
     settings = _make_proxy_settings(log_proxy_service_tier_trace=False)
     request_logs = _RequestLogsRecorder()
     service = proxy_service.ProxyService(_repo_factory(request_logs))
-    account = _make_account("acc_estimated_lease")
-    select_account = AsyncMock(return_value=AccountSelection(account=account, error_message=None))
+    account = _make_account("acc_transcribe_fallback_header")
+    account.chatgpt_account_id = "local_imported_slot"
+    seen_call: dict[str, object] = {}
 
     monkeypatch.setattr(proxy_service, "get_settings_cache", lambda: _SettingsCache(settings))
-    monkeypatch.setattr(service._load_balancer, "select_account", select_account)
-    monkeypatch.setattr(proxy_service, "_remaining_budget_seconds", lambda _deadline: 10.0)
+    monkeypatch.setattr(proxy_service, "get_settings", lambda: settings)
+    monkeypatch.setattr(
+        service._load_balancer,
+        "select_account",
+        AsyncMock(return_value=AccountSelection(account=account, error_message=None)),
+    )
+    monkeypatch.setattr(service, "_ensure_fresh", AsyncMock(return_value=account))
 
-    selection = await service._select_account_with_budget(
-        deadline=123.0,
-        request_id="req-estimated-lease",
-        kind="stream",
-        lease_kind="stream",
-        estimated_lease_tokens=1234.0,
-        model="gpt-5.1",
+    async def fake_transcribe(
+        audio_bytes: bytes,
+        *,
+        filename: str,
+        content_type: str | None,
+        prompt: str | None,
+        headers,
+        access_token: str,
+        account_id: str | None,
+        chatgpt_account_id: str | None = None,
+        **_kwargs,
+    ):
+        del audio_bytes, filename, content_type, prompt, headers, access_token
+        seen_call["account_id"] = account_id
+        seen_call["chatgpt_account_id"] = chatgpt_account_id
+        return {"text": "ok"}
+
+    monkeypatch.setattr(proxy_service, "core_transcribe_audio", fake_transcribe)
+
+    result = await service.transcribe(
+        audio_bytes=b"\x01\x02",
+        filename="sample.wav",
+        content_type="audio/wav",
+        prompt=None,
+        headers={"session_id": "sid-transcribe"},
     )
 
-    assert selection.account == account
-    assert select_account.await_args is not None
-    assert select_account.await_args.kwargs["estimated_lease_tokens"] == 1234.0
+    assert result == {"text": "ok"}
+    assert seen_call == {"account_id": account.id, "chatgpt_account_id": None}
 
 
 @pytest.mark.asyncio
@@ -15298,6 +15589,7 @@ async def test_transcribe_budget_exhaustion_blocks_401_retry_with_timeout(monkey
         account_id: str | None,
         base_url=None,
         session=None,
+        **_kwargs,
     ):
         nonlocal transcribe_calls
         transcribe_calls += 1
@@ -15459,6 +15751,7 @@ async def test_transcribe_records_transient_error_for_generic_upstream_failure(m
         account_id: str | None,
         base_url=None,
         session=None,
+        **_kwargs,
     ):
         raise proxy_module.ProxyResponseError(502, openai_error("upstream_unavailable", "late"))
 
@@ -16440,6 +16733,7 @@ async def test_thread_goal_refresh_connection_reset_fails_over(monkeypatch):
         *,
         method: str,
         timeout_seconds: float,
+        **_kwargs: object,
     ) -> dict[str, JsonValue]:
         del operation, payload, headers, access_token, method, timeout_seconds
         assert account_id == account_b.chatgpt_account_id
@@ -16495,6 +16789,7 @@ async def test_thread_goal_refresh_transport_error_fails_over(monkeypatch):
         *,
         method: str,
         timeout_seconds: float,
+        **_kwargs: object,
     ) -> dict[str, JsonValue]:
         del operation, payload, headers, access_token, method, timeout_seconds
         assert account_id == account_b.chatgpt_account_id
@@ -16537,6 +16832,7 @@ async def test_thread_goal_upstream_connection_reset_fails_over_after_freshness(
         *,
         method: str,
         timeout_seconds: float,
+        **_kwargs: object,
     ) -> dict[str, JsonValue]:
         del operation, payload, headers, access_token, method, timeout_seconds
         upstream_accounts.append(account_id)
@@ -16597,6 +16893,7 @@ async def test_thread_goal_failover_401_force_refreshes_fallback_account(monkeyp
         *,
         method: str,
         timeout_seconds: float,
+        **_kwargs: object,
     ) -> dict[str, JsonValue]:
         del operation, payload, headers, account_id, method, timeout_seconds
         upstream_tokens.append(access_token)
@@ -16652,6 +16949,7 @@ async def test_thread_goal_body_read_connection_reset_does_not_fail_over(monkeyp
         *,
         method: str,
         timeout_seconds: float,
+        **_kwargs: object,
     ) -> dict[str, JsonValue]:
         del operation, payload, headers, access_token, method, timeout_seconds
         upstream_accounts.append(account_id)
@@ -16700,6 +16998,7 @@ async def test_thread_goal_failover_call_error_records_fallback_account(monkeypa
         *,
         method: str,
         timeout_seconds: float,
+        **_kwargs: object,
     ) -> dict[str, JsonValue]:
         del operation, payload, headers, access_token, method, timeout_seconds
         upstream_accounts.append(account_id)
@@ -16761,6 +17060,7 @@ async def test_thread_goal_failover_freshness_connection_reset_marks_failover_ac
         *,
         method: str,
         timeout_seconds: float,
+        **_kwargs: object,
     ) -> dict[str, JsonValue]:
         del operation, payload, headers, access_token, method, timeout_seconds
         upstream_accounts.append(account_id)
@@ -16820,6 +17120,7 @@ async def test_thread_goal_failover_refresh_transport_error_marks_failover_accou
         *,
         method: str,
         timeout_seconds: float,
+        **_kwargs: object,
     ) -> dict[str, JsonValue]:
         del operation, payload, headers, access_token, method, timeout_seconds
         upstream_accounts.append(account_id)
@@ -16991,6 +17292,7 @@ async def test_codex_control_refresh_connection_reset_fails_over(monkeypatch):
         access_token: str,
         account_id: str | None,
         timeout_seconds: float,
+        **_kwargs: object,
     ) -> proxy_module.CodexControlResponse:
         del path, method, payload, query_params, headers, access_token, timeout_seconds
         assert account_id == account_b.chatgpt_account_id
@@ -17092,6 +17394,7 @@ async def test_files_create_refresh_connection_reset_fails_over(monkeypatch):
         headers: Mapping[str, str],
         access_token: str,
         account_id: str | None,
+        **_kwargs: object,
     ) -> dict[str, JsonValue]:
         del payload, headers, access_token
         assert account_id == account_b.chatgpt_account_id
@@ -17131,6 +17434,7 @@ async def test_files_create_body_read_connection_reset_does_not_fail_over(monkey
         headers: Mapping[str, str],
         access_token: str,
         account_id: str | None,
+        **_kwargs: object,
     ) -> dict[str, JsonValue]:
         del payload, headers, access_token
         upstream_accounts.append(account_id)

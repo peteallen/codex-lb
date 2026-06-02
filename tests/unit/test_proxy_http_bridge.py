@@ -1088,6 +1088,39 @@ async def test_select_account_with_budget_prefers_durable_account_id_when_availa
 
 
 @pytest.mark.asyncio
+async def test_select_account_with_budget_forwards_lease_token_estimate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    select_account = AsyncMock(
+        return_value=proxy_service.AccountSelection(
+            account=cast(Any, SimpleNamespace(id="acc-estimated")),
+            error_message=None,
+            error_code=None,
+        )
+    )
+    service._load_balancer = cast(Any, SimpleNamespace(select_account=select_account))
+    monkeypatch.setattr(
+        proxy_service,
+        "get_settings_cache",
+        lambda: SimpleNamespace(
+            get=AsyncMock(return_value=SimpleNamespace(sticky_reallocation_budget_threshold_pct=95.0))
+        ),
+    )
+
+    await service._select_account_with_budget(
+        time.monotonic() + 60.0,
+        request_id="req-estimated",
+        kind="stream",
+        lease_kind="stream",
+        estimated_lease_tokens=1234.0,
+    )
+
+    first_call = select_account.await_args_list[0]
+    assert first_call.kwargs["estimated_lease_tokens"] == 1234.0
+
+
+@pytest.mark.asyncio
 async def test_select_account_with_budget_skips_preferred_account_outside_assignment_scope(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1249,6 +1282,38 @@ async def test_select_account_with_budget_soft_preference_can_fallback_after_acc
     second_call = select_account.await_args_list[1]
     assert first_call.kwargs["account_ids"] == {"acc-soft"}
     assert second_call.kwargs["account_ids"] is None
+
+
+def test_prepare_http_bridge_request_records_estimated_lease_tokens() -> None:
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    payload = proxy_service.ResponsesRequest.model_validate(
+        {
+            "model": "gpt-5.2",
+            "instructions": "inspect",
+            "input": [{"role": "user", "content": "please inspect this moderately long payload"}],
+            "stream": True,
+        }
+    )
+
+    request_state, _ = service._prepare_http_bridge_request(
+        payload,
+        {"x-codex-session-id": "bridge-estimate"},
+        api_key=None,
+        api_key_reservation=None,
+        request_id="req-bridge-estimate",
+    )
+
+    assert request_state.estimated_lease_tokens > 0
+
+
+def test_estimated_lease_tokens_preserves_unknown_usage_defaults() -> None:
+    assert proxy_service._estimated_lease_tokens_from_usage_budget(None) == float(
+        proxy_service.API_KEY_USAGE_RESERVATION_DEFAULT_INPUT_TOKENS
+        + proxy_service.API_KEY_USAGE_RESERVATION_DEFAULT_OUTPUT_TOKENS
+    )
+    assert proxy_service._estimated_lease_tokens_from_usage_budget(
+        proxy_service.ApiKeyRequestUsageBudget(input_tokens=None, output_tokens=17)
+    ) == float(proxy_service.API_KEY_USAGE_RESERVATION_DEFAULT_INPUT_TOKENS + 17)
 
 
 def test_headers_with_authorization_restores_missing_proxy_api_header() -> None:

@@ -15,13 +15,21 @@ from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from app.core.auth.dashboard_mode import DashboardAuthMode, normalize_dashboard_auth_proxy_header
-from app.core.utils.proxy_env import outbound_proxy_env_configured
 
 BASE_DIR = Path(__file__).resolve().parents[3]
 ENV_FILES = (BASE_DIR / ".env", BASE_DIR / ".env.local")
+_STANDARD_OUTBOUND_PROXY_ENV_NAMES = {
+    "all_proxy",
+    "http_proxy",
+    "https_proxy",
+    "socks_proxy",
+    "ws_proxy",
+    "wss_proxy",
+}
 
 DOCKER_DATA_DIR = Path("/var/lib/codex-lb")
 DOCKER_CALLBACK_HOST = "0.0.0.0"
+DEFAULT_OAUTH_REDIRECT_URI = "http://localhost:1455/auth/callback"
 
 
 def _in_container() -> bool:
@@ -51,16 +59,23 @@ def _default_http_bridge_instance_id() -> str:
     return hostname or "codex-lb"
 
 
-def _default_upstream_websocket_trust_env() -> bool:
-    return outbound_proxy_env_configured(_configured_outbound_proxy_env())
-
-
 def _configured_outbound_proxy_env() -> dict[str, str | None]:
     environ: dict[str, str | None] = {}
     for env_file in ENV_FILES:
         environ.update(dotenv_values(env_file))
     environ.update(os.environ)
     return environ
+
+
+def _outbound_proxy_env_configured(environ: Mapping[str, str | None]) -> bool:
+    return any(
+        name.lower() in _STANDARD_OUTBOUND_PROXY_ENV_NAMES and value is not None and value.strip()
+        for name, value in environ.items()
+    )
+
+
+def _default_upstream_websocket_trust_env() -> bool:
+    return _outbound_proxy_env_configured(_configured_outbound_proxy_env())
 
 
 DEFAULT_HOME_DIR = _default_home_dir()
@@ -175,10 +190,26 @@ class Settings(BaseSettings):
     oauth_originator: str = "codex_chatgpt_desktop"
     oauth_scope: str = "openid profile email"
     oauth_timeout_seconds: float = 30.0
-    oauth_redirect_uri: str = "http://localhost:1455/auth/callback"
+    oauth_redirect_uri: str = DEFAULT_OAUTH_REDIRECT_URI
     oauth_callback_host: str = _default_oauth_callback_host()
     oauth_callback_port: int = 1455  # Do not change the port. OpenAI dislikes changes.
     token_refresh_timeout_seconds: float = 8.0
+    account_token_refresh_jitter_hours: float = Field(
+        default=18.0,
+        ge=0.0,
+        # Upper bound: half the default refresh interval expressed in
+        # hours (8 days * 24 / 2 = 96h). Jitter is an early-refresh
+        # offset, so this cap keeps the default schedule from starting
+        # earlier than halfway through the interval. Operators running
+        # custom ``token_refresh_interval_days`` values should adjust
+        # accordingly.
+        le=96.0,
+    )
+    account_proxy_probe_timeout_seconds: float = Field(default=10.0, gt=0)
+    account_proxy_failure_threshold: int = Field(default=3, ge=1)
+    account_proxy_failure_window_seconds: float = Field(default=60.0, gt=0)
+    http_connector_limit_per_account_direct: int = Field(default=20, ge=1)
+    http_connector_limit_per_host_per_account_direct: int = Field(default=10, ge=1)
     transcription_request_budget_seconds: float = Field(default=120.0, gt=0)
     token_refresh_interval_days: int = 8
     usage_fetch_timeout_seconds: float = 10.0
@@ -240,10 +271,6 @@ class Settings(BaseSettings):
     )
     firewall_ip_cache_ttl_seconds: int = Field(default=30, gt=0)
     dashboard_auth_mode: DashboardAuthMode = DashboardAuthMode.STANDARD
-
-    def upstream_websocket_proxy_env(self) -> Mapping[str, str | None]:
-        return _configured_outbound_proxy_env()
-
     dashboard_auth_proxy_header: str = "Remote-User"
 
     # --- Multi-replica & production settings ---
@@ -253,6 +280,7 @@ class Settings(BaseSettings):
 
     # Logging
     log_format: str = "text"  # "text" or "json"
+    log_level: str = "INFO"
 
     # Leader election
     leader_election_enabled: bool = False

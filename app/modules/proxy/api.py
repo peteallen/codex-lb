@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import time
@@ -2133,13 +2134,12 @@ async def _stream_responses(
         enforce_openai_sdk_contract=enforce_openai_sdk_contract,
     )
     keepalive_frame = CODEX_KEEPALIVE_FRAME if not enforce_openai_sdk_contract else SSE_KEEPALIVE_FRAME
-    if not enforce_openai_sdk_contract:
-        stream = _prepend_initial_sse_heartbeat(
-            stream,
-            keepalive_frame,
-            request_id=get_request_id(),
-            route_family="responses",
-        )
+    stream = _prepend_initial_sse_heartbeat(
+        stream,
+        keepalive_frame,
+        request_id=get_request_id(),
+        route_family="responses",
+    )
     return StreamingResponse(
         inject_sse_keepalives(
             stream,
@@ -2432,7 +2432,9 @@ async def _probe_stream_startup_error(
         if first_error is not None:
             aclose = getattr(stream, "aclose", None)
             if callable(aclose):
-                await aclose()
+                close_result = aclose()
+                if inspect.isawaitable(close_result):
+                    await cast(Awaitable[None], close_result)
             return _prepend_first(None, stream), first_error
     return _prepend_first(first, stream), None
 

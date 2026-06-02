@@ -8,11 +8,12 @@ from dataclasses import dataclass, field
 from typing import Protocol, cast
 
 from app.core.auth.refresh import RefreshError
-from app.core.clients.http import refresh_http_client
+from app.core.clients.account_http import invalidate_account_client
 from app.core.clients.model_fetcher import ModelFetchError, fetch_models_for_plan
 from app.core.config.settings import get_settings
 from app.core.crypto import TokenEncryptor
 from app.core.openai.model_registry import UpstreamModel, get_model_registry
+from app.core.upstream_proxy import ResolvedUpstreamRoute, resolve_upstream_route
 from app.db.models import Account, AccountStatus
 from app.db.session import get_background_session
 from app.modules.accounts.auth_manager import AuthManager
@@ -242,9 +243,16 @@ async def _fetch_models_with_transport_recovery(
 ) -> list[UpstreamModel]:
     access_token = encryptor.decrypt(account.access_token_encrypted)
     account_id = account.chatgpt_account_id
+    route = await _resolve_upstream_route_for_account(account, operation="model_discovery")
 
     try:
-        return await fetch_models_for_plan(access_token, account_id)
+        return await fetch_models_for_plan(
+            access_token,
+            account_id,
+            lease_account_id=account.id,
+            route=route,
+            allow_direct_egress=route is None,
+        )
     except ModelFetchError as exc:
         if not exc.transport_error or transport_recovery.attempted:
             raise
@@ -253,12 +261,29 @@ async def _fetch_models_with_transport_recovery(
         transport_recovery.attempted = True
         access_token = encryptor.decrypt(account.access_token_encrypted)
         account_id = account.chatgpt_account_id
-        return await fetch_models_for_plan(access_token, account_id)
+        route = await _resolve_upstream_route_for_account(account, operation="model_discovery")
+        return await fetch_models_for_plan(
+            access_token,
+            account_id,
+            lease_account_id=account.id,
+            route=route,
+            allow_direct_egress=route is None,
+        )
+
+
+async def _resolve_upstream_route_for_account(account: Account, *, operation: str) -> ResolvedUpstreamRoute | None:
+    async with get_background_session() as session:
+        return await resolve_upstream_route(
+            session,
+            account_id=account.id,
+            operation=operation,
+            scope="account",
+        )
 
 
 async def _refresh_http_client_after_transport_error(account: Account, transport_exc: BaseException) -> None:
     try:
-        await refresh_http_client()
+        await invalidate_account_client(account.id)
     except Exception as refresh_exc:
         logger.warning(
             "Model fetch transport recovery failed account=%s plan=%s transport_error=%s refresh_error=%s",
@@ -269,7 +294,7 @@ async def _refresh_http_client_after_transport_error(account: Account, transport
         )
         raise
     logger.info(
-        "Refreshed shared HTTP client after model fetch transport error; retrying account=%s plan=%s error=%s",
+        "Invalidated account HTTP client after model fetch transport error; retrying account=%s plan=%s error=%s",
         account.id,
         account.plan_type,
         _error_summary(transport_exc),
