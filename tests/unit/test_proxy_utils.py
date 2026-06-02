@@ -17202,6 +17202,64 @@ async def test_codex_control_refresh_connection_reset_fails_over(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_codex_control_failed_routed_call_logs_actual_fallback_endpoint(monkeypatch):
+    request_logs = _RequestLogsRecorder()
+    service = proxy_service.ProxyService(_repo_factory(request_logs))
+    account = _make_account("acc_control_routed_error")
+    fallback_endpoint = ResolvedProxyEndpoint("ep_control_b", "http", "fallback.proxy.test", 8081)
+    route = ResolvedUpstreamRoute(
+        mode="account_bound",
+        pool_id="pool_control",
+        endpoint=ResolvedProxyEndpoint("ep_control_a", "http", "primary.proxy.test", 8080),
+        fallbacks=(fallback_endpoint,),
+    )
+
+    monkeypatch.setattr(
+        service,
+        "_select_account_with_budget",
+        AsyncMock(return_value=AccountSelection(account=account, error_message=None)),
+    )
+    monkeypatch.setattr(
+        service,
+        "_ensure_previsible_unary_fresh_with_failover",
+        AsyncMock(return_value=account),
+    )
+    monkeypatch.setattr(service, "_resolve_upstream_route_for_account", AsyncMock(return_value=route))
+    monkeypatch.setattr(service, "_retry_previsible_unary_call_failover", AsyncMock(return_value=None))
+    monkeypatch.setattr(service, "_handle_proxy_error", AsyncMock())
+
+    async def fake_codex_control_request(*args: object, **kwargs: object) -> proxy_module.CodexControlResponse:
+        del args
+        route_trace = cast(proxy_module.UpstreamProxyRouteTrace, kwargs["route_trace"])
+        selected_route = cast(ResolvedUpstreamRoute, kwargs["route"])
+        route_trace.record(
+            route=selected_route.with_endpoint(fallback_endpoint, ()),
+            fallback_used=True,
+        )
+        raise proxy_module.ProxyResponseError(
+            502,
+            openai_error("upstream_unavailable", "fallback endpoint returned 502"),
+        )
+
+    monkeypatch.setattr(proxy_service, "core_codex_control_request", fake_codex_control_request)
+
+    with pytest.raises(proxy_module.ProxyResponseError):
+        await service.codex_control_request(
+            "/conversation",
+            method="GET",
+            payload=None,
+            query_params={},
+            headers={"session_id": "sid-control-routed-error"},
+        )
+
+    assert request_logs.calls[0]["status"] == "error"
+    assert request_logs.calls[0]["upstream_proxy_route_mode"] == "account_bound"
+    assert request_logs.calls[0]["upstream_proxy_pool_id"] == "pool_control"
+    assert request_logs.calls[0]["upstream_proxy_endpoint_id"] == "ep_control_b"
+    assert request_logs.calls[0]["upstream_proxy_fallback_used"] is True
+
+
+@pytest.mark.asyncio
 async def test_transcribe_refresh_connection_reset_fails_over(monkeypatch):
     request_logs = _RequestLogsRecorder()
     service = proxy_service.ProxyService(_repo_factory(request_logs))

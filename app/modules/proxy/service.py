@@ -2266,24 +2266,25 @@ class ProxyService:
                         route_pool_id = route.pool_id
                         route_endpoint_id = route.endpoint_id
                     route_trace = UpstreamProxyRouteTrace()
-                    compact_response = await _call_with_supported_optional_kwargs(
-                        core_compact_responses,
-                        payload,
-                        filtered,
-                        access_token,
-                        account_id,
-                        optional_kwargs={
-                            "route": route,
-                            "allow_direct_egress": route is None,
-                            "route_trace": route_trace,
-                        },
-                    )
-                    if route_trace.mode is not None:
-                        route_mode = route_trace.mode
-                        route_pool_id = route_trace.pool_id
-                        route_endpoint_id = route_trace.endpoint_id
-                        route_fallback_used = route_trace.fallback_used
-                    return compact_response
+                    try:
+                        return await _call_with_supported_optional_kwargs(
+                            core_compact_responses,
+                            payload,
+                            filtered,
+                            access_token,
+                            account_id,
+                            optional_kwargs={
+                                "route": route,
+                                "allow_direct_egress": route is None,
+                                "route_trace": route_trace,
+                            },
+                        )
+                    finally:
+                        if route_trace.mode is not None:
+                            route_mode = route_trace.mode
+                            route_pool_id = route_trace.pool_id
+                            route_endpoint_id = route_trace.endpoint_id
+                            route_fallback_used = route_trace.fallback_used
                 finally:
                     if create_lease is not None:
                         create_lease.release()
@@ -2747,24 +2748,25 @@ class ProxyService:
                     route_pool_id = route.pool_id
                     route_endpoint_id = route.endpoint_id
                 route_trace = UpstreamProxyRouteTrace()
-                response = await core_thread_goal_request(
-                    operation,
-                    payload,
-                    filtered,
-                    access_token,
-                    upstream_account_id,
-                    method=method,
-                    timeout_seconds=remaining_budget,
-                    route=route,
-                    allow_direct_egress=route is None,
-                    route_trace=route_trace,
-                )
-                if route_trace.mode is not None:
-                    route_mode = route_trace.mode
-                    route_pool_id = route_trace.pool_id
-                    route_endpoint_id = route_trace.endpoint_id
-                    route_fallback_used = route_trace.fallback_used
-                return response
+                try:
+                    return await core_thread_goal_request(
+                        operation,
+                        payload,
+                        filtered,
+                        access_token,
+                        upstream_account_id,
+                        method=method,
+                        timeout_seconds=remaining_budget,
+                        route=route,
+                        allow_direct_egress=route is None,
+                        route_trace=route_trace,
+                    )
+                finally:
+                    if route_trace.mode is not None:
+                        route_mode = route_trace.mode
+                        route_pool_id = route_trace.pool_id
+                        route_endpoint_id = route_trace.endpoint_id
+                        route_fallback_used = route_trace.fallback_used
 
             async def _select_goal_failover(excluded_account_ids: set[str]) -> AccountSelection:
                 return await self._select_account_with_budget(
@@ -3037,25 +3039,26 @@ class ProxyService:
                     route_pool_id = route.pool_id
                     route_endpoint_id = route.endpoint_id
                 route_trace = UpstreamProxyRouteTrace()
-                response = await core_codex_control_request(
-                    path,
-                    method=method,
-                    payload=payload,
-                    query_params=query_params,
-                    headers=filtered,
-                    access_token=access_token,
-                    account_id=upstream_account_id,
-                    timeout_seconds=remaining_budget,
-                    route=route,
-                    allow_direct_egress=route is None,
-                    route_trace=route_trace,
-                )
-                if route_trace.mode is not None:
-                    route_mode = route_trace.mode
-                    route_pool_id = route_trace.pool_id
-                    route_endpoint_id = route_trace.endpoint_id
-                    route_fallback_used = route_trace.fallback_used
-                return response
+                try:
+                    return await core_codex_control_request(
+                        path,
+                        method=method,
+                        payload=payload,
+                        query_params=query_params,
+                        headers=filtered,
+                        access_token=access_token,
+                        account_id=upstream_account_id,
+                        timeout_seconds=remaining_budget,
+                        route=route,
+                        allow_direct_egress=route is None,
+                        route_trace=route_trace,
+                    )
+                finally:
+                    if route_trace.mode is not None:
+                        route_mode = route_trace.mode
+                        route_pool_id = route_trace.pool_id
+                        route_endpoint_id = route_trace.endpoint_id
+                        route_fallback_used = route_trace.fallback_used
 
             async def _select_control_failover(excluded_account_ids: set[str]) -> AccountSelection:
                 return await self._select_account_with_budget(
@@ -3550,7 +3553,7 @@ class ProxyService:
                     total_timeout_seconds=remaining_budget,
                 )
                 try:
-                    result = await _call_with_supported_optional_kwargs(
+                    return await _call_with_supported_optional_kwargs(
                         core_transcribe_audio,
                         audio_bytes,
                         optional_kwargs={
@@ -3566,13 +3569,12 @@ class ProxyService:
                         account_id=account_id,
                     )
                 finally:
+                    if route_trace.mode is not None:
+                        route_mode = route_trace.mode
+                        route_pool_id = route_trace.pool_id
+                        route_endpoint_id = route_trace.endpoint_id
+                        route_fallback_used = route_trace.fallback_used
                     pop_transcribe_timeout_overrides(timeout_tokens)
-                if route_trace.mode is not None:
-                    route_mode = route_trace.mode
-                    route_pool_id = route_trace.pool_id
-                    route_endpoint_id = route_trace.endpoint_id
-                    route_fallback_used = route_trace.fallback_used
-                return result
 
             async def _select_transcribe_failover(excluded_account_ids: set[str]) -> AccountSelection:
                 return await self._select_account_with_budget(
@@ -4091,13 +4093,7 @@ class ProxyService:
                     total_timeout_seconds=remaining_budget,
                 )
                 try:
-                    result = await invoke(access_token, account_id, filtered, route, route_trace)
-                    if route_trace.mode is not None:
-                        route_mode = route_trace.mode
-                        route_pool_id = route_trace.pool_id
-                        route_endpoint_id = route_trace.endpoint_id
-                        route_fallback_used = route_trace.fallback_used
-                    return result
+                    return await invoke(access_token, account_id, filtered, route, route_trace)
                 except FileProxyError as files_exc:
                     raise ProxyResponseError(
                         files_exc.status_code,
@@ -4105,6 +4101,11 @@ class ProxyService:
                         failure_phase=files_exc.failure_phase,
                     ) from files_exc
                 finally:
+                    if route_trace.mode is not None:
+                        route_mode = route_trace.mode
+                        route_pool_id = route_trace.pool_id
+                        route_endpoint_id = route_trace.endpoint_id
+                        route_fallback_used = route_trace.fallback_used
                     pop_files_timeout_overrides(timeout_tokens)
 
             async def _select_files_failover(excluded_account_ids: set[str]) -> AccountSelection:

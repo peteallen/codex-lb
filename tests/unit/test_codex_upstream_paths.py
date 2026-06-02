@@ -6,7 +6,7 @@ import pytest
 from curl_cffi.const import CurlWsFlag
 
 import app.core.clients.proxy as proxy_module
-from app.core.clients.codex import CodexTransportError
+from app.core.clients.codex import CodexTransportError, CodexWebSocketResult
 from app.core.clients.files import create_file, finalize_file
 from app.core.clients.proxy import (
     ProxyResponseError,
@@ -155,6 +155,31 @@ class _WsCodexClient:
     async def ws_connect(self, url: str, *, route: ResolvedUpstreamRoute, **kwargs: Any) -> _FakeWsContext:
         self.calls.append({"url": url, "route": route, **kwargs})
         return self.context
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+class _RawWsCodexClient:
+    def __init__(self) -> None:
+        self.websocket = _FakeCodexWebSocket()
+        self.calls: list[dict[str, Any]] = []
+        self.closed = False
+
+    async def open_ws_with_route_metadata(
+        self,
+        url: str,
+        *,
+        route: ResolvedUpstreamRoute,
+        **kwargs: Any,
+    ) -> CodexWebSocketResult:
+        self.calls.append({"url": url, "route": route, **kwargs})
+        return CodexWebSocketResult(
+            websocket=self.websocket,
+            context=None,
+            route=route,
+            fallback_used=False,
+        )
 
     async def close(self) -> None:
         self.closed = True
@@ -400,6 +425,36 @@ async def test_stream_responses_websocket_transport_uses_codex_client_when_route
     assert client.calls[0]["url"].startswith("wss://")
     assert client.calls[0]["route"] is route
     assert '"type":"response.create"' in str(client.websocket.sent[0])
+    assert trace.endpoint_id == "ep_1"
+
+
+@pytest.mark.asyncio
+async def test_stream_responses_routed_websocket_closes_raw_result_without_context(
+    route: ResolvedUpstreamRoute,
+) -> None:
+    client = _RawWsCodexClient()
+    trace = UpstreamProxyRouteTrace()
+    payload = ResponsesRequest(model="gpt-5.2", instructions="Reply.", input="hello", stream=True)
+
+    events = [
+        event
+        async for event in stream_responses(
+            payload,
+            {"user-agent": "codex"},
+            "access",
+            "chatgpt_account",
+            session=cast(Any, object()),
+            upstream_stream_transport_override="websocket",
+            route=route,
+            codex_client=cast(Any, client),
+            route_trace=trace,
+        )
+    ]
+
+    assert events == ['event: response.completed\ndata: {"type":"response.completed"}\n\n']
+    assert client.calls[0]["url"].endswith("/backend-api/codex/responses")
+    assert client.websocket.closed is True
+    assert client.closed is False
     assert trace.endpoint_id == "ep_1"
 
 

@@ -1428,6 +1428,17 @@ async def _stream_codex_websocket_events(
             break
 
 
+async def _close_unmanaged_websocket(websocket: Any | None) -> None:
+    if websocket is None:
+        return
+    close = getattr(websocket, "close", None)
+    if not callable(close):
+        return
+    result = close()
+    if asyncio.iscoroutine(result):
+        await result
+
+
 async def _stream_responses_via_websocket(
     *,
     payload_dict: JsonObject,
@@ -1617,6 +1628,8 @@ async def _stream_responses_via_websocket(
                 await websocket_context.__aexit__(None, None, None)
             elif websocket_cm is not None:
                 await websocket_cm.__aexit__(None, None, None)
+            else:
+                await _close_unmanaged_websocket(websocket)
         finally:
             if owns_codex_client and active_codex_client is not None:
                 await active_codex_client.close()
@@ -2469,8 +2482,6 @@ async def _stream_responses_with_session(
                         if event_type in _RESPONSE_STREAM_TERMINAL_EVENT_TYPES:
                             seen_terminal = True
                     yield event_block
-                    if seen_terminal:
-                        break
             except aiohttp.WSServerHandshakeError as exc:
                 if not _should_fallback_to_http_after_websocket_handshake_error(transport_mode, exc):
                     error_payload = _error_payload_from_websocket_handshake_error(exc)
