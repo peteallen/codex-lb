@@ -35,8 +35,8 @@ from typing import Any
 
 import aiohttp
 
+from app.core.clients.account_http import lease_account_http_session
 from app.core.clients.codex import CodexClient, create_codex_session, require_route_or_direct_egress_opt_in
-from app.core.clients.http import lease_http_session
 from app.core.config.settings import get_settings
 from app.core.errors import openai_error
 from app.core.types import JsonValue
@@ -219,7 +219,7 @@ async def create_file(
         )
         return await _parse_file_response(response, "/files")
     try:
-        async with lease_http_session(session) as client_session:
+        async with lease_account_http_session(account_id or "", session) as client_session:
             async with client_session.post(
                 url,
                 data=body,
@@ -343,7 +343,7 @@ async def finalize_file(
         finally:
             if owns_codex_client:
                 await active_codex_client.close()
-    async with lease_http_session(session) as client_session:
+    async with lease_account_http_session(account_id or "", session) as client_session:
         # The finalize budget cannot exceed the caller's per-request budget;
         # otherwise we would keep polling well past the parent timeout.
         finalize_budget = min(_DEFAULT_FILE_FINALIZE_BUDGET_SECONDS, effective_per_poll_total)

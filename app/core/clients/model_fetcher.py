@@ -6,6 +6,7 @@ from typing import cast
 
 import aiohttp
 
+from app.core.clients.account_http import lease_account_http_session
 from app.core.clients.codex import (
     CodexClient,
     CodexTransportError,
@@ -13,7 +14,6 @@ from app.core.clients.codex import (
     require_route_or_direct_egress_opt_in,
 )
 from app.core.clients.codex_version import get_codex_version_cache
-from app.core.clients.http import lease_http_session
 from app.core.config.settings import get_settings
 from app.core.openai.model_registry import ReasoningLevel, UpstreamModel
 from app.core.types import JsonValue
@@ -150,7 +150,7 @@ async def fetch_models_for_plan(
             data = await _codex_response_json(resp)
         else:
             timeout = aiohttp.ClientTimeout(total=_FETCH_TIMEOUT_SECONDS)
-            async with lease_http_session() as session:
+            async with lease_account_http_session(account_id or "") as session:
                 async with session.get(url, headers=headers, timeout=timeout) as resp:
                     if resp.status >= 400:
                         text = await resp.text()

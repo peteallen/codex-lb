@@ -191,10 +191,11 @@ async def validate_codex_usage_identity(request: Request) -> ApiKeyData | None:
         account = await accounts_repo.get_active_by_chatgpt_account_id(account_id)
         if account is None:
             raise ProxyAuthError("Unknown or inactive chatgpt-account-id")
+        local_account_id = account.id
         try:
             route = await resolve_upstream_route(
                 session,
-                account_id=account.id,
+                account_id=local_account_id,
                 operation="usage_identity",
                 scope="account",
                 encryptor=TokenEncryptor(),
@@ -206,6 +207,7 @@ async def validate_codex_usage_identity(request: Request) -> ApiKeyData | None:
         await fetch_usage(
             access_token=token,
             account_id=account_id,
+            lease_account_id=local_account_id,
             route=route,
             allow_direct_egress=route is None,
         )

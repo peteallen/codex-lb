@@ -37,6 +37,7 @@ from aiohttp.http_websocket import WS_KEY, WebSocketReader, WebSocketWriter
 from curl_cffi.const import CurlWsFlag
 from multidict import CIMultiDict
 
+from app.core.clients.account_http import lease_account_http_session
 from app.core.clients.codex import (
     CodexClient,
     CodexTransportError,
@@ -44,7 +45,7 @@ from app.core.clients.codex import (
     create_codex_session,
     require_route_or_direct_egress_opt_in,
 )
-from app.core.clients.http import acquire_http_client, lease_http_session
+from app.core.clients.http import acquire_http_client
 from app.core.config.settings import Settings, get_settings
 from app.core.conversation_archive import archive_json, archive_text
 from app.core.errors import (
@@ -1442,6 +1443,7 @@ async def _stream_responses_via_websocket(
     codex_client: CodexClient | None = None,
     route_trace: UpstreamProxyRouteTrace | None = None,
     allow_direct_egress: bool = True,
+    chatgpt_account_id: str | None = None,
 ) -> AsyncIterator[str]:
     websocket_url = _to_websocket_upstream_url(url)
     request_started_at = time.monotonic()
@@ -2094,8 +2096,9 @@ async def stream_responses(
     codex_client: CodexClient | None = None,
     route_trace: UpstreamProxyRouteTrace | None = None,
     allow_direct_egress: bool = True,
+    chatgpt_account_id: str | None = None,
 ) -> AsyncIterator[str]:
-    async with lease_http_session(session) as client_session:
+    async with lease_account_http_session(account_id or "", session) as client_session:
         async for event_block in _stream_responses_with_session(
             payload=payload,
             headers=headers,
@@ -2109,6 +2112,7 @@ async def stream_responses(
             codex_client=codex_client,
             route_trace=route_trace,
             allow_direct_egress=allow_direct_egress,
+            chatgpt_account_id=chatgpt_account_id,
         ):
             yield event_block
 
@@ -2126,8 +2130,10 @@ async def _stream_responses_with_session(
     codex_client: CodexClient | None = None,
     route_trace: UpstreamProxyRouteTrace | None = None,
     allow_direct_egress: bool = True,
+    chatgpt_account_id: str | None = None,
 ) -> AsyncIterator[str]:
     settings = get_settings()
+    upstream_account_id = chatgpt_account_id if chatgpt_account_id is not None else account_id
     upstream_base = (base_url or settings.upstream_base_url).rstrip("/")
     url = f"{upstream_base}/codex/responses"
     require_route_or_direct_egress_opt_in(
@@ -2177,10 +2183,10 @@ async def _stream_responses_with_session(
         payload_size_estimate_bytes=payload_size_estimate_bytes,
     )
     if transport == "websocket":
-        upstream_headers = _build_upstream_websocket_headers(headers, access_token, account_id)
+        upstream_headers = _build_upstream_websocket_headers(headers, access_token, upstream_account_id)
         method = "GET"
     else:
-        upstream_headers = _build_upstream_headers(headers, access_token, account_id)
+        upstream_headers = _build_upstream_headers(headers, access_token, upstream_account_id)
         method = "POST"
     remaining_request_timeout = _remaining_total_timeout(
         request_total_timeout,
@@ -2406,7 +2412,7 @@ async def _stream_responses_with_session(
         )
 
         transport = "http"
-        upstream_headers = _build_upstream_headers(headers, access_token, account_id)
+        upstream_headers = _build_upstream_headers(headers, access_token, upstream_account_id)
         method = "POST"
         remaining_request_timeout = _remaining_total_timeout(
             request_total_timeout,
@@ -2757,8 +2763,9 @@ async def compact_responses(
     codex_client: CodexClient | None = None,
     route_trace: UpstreamProxyRouteTrace | None = None,
     allow_direct_egress: bool = True,
+    chatgpt_account_id: str | None = None,
 ) -> CompactResponsePayload:
-    async with lease_http_session(session) as client_session:
+    async with lease_account_http_session(account_id or "", session) as client_session:
         transport = _CompactCommandTransport(
             payload=payload,
             headers=headers,
@@ -2769,6 +2776,7 @@ async def compact_responses(
             codex_client=codex_client,
             route_trace=route_trace,
             allow_direct_egress=allow_direct_egress,
+            chatgpt_account_id=chatgpt_account_id,
         )
         return await transport.execute()
 
@@ -2788,11 +2796,13 @@ class _CompactCommandTransport:
     codex_client: CodexClient | None = None
     route_trace: UpstreamProxyRouteTrace | None = None
     allow_direct_egress: bool = False
+    chatgpt_account_id: str | None = None
 
     async def execute(self) -> CompactResponsePayload:
         settings = get_settings()
         upstream_base = settings.upstream_base_url.rstrip("/")
         url = f"{upstream_base}/codex/responses/compact"
+        upstream_account_id = self.chatgpt_account_id if self.chatgpt_account_id is not None else self.account_id
         require_route_or_direct_egress_opt_in(
             route=self.route,
             allow_direct_egress=self.allow_direct_egress,
@@ -2803,7 +2813,7 @@ class _CompactCommandTransport:
         upstream_headers = _build_upstream_headers(
             self.headers,
             self.access_token,
-            self.account_id,
+            upstream_account_id,
             accept="application/json",
         )
         pre_request_started_at = time.monotonic()
@@ -3219,6 +3229,7 @@ async def thread_goal_request(
     codex_client: CodexClient | None = None,
     route_trace: UpstreamProxyRouteTrace | None = None,
     allow_direct_egress: bool = True,
+    chatgpt_account_id: str | None = None,
 ) -> dict[str, JsonValue]:
     settings = get_settings()
     upstream_base = (base_url or settings.upstream_base_url).rstrip("/")
@@ -3571,8 +3582,9 @@ async def transcribe_audio(
     codex_client: CodexClient | None = None,
     route_trace: UpstreamProxyRouteTrace | None = None,
     allow_direct_egress: bool = True,
+    chatgpt_account_id: str | None = None,
 ) -> dict[str, JsonValue]:
-    async with lease_http_session(session) as client_session:
+    async with lease_account_http_session(account_id or "", session) as client_session:
         return await _transcribe_audio_with_session(
             audio_bytes,
             filename=filename,
@@ -3587,6 +3599,7 @@ async def transcribe_audio(
             codex_client=codex_client,
             route_trace=route_trace,
             allow_direct_egress=allow_direct_egress,
+            chatgpt_account_id=chatgpt_account_id,
         )
 
 
@@ -3605,14 +3618,16 @@ async def _transcribe_audio_with_session(
     codex_client: CodexClient | None = None,
     route_trace: UpstreamProxyRouteTrace | None = None,
     allow_direct_egress: bool = False,
+    chatgpt_account_id: str | None = None,
 ) -> dict[str, JsonValue]:
     settings = get_settings()
+    upstream_account_id = chatgpt_account_id if chatgpt_account_id is not None else account_id
     upstream_base = (base_url or settings.upstream_base_url).rstrip("/")
     url = f"{upstream_base}/transcribe"
     upstream_headers = _build_upstream_transcribe_headers(
         headers,
         access_token,
-        account_id,
+        upstream_account_id,
     )
 
     effective_total_timeout = _effective_transcribe_total_timeout(

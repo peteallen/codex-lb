@@ -2123,11 +2123,12 @@ class ProxyService:
                         payload,
                         filtered,
                         access_token,
-                        account_id,
+                        target.id,
                         optional_kwargs={
                             "route": route,
                             "allow_direct_egress": route is None,
                             "route_trace": route_trace,
+                            "chatgpt_account_id": account_id,
                         },
                     )
                     if route_trace.mode is not None:
@@ -3050,13 +3051,14 @@ class ProxyService:
                             "route": route,
                             "allow_direct_egress": route is None,
                             "route_trace": route_trace,
+                            "chatgpt_account_id": account_id,
                         },
                         filename=filename,
                         content_type=content_type,
                         prompt=prompt,
                         headers=filtered,
                         access_token=access_token,
-                        account_id=account_id,
+                        account_id=target.id,
                     )
                 finally:
                     pop_transcribe_timeout_overrides(timeout_tokens)
@@ -5376,10 +5378,11 @@ class ProxyService:
                 connect_responses_websocket,
                 headers,
                 access_token,
-                account_id,
+                account.id,
                 optional_kwargs={
                     "route": route,
                     "allow_direct_egress": route is None,
+                    "chatgpt_account_id": account_id,
                 },
             )
             if request_state is not None:
@@ -11175,11 +11178,12 @@ class ProxyService:
                     payload,
                     headers,
                     access_token,
-                    account_id,
+                    account.id,
                     optional_kwargs={
                         "route": route,
                         "allow_direct_egress": route is None,
                         "route_trace": route_trace,
+                        "chatgpt_account_id": account_id,
                     },
                     raise_for_status=True,
                     upstream_stream_transport_override=upstream_stream_transport,
@@ -11190,11 +11194,12 @@ class ProxyService:
                     payload,
                     headers,
                     access_token,
-                    account_id,
+                    account.id,
                     optional_kwargs={
                         "route": route,
                         "allow_direct_egress": route is None,
                         "route_trace": route_trace,
+                        "chatgpt_account_id": account_id,
                     },
                     raise_for_status=True,
                 )
