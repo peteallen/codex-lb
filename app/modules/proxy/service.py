@@ -11601,7 +11601,6 @@ class ProxyService:
         rewritten_file_account_id: str | None = None,
         upstream_stream_transport_override: str | None = None,
         enforce_openai_sdk_contract: bool = True,
-        upstream_stream_transport_override: str | None = None,
     ) -> AsyncIterator[str]:
         request_id = ensure_request_id()
         start = time.monotonic()
@@ -13091,7 +13090,12 @@ class ProxyService:
                 event_payload = parse_sse_data_json(line)
                 event = parse_sse_event(line)
                 event_type = _event_type_from_payload(event, event_payload)
-                if event_type == "error" and (event is None or event.error is None) and isinstance(event_payload, dict):
+                if (
+                    enforce_openai_sdk_contract
+                    and event_type == "error"
+                    and (event is None or event.error is None)
+                    and isinstance(event_payload, dict)
+                ):
                     message_value = event_payload.get("message")
                     message = (
                         message_value.strip()
