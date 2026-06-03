@@ -2176,6 +2176,10 @@ async def _stream_responses_with_session(
     last_stream_activity_at: float | None = None
     error_code: str | None = None
     error_message: str | None = None
+    failure_phase: str | None = None
+    failure_detail: str | None = None
+    failure_exception_type: str | None = None
+    retryable_same_contract: bool | None = None
     client_session = session
     payload_dict = payload.to_payload()
     if settings.image_inline_fetch_enabled:
@@ -2529,6 +2533,10 @@ async def _stream_responses_with_session(
     except StreamIdleTimeoutError:
         error_code = "stream_idle_timeout"
         error_message = "Upstream stream idle timeout"
+        failure_phase = "upstream"
+        failure_detail = "stream_idle_timeout"
+        failure_exception_type = "StreamIdleTimeoutError"
+        retryable_same_contract = False
         yield format_sse_event(
             response_failed_event(
                 "stream_idle_timeout",
@@ -2568,6 +2576,10 @@ async def _stream_responses_with_session(
             exc=exc,
         )
         response_error_message = cast(str, error_message)
+        failure_phase = "upstream"
+        failure_detail = "transport_error"
+        failure_exception_type = type(exc).__name__
+        retryable_same_contract = True
         yield format_sse_event(
             response_failed_event("upstream_unavailable", response_error_message, response_id=get_request_id()),
         )
@@ -2581,6 +2593,10 @@ async def _stream_responses_with_session(
             exc=exc,
         )
         response_error_message = cast(str, error_message)
+        failure_phase = "upstream"
+        failure_detail = "transport_error"
+        failure_exception_type = type(exc).__name__
+        retryable_same_contract = True
         yield format_sse_event(
             response_failed_event("upstream_unavailable", response_error_message, response_id=get_request_id()),
         )
@@ -2601,6 +2617,10 @@ async def _stream_responses_with_session(
                 else str(exc) or "Request to upstream timed out"
             )
             response_error_message = cast(str, error_message)
+            failure_phase = "upstream"
+            failure_detail = "transport_error"
+            failure_exception_type = type(exc).__name__
+            retryable_same_contract = True
             yield format_sse_event(
                 response_failed_event("upstream_unavailable", response_error_message, response_id=get_request_id()),
             )
@@ -2614,6 +2634,10 @@ async def _stream_responses_with_session(
         ):
             error_code = "stream_idle_timeout"
             error_message = "Upstream stream idle timeout"
+            failure_phase = "upstream"
+            failure_detail = "stream_idle_timeout"
+            failure_exception_type = type(exc).__name__
+            retryable_same_contract = False
             yield format_sse_event(
                 response_failed_event(
                     "stream_idle_timeout",
@@ -2636,6 +2660,10 @@ async def _stream_responses_with_session(
                 else str(exc) or "Request to upstream timed out"
             )
             response_error_message = cast(str, error_message)
+            failure_phase = "upstream"
+            failure_detail = "transport_error"
+            failure_exception_type = type(exc).__name__
+            retryable_same_contract = True
             yield format_sse_event(
                 response_failed_event(
                     "upstream_unavailable",
@@ -2646,12 +2674,40 @@ async def _stream_responses_with_session(
             return
         error_code = "upstream_request_timeout"
         error_message = "Proxy request budget exhausted"
+        failure_phase = "upstream"
+        failure_detail = "request_timeout"
+        failure_exception_type = type(exc).__name__
+        retryable_same_contract = False
         yield format_sse_event(
             response_failed_event(
                 "upstream_request_timeout",
                 "Proxy request budget exhausted",
                 response_id=get_request_id(),
             ),
+        )
+        return
+    except GeneratorExit:
+        error_code = "client_disconnected"
+        error_message = "Downstream client disconnected before response.completed"
+        failure_phase = "downstream"
+        failure_detail = "client_disconnected_before_terminal_event"
+        failure_exception_type = "GeneratorExit"
+        retryable_same_contract = False
+        raise
+    except OSError as exc:
+        error_code = "upstream_unavailable"
+        error_message = _codex_route_transport_error_message(
+            route=route,
+            route_trace=route_trace,
+            operation="stream",
+            exc=exc,
+        )
+        failure_phase = "upstream"
+        failure_detail = "transport_error"
+        failure_exception_type = type(exc).__name__
+        retryable_same_contract = True
+        yield format_sse_event(
+            response_failed_event("upstream_unavailable", error_message, response_id=get_request_id()),
         )
         return
     except Exception as exc:
@@ -2688,6 +2744,10 @@ async def _stream_responses_with_session(
             status_code=status_code,
             error_code=error_code,
             error_message=error_message,
+            failure_phase=failure_phase,
+            failure_detail=failure_detail,
+            failure_exception_type=failure_exception_type,
+            retryable_same_contract=retryable_same_contract,
         )
 
 
