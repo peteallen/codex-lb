@@ -2328,14 +2328,9 @@ async def _stream_responses_with_session(
                             event.type == "error" and not enforce_openai_sdk_contract
                         ):
                             seen_terminal = True
-                    elif (
-                        isinstance(normalized_event_type, str)
-                        and (
-                            normalized_event_type in _RESPONSE_STREAM_TERMINAL_EVENT_TYPES
-                            or (
-                                normalized_event_type == "error" and not enforce_openai_sdk_contract
-                            )
-                        )
+                    elif isinstance(normalized_event_type, str) and (
+                        normalized_event_type in _RESPONSE_STREAM_TERMINAL_EVENT_TYPES
+                        or (normalized_event_type == "error" and not enforce_openai_sdk_contract)
                     ):
                         seen_terminal = True
                     archive_text(
@@ -2421,14 +2416,9 @@ async def _stream_responses_with_session(
                         event.type == "error" and not enforce_openai_sdk_contract
                     ):
                         seen_terminal = True
-                elif (
-                    isinstance(normalized_event_type, str)
-                    and (
-                        normalized_event_type in _RESPONSE_STREAM_TERMINAL_EVENT_TYPES
-                        or (
-                            normalized_event_type == "error" and not enforce_openai_sdk_contract
-                        )
-                    )
+                elif isinstance(normalized_event_type, str) and (
+                    normalized_event_type in _RESPONSE_STREAM_TERMINAL_EVENT_TYPES
+                    or (normalized_event_type == "error" and not enforce_openai_sdk_contract)
                 ):
                     seen_terminal = True
                 archive_text(
