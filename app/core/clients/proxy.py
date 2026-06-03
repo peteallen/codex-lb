@@ -1077,7 +1077,18 @@ def _normalize_stream_event_payload(payload: dict[str, JsonValue]) -> dict[str, 
     return payload
 
 
-def _normalize_stream_payload_for_http_block(event_block: str) -> tuple[str, str | None]:
+def _normalize_stream_payload_for_http_block(
+    event_block: str,
+    *,
+    enforce_openai_sdk_contract: bool = True,
+) -> tuple[str, str | None]:
+    if not enforce_openai_sdk_contract:
+        payload = parse_sse_data_json(event_block)
+        if payload is None:
+            return event_block, None
+        event_type = payload.get("type")
+        return event_block, event_type if isinstance(event_type, str) else None
+
     payload = parse_sse_data_json(event_block)
     if payload is None:
         return event_block, None
@@ -2129,6 +2140,7 @@ async def stream_responses(
     codex_client: CodexClient | None = None,
     route_trace: UpstreamProxyRouteTrace | None = None,
     allow_direct_egress: bool = True,
+    enforce_openai_sdk_contract: bool = True,
 ) -> AsyncIterator[str]:
     effective_allow_direct_egress = allow_direct_egress or (route is None and session is not None)
     async with lease_http_session(session) as client_session:
@@ -2145,6 +2157,7 @@ async def stream_responses(
             codex_client=codex_client,
             route_trace=route_trace,
             allow_direct_egress=effective_allow_direct_egress,
+            enforce_openai_sdk_contract=enforce_openai_sdk_contract,
         ):
             yield event_block
 
@@ -2162,6 +2175,7 @@ async def _stream_responses_with_session(
     codex_client: CodexClient | None = None,
     route_trace: UpstreamProxyRouteTrace | None = None,
     allow_direct_egress: bool = True,
+    enforce_openai_sdk_contract: bool = True,
 ) -> AsyncIterator[str]:
     settings = get_settings()
     upstream_base = (base_url or settings.upstream_base_url).rstrip("/")
@@ -2304,14 +2318,24 @@ async def _stream_responses_with_session(
                 ):
                     last_stream_activity_at = time.monotonic()
                     event_block = _normalize_sse_event_block(event_block)
-                    event_block, normalized_event_type = _normalize_stream_payload_for_http_block(event_block)
+                    event_block, normalized_event_type = _normalize_stream_payload_for_http_block(
+                        event_block,
+                        enforce_openai_sdk_contract=enforce_openai_sdk_contract,
+                    )
                     event = parse_sse_event(event_block)
                     if event:
-                        if event.type in _RESPONSE_STREAM_TERMINAL_EVENT_TYPES:
+                        if event.type in _RESPONSE_STREAM_TERMINAL_EVENT_TYPES or (
+                            event.type == "error" and not enforce_openai_sdk_contract
+                        ):
                             seen_terminal = True
                     elif (
                         isinstance(normalized_event_type, str)
-                        and normalized_event_type in _RESPONSE_STREAM_TERMINAL_EVENT_TYPES
+                        and (
+                            normalized_event_type in _RESPONSE_STREAM_TERMINAL_EVENT_TYPES
+                            or (
+                                normalized_event_type == "error" and not enforce_openai_sdk_contract
+                            )
+                        )
                     ):
                         seen_terminal = True
                     archive_text(
@@ -2387,14 +2411,24 @@ async def _stream_responses_with_session(
             ):
                 last_stream_activity_at = time.monotonic()
                 event_block = _normalize_sse_event_block(event_block)
-                event_block, normalized_event_type = _normalize_stream_payload_for_http_block(event_block)
+                event_block, normalized_event_type = _normalize_stream_payload_for_http_block(
+                    event_block,
+                    enforce_openai_sdk_contract=enforce_openai_sdk_contract,
+                )
                 event = parse_sse_event(event_block)
                 if event:
-                    if event.type in _RESPONSE_STREAM_TERMINAL_EVENT_TYPES:
+                    if event.type in _RESPONSE_STREAM_TERMINAL_EVENT_TYPES or (
+                        event.type == "error" and not enforce_openai_sdk_contract
+                    ):
                         seen_terminal = True
                 elif (
                     isinstance(normalized_event_type, str)
-                    and normalized_event_type in _RESPONSE_STREAM_TERMINAL_EVENT_TYPES
+                    and (
+                        normalized_event_type in _RESPONSE_STREAM_TERMINAL_EVENT_TYPES
+                        or (
+                            normalized_event_type == "error" and not enforce_openai_sdk_contract
+                        )
+                    )
                 ):
                     seen_terminal = True
                 archive_text(

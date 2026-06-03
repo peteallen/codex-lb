@@ -4756,6 +4756,64 @@ async def test_stream_responses_http_transport_keeps_http(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_stream_responses_http_transport_preserves_raw_error_shape_when_contract_disabled(monkeypatch):
+    class Settings:
+        upstream_base_url = "https://chatgpt.com/backend-api"
+        upstream_connect_timeout_seconds = 8.0
+        stream_idle_timeout_seconds = 45.0
+        max_sse_event_bytes = 1024
+        image_inline_fetch_enabled = False
+        log_upstream_request_payload = False
+        proxy_request_budget_seconds = 75.0
+        log_upstream_request_summary = False
+        upstream_stream_transport = "http"
+
+    monkeypatch.setattr(proxy_module, "get_settings", lambda: Settings())
+    monkeypatch.setattr(
+        proxy_module,
+        "get_model_registry",
+        lambda: SimpleNamespace(prefers_websockets=lambda model: model == "gpt-5.4"),
+    )
+    monkeypatch.setattr(proxy_module, "_maybe_log_upstream_request_start", lambda **kwargs: None)
+    monkeypatch.setattr(proxy_module, "_maybe_log_upstream_request_complete", lambda **kwargs: None)
+
+    session = _SseSession(
+        _SsePostResponse(
+            [
+                b'data: {"type":"response.created","response":{"id":"resp_http_error"}}\n\n',
+                (
+                    b'data: {"type":"error","sequence_number":"error","error_type":"server_error",'
+                    b'"message":"OpenCode stream failed"}\n\n'
+                ),
+            ]
+        )
+    )
+    payload = ResponsesRequest.model_validate(
+        {"model": "gpt-5.4", "instructions": "hi", "input": [{"role": "user", "content": "hi"}]}
+    )
+
+    events = [
+        event
+        async for event in proxy_module.stream_responses(
+            payload,
+            headers={},
+            access_token="token",
+            account_id="acc_1",
+            session=cast(proxy_module.aiohttp.ClientSession, session),
+            enforce_openai_sdk_contract=False,
+        )
+    ]
+
+    assert session.calls
+    assert len(events) == 2
+    parsed_error = parse_sse_data_json(events[1])
+    assert parsed_error is not None
+    assert parsed_error["type"] == "error"
+    assert parsed_error["sequence_number"] == "error"
+    assert parsed_error["error_type"] == "server_error"
+
+
+@pytest.mark.asyncio
 async def test_stream_responses_http_transport_normalizes_error_sequence_number_to_response_failed(monkeypatch):
     class Settings:
         upstream_base_url = "https://chatgpt.com/backend-api"

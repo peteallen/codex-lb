@@ -759,6 +759,7 @@ class ProxyService:
         api_key_reservation: ApiKeyUsageReservationData | None = None,
         suppress_text_done_events: bool = False,
         request_transport: str = _REQUEST_TRANSPORT_HTTP,
+        enforce_openai_sdk_contract: bool = True,
     ) -> AsyncIterator[str]:
         _maybe_log_proxy_request_payload("stream", payload, headers)
         filtered = filter_inbound_headers(headers)
@@ -772,6 +773,7 @@ class ProxyService:
             api_key_reservation=api_key_reservation,
             suppress_text_done_events=suppress_text_done_events,
             request_transport=request_transport,
+            enforce_openai_sdk_contract=enforce_openai_sdk_contract,
         )
 
     def stream_http_responses(
@@ -789,6 +791,7 @@ class ProxyService:
         forwarded_request: bool = False,
         forwarded_affinity_kind: str | None = None,
         forwarded_affinity_key: str | None = None,
+        enforce_openai_sdk_contract: bool = True,
     ) -> AsyncIterator[str]:
         _maybe_log_proxy_request_payload("stream_http", payload, headers)
         proxy_api_authorization = _header_value_case_insensitive(headers, "authorization")
@@ -807,6 +810,7 @@ class ProxyService:
             proxy_api_authorization=proxy_api_authorization,
             forwarded_affinity_kind=forwarded_affinity_kind,
             forwarded_affinity_key=forwarded_affinity_key,
+            enforce_openai_sdk_contract=enforce_openai_sdk_contract,
         )
 
     async def _stream_http_bridge_or_retry(
@@ -825,6 +829,7 @@ class ProxyService:
         proxy_api_authorization: str | None = None,
         forwarded_affinity_kind: str | None = None,
         forwarded_affinity_key: str | None = None,
+        enforce_openai_sdk_contract: bool = True,
     ) -> AsyncIterator[str]:
         dashboard_settings = await get_settings_cache().get()
         runtime_config = _http_bridge_runtime_config(dashboard_settings, get_settings())
@@ -864,6 +869,7 @@ class ProxyService:
                 request_transport=_REQUEST_TRANSPORT_HTTP,
                 rewritten_file_account_id=rewritten_file_account_id,
                 upstream_stream_transport_override=force_upstream_stream_transport,
+                enforce_openai_sdk_contract=enforce_openai_sdk_contract,
             ):
                 yield line
             return
@@ -888,6 +894,7 @@ class ProxyService:
             forwarded_affinity_kind=forwarded_affinity_kind,
             forwarded_affinity_key=forwarded_affinity_key,
             rewritten_file_account_id=rewritten_file_account_id,
+            enforce_openai_sdk_contract=enforce_openai_sdk_contract,
         ):
             yield line
 
@@ -11540,6 +11547,8 @@ class ProxyService:
         request_transport: str,
         rewritten_file_account_id: str | None = None,
         upstream_stream_transport_override: str | None = None,
+        enforce_openai_sdk_contract: bool = True,
+        upstream_stream_transport_override: str | None = None,
     ) -> AsyncIterator[str]:
         request_id = ensure_request_id()
         start = time.monotonic()
@@ -12075,6 +12084,7 @@ class ProxyService:
                                 request_transport=request_transport,
                                 preferred_account_id=preferred_account_id,
                                 tool_call_dedupe=tool_call_dedupe,
+                                enforce_openai_sdk_contract=enforce_openai_sdk_contract,
                             ):
                                 yield line
                         except (_TransientStreamError, ProxyResponseError) as tex:
@@ -12441,6 +12451,7 @@ class ProxyService:
                                 upstream_stream_transport=upstream_stream_transport,
                                 request_transport=request_transport,
                                 tool_call_dedupe=tool_call_dedupe,
+                                enforce_openai_sdk_contract=enforce_openai_sdk_contract,
                             ):
                                 yield line
                         except ProxyResponseError as retry_exc:
@@ -12727,6 +12738,7 @@ class ProxyService:
         request_transport: str,
         preferred_account_id: str | None = None,
         tool_call_dedupe: _WebSocketUpstreamControl | None = None,
+        enforce_openai_sdk_contract: bool = True,
     ) -> AsyncIterator[str]:
         account_id_value = account.id
         access_token = self._encryptor.decrypt(account.access_token_encrypted)
@@ -12822,6 +12834,7 @@ class ProxyService:
                     },
                     raise_for_status=True,
                     upstream_stream_transport_override=upstream_stream_transport,
+                    enforce_openai_sdk_contract=enforce_openai_sdk_contract,
                 )
             else:
                 stream = _call_stream_with_supported_optional_kwargs(
@@ -12836,6 +12849,7 @@ class ProxyService:
                         "route_trace": route_trace,
                     },
                     raise_for_status=True,
+                    enforce_openai_sdk_contract=enforce_openai_sdk_contract,
                 )
             iterator = stream.__aiter__()
             try:
