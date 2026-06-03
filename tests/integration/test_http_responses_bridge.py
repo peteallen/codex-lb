@@ -5725,11 +5725,10 @@ async def test_v1_responses_http_bridge_does_not_evict_queued_session_when_pool_
         monkeypatch,
         enabled=True,
         max_sessions=1,
-        # This test verifies pool accounting for a queued request. Keep the
-        # synthetic request queued long enough on slow CI hosts so the
-        # response-create gate timeout does not drain it before the pool-full
-        # assertion runs.
-        admission_wait_timeout_seconds=30.0,
+        # Queued HTTP bridge requests have already claimed the bounded bridge
+        # queue slot, so per-session gate scheduling latency must not drain
+        # them via the global admission timeout.
+        admission_wait_timeout_seconds=0.01,
     )
     account_id = await _import_account(
         async_client,
@@ -5846,6 +5845,8 @@ async def test_v1_responses_http_bridge_does_not_evict_queued_session_when_pool_
         )
     )
     await asyncio.sleep(0)
+    await asyncio.sleep(0.05)
+    assert not submit_task.done()
 
     assert await service._http_bridge_pending_count(first_session) == 1
     async with first_session.pending_lock:

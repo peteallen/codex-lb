@@ -7662,11 +7662,13 @@ async def test_submit_http_bridge_request_starts_api_key_reservation_heartbeat(
         compact: bool = False,
         account_id: str | None = None,
         surface: str = "websocket",
+        apply_gate_timeout: bool = True,
     ) -> None:
         del bridge_session
         del compact
         del account_id
         del surface
+        del apply_gate_timeout
         nonlocal admission_saw_heartbeat
         admission_saw_heartbeat = state.api_key_reservation_heartbeat_task is not None
         state.response_create_gate = response_create_gate

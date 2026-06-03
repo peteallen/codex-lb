@@ -5474,6 +5474,7 @@ class ProxyService:
         compact: bool = False,
         account_id: str | None = None,
         surface: str = "websocket",
+        apply_gate_timeout: bool = True,
     ) -> None:
         timeout_seconds = _proxy_admission_wait_timeout_seconds()
         request_state.response_create_gate = response_create_gate
@@ -5485,7 +5486,10 @@ class ProxyService:
             )
             request_state.account_response_create_release = self._load_balancer.release_account_lease
         try:
-            await asyncio.wait_for(response_create_gate.acquire(), timeout=timeout_seconds)
+            if apply_gate_timeout:
+                await asyncio.wait_for(response_create_gate.acquire(), timeout=timeout_seconds)
+            else:
+                await response_create_gate.acquire()
         except TimeoutError as exc:
             await self._release_request_state_account_response_create_lease(request_state)
             request_state.response_create_gate = None
@@ -8060,6 +8064,7 @@ class ProxyService:
                 account_id=session.account.id,
                 surface="http_bridge",
                 bridge_session=session,
+                apply_gate_timeout=False,
             )
             gate_acquired = True
             async with session.lifecycle_lock:
