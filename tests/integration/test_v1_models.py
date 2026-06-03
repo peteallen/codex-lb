@@ -12,7 +12,6 @@ BOOTSTRAP_MODEL_SLUGS = {
     "gpt-5.4",
     "gpt-5.4-mini",
     "gpt-5.3-codex",
-    "gpt-5.3-codex-spark",
     "gpt-5.2",
     "codex-auto-review",
 }
@@ -39,7 +38,6 @@ EXPECTED_BOOTSTRAP_MINIMAL_CLIENT_VERSIONS = {
     "gpt-5.4": "0.98.0",
     "gpt-5.4-mini": "0.98.0",
     "gpt-5.3-codex": "0.98.0",
-    "gpt-5.3-codex-spark": "0.100.0",
     "gpt-5.2": "0.0.1",
     "codex-auto-review": "0.98.0",
 }
@@ -156,12 +154,7 @@ async def test_backend_codex_models_uses_bootstrap_upstream_metadata(async_clien
     assert mini["minimal_client_version"] == "0.98.0"
     assert {level["effort"] for level in mini["supported_reasoning_levels"]} == {"low", "medium", "high", "xhigh"}
 
-    spark = entries["gpt-5.3-codex-spark"]
-    assert spark["context_window"] == 128_000
-    assert spark["input_modalities"] == ["text"]
-    assert spark["default_reasoning_level"] == "high"
-    assert spark["supported_in_api"] is False
-    assert spark["minimal_client_version"] == "0.100.0"
+    assert "gpt-5.3-codex-spark" not in entries
 
     auto_review = entries["codex-auto-review"]
     assert auto_review["visibility"] == "hide"
@@ -173,7 +166,7 @@ async def test_backend_codex_models_uses_bootstrap_upstream_metadata(async_clien
 
 
 @pytest.mark.asyncio
-async def test_v1_models_includes_supported_in_api_false_models(async_client):
+async def test_v1_models_excludes_supported_in_api_false_models(async_client):
     registry = get_model_registry()
     models = [
         _make_upstream_model("gpt-5.2"),
@@ -185,7 +178,25 @@ async def test_v1_models_includes_supported_in_api_false_models(async_client):
     resp = await async_client.get("/v1/models")
     assert resp.status_code == 200
     ids = {item["id"] for item in resp.json()["data"]}
-    assert {"gpt-5.2", "gpt-5.3-codex", "gpt-hidden"}.issubset(ids)
+    assert "gpt-5.2" in ids
+    assert "gpt-5.3-codex" in ids
+    assert "gpt-hidden" not in ids
+
+
+@pytest.mark.asyncio
+async def test_v1_models_includes_supported_model_and_excludes_unsupported_spark_alias(async_client):
+    registry = get_model_registry()
+    models = [
+        _make_upstream_model("gpt-5.3-codex", supported_in_api=False),
+        _make_upstream_model("gpt-5.3-codex-spark", supported_in_api=True),
+    ]
+    await registry.update({"plus": models, "pro": models})
+
+    resp = await async_client.get("/v1/models")
+    assert resp.status_code == 200
+    ids = {item["id"] for item in resp.json()["data"]}
+    assert "gpt-5.3-codex" not in ids
+    assert "gpt-5.3-codex-spark" in ids
 
 
 @pytest.mark.asyncio
@@ -524,7 +535,7 @@ async def test_backend_codex_models_preserves_original_flow_without_allowlist(as
 
 
 @pytest.mark.asyncio
-async def test_backend_codex_models_includes_supported_in_api_false_models(async_client):
+async def test_backend_codex_models_excludes_supported_in_api_false_models(async_client):
     registry = get_model_registry()
     models = [
         _make_upstream_model("gpt-5.2"),
@@ -536,7 +547,9 @@ async def test_backend_codex_models_includes_supported_in_api_false_models(async
     resp = await async_client.get("/backend-api/codex/models")
     assert resp.status_code == 200
     slugs = {m["slug"] for m in resp.json()["models"]}
-    assert {"gpt-5.2", "gpt-5.3-codex", "gpt-hidden"}.issubset(slugs)
+    assert "gpt-5.2" in slugs
+    assert "gpt-5.3-codex" in slugs
+    assert "gpt-hidden" not in slugs
 
 
 @pytest.mark.asyncio
@@ -572,6 +585,9 @@ async def test_model_sets_are_consistent_across_api_endpoints(async_client):
     dashboard_ids = {item["id"] for item in dashboard.json()["models"]}
     v1_ids = {item["id"] for item in v1.json()["data"]}
     codex_slugs = {item["slug"] for item in codex.json()["models"]}
+    assert "gpt-hidden" not in dashboard_ids
+    assert "gpt-hidden" not in v1_ids
+    assert "gpt-hidden" not in codex_slugs
     assert dashboard_ids == v1_ids == codex_slugs
 
 
