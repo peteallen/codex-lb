@@ -11365,7 +11365,12 @@ class ProxyService:
             return await asyncio.shield(task)
         except asyncio.CancelledError:
             settlement.usage_settlement_transferred = True
-            self._track_stream_usage_settlement_task(task, api_key=api_key, request_id=request_id)
+            self._track_stream_usage_settlement_task(
+                task,
+                api_key=api_key,
+                api_key_reservation=api_key_reservation,
+                request_id=request_id,
+            )
             raise
 
     async def _settle_stream_api_key_usage_owned(
@@ -11416,6 +11421,7 @@ class ProxyService:
         task: asyncio.Task[bool],
         *,
         api_key: ApiKeyData,
+        api_key_reservation: ApiKeyUsageReservationData,
         request_id: str,
     ) -> None:
         self._background_cleanup_tasks.add(task)
@@ -11423,7 +11429,7 @@ class ProxyService:
         def _settlement_done(done_task: asyncio.Task[bool]) -> None:
             self._background_cleanup_tasks.discard(done_task)
             try:
-                done_task.result()
+                settled = done_task.result()
             except asyncio.CancelledError:
                 logger.warning(
                     "Stream API key settlement task cancelled key_id=%s request_id=%s",
@@ -11437,6 +11443,18 @@ class ProxyService:
                     request_id,
                     exc_info=(type(exc), exc, exc.__traceback__),
                 )
+            else:
+                if not settled:
+                    release_coro = self._release_unsettled_stream_api_key_usage(
+                        api_key=api_key,
+                        api_key_reservation=api_key_reservation,
+                        request_id=request_id,
+                    )
+                    self._schedule_cancel_safe_cleanup(
+                        release_coro,
+                        action="release_stream_api_key_reservation_after_failed_settlement",
+                        request_id=request_id,
+                    )
 
         task.add_done_callback(_settlement_done)
 
@@ -12969,6 +12987,7 @@ class ProxyService:
             event = parse_sse_event(first)
             event_type = _event_type_from_payload(event, first_payload)
             mark_terminal_event_seen(event_type)
+            preserve_raw_sse_line = not enforce_openai_sdk_contract and event_type == "error"
             if event_type not in {"response.completed", "response.failed", "response.incomplete", "error"}:
                 api_key_reservation_touch_state.last_touch_at = await self._maybe_touch_api_key_reservation(
                     api_key=api_key,
@@ -13006,13 +13025,17 @@ class ProxyService:
                     and _websocket_event_error_code(event_type, first_payload) is None
                 ):
                     code = "upstream_error"
-                rewritten_error = _rewrite_previous_response_stream_error(
-                    previous_response_id=payload.previous_response_id,
-                    preferred_account_id=preferred_account_id,
-                    error_code=code,
-                    error_type=error.type if error else None,
-                    error_message=error.message if error else None,
-                    error_param=error.param if error else None,
+                rewritten_error = (
+                    None
+                    if preserve_raw_sse_line
+                    else _rewrite_previous_response_stream_error(
+                        previous_response_id=payload.previous_response_id,
+                        preferred_account_id=preferred_account_id,
+                        error_code=code,
+                        error_type=error.type if error else None,
+                        error_message=error.message if error else None,
+                        error_param=error.param if error else None,
+                    )
                 )
                 status = "error"
                 settlement.error = _upstream_error_from_openai(error)
@@ -13093,7 +13116,7 @@ class ProxyService:
                 ):
                     suppressed_duplicate_tool_call = True
                 else:
-                    if first_payload is not None:
+                    if first_payload is not None and not preserve_raw_sse_line:
                         first = format_sse_event(first_payload)
                     if latency_first_token_ms is None and event_type in _TEXT_DELTA_EVENT_TYPES:
                         latency_first_token_ms = int((time.monotonic() - request_started_at) * 1000)
@@ -13108,6 +13131,7 @@ class ProxyService:
                 event_payload = parse_sse_data_json(line)
                 event = parse_sse_event(line)
                 event_type = _event_type_from_payload(event, event_payload)
+                preserve_raw_sse_line = not enforce_openai_sdk_contract and event_type == "error"
                 if (
                     enforce_openai_sdk_contract
                     and event_type == "error"
@@ -13169,13 +13193,17 @@ class ProxyService:
                             and _websocket_event_error_code(event_type, event_payload) is None
                         ):
                             raw_error_code = "upstream_error"
-                        rewritten_error = _rewrite_previous_response_stream_error(
-                            previous_response_id=payload.previous_response_id,
-                            preferred_account_id=preferred_account_id,
-                            error_code=raw_error_code,
-                            error_type=error.type if error else None,
-                            error_message=error.message if error else None,
-                            error_param=error.param if error else None,
+                        rewritten_error = (
+                            None
+                            if preserve_raw_sse_line
+                            else _rewrite_previous_response_stream_error(
+                                previous_response_id=payload.previous_response_id,
+                                preferred_account_id=preferred_account_id,
+                                error_code=raw_error_code,
+                                error_type=error.type if error else None,
+                                error_message=error.message if error else None,
+                                error_param=error.param if error else None,
+                            )
                         )
                         if rewritten_error is not None:
                             response_id = (
@@ -13245,7 +13273,7 @@ class ProxyService:
                 ):
                     suppressed_duplicate_tool_call = True
                     continue
-                if event_payload is not None:
+                if event_payload is not None and not preserve_raw_sse_line:
                     line = format_sse_event(event_payload)
                 settlement.downstream_visible = True
                 if event_type in _TEXT_DELTA_EVENT_TYPES:

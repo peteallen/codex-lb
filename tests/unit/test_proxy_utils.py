@@ -6025,6 +6025,10 @@ async def test_service_stream_responses_preserves_raw_codex_error_after_created(
     service = proxy_service.ProxyService(_repo_factory(request_logs))
     account = _make_account("acc_stream_raw_error")
     captured: dict[str, object] = {}
+    raw_error_line = (
+        'data: {"type":"error","sequence_number":"error","error_type":"server_error",'
+        '"message":"OpenCode stream failed"}\n\n'
+    )
 
     monkeypatch.setattr(proxy_service, "get_settings_cache", lambda: _SettingsCache(settings))
     monkeypatch.setattr(proxy_service, "get_settings", lambda: settings)
@@ -6048,10 +6052,7 @@ async def test_service_stream_responses_preserves_raw_codex_error_after_created(
         del payload, headers, access_token, account_id, base_url, raise_for_status
         captured["enforce_openai_sdk_contract"] = enforce_openai_sdk_contract
         yield 'data: {"type":"response.created","response":{"id":"resp_raw_error"}}\n\n'
-        yield (
-            'data: {"type":"error","sequence_number":"error","error_type":"server_error",'
-            '"message":"OpenCode stream failed"}\n\n'
-        )
+        yield raw_error_line
 
     monkeypatch.setattr(proxy_service, "core_stream_responses", fake_stream)
 
@@ -6075,6 +6076,7 @@ async def test_service_stream_responses_preserves_raw_codex_error_after_created(
 
     assert captured["enforce_openai_sdk_contract"] is False
     assert len(chunks) >= 2
+    assert chunks[1] == raw_error_line
     error_payload = parse_sse_data_json(chunks[1])
     assert error_payload is not None
     assert error_payload["type"] == "error"
@@ -12769,6 +12771,81 @@ async def test_stream_api_key_settlement_outlives_caller_cancel_and_closes_repo(
         }
     ]
     assert settlement.usage_settlement_transferred is True
+
+
+@pytest.mark.asyncio
+async def test_stream_api_key_background_settlement_failure_falls_back_to_release(monkeypatch):
+    started = asyncio.Event()
+    release_finalize = asyncio.Event()
+    released: list[str] = []
+    repo = SimpleNamespace(api_keys=object())
+
+    @asynccontextmanager
+    async def repo_factory() -> AsyncIterator[SimpleNamespace]:
+        yield repo
+
+    class FakeApiKeysService:
+        def __init__(self, api_keys_repository: object) -> None:
+            assert api_keys_repository is repo.api_keys
+
+        async def finalize_usage_reservation(self, reservation_id: str, **kwargs: object) -> None:
+            del reservation_id, kwargs
+            started.set()
+            await release_finalize.wait()
+            raise RuntimeError("temporary finalize failure")
+
+        async def release_usage_reservation(self, reservation_id: str) -> None:
+            released.append(reservation_id)
+
+    monkeypatch.setattr(proxy_service, "ApiKeysService", FakeApiKeysService)
+
+    service = proxy_service.ProxyService(cast(proxy_service.ProxyRepoFactory, repo_factory))
+    api_key = ApiKeyData(
+        id="key_stream_failed_background",
+        name="stream failed background",
+        key_prefix="sk-bgfail",
+        allowed_models=None,
+        enforced_model=None,
+        enforced_reasoning_effort=None,
+        enforced_service_tier=None,
+        expires_at=None,
+        is_active=True,
+        created_at=utcnow(),
+        last_used_at=None,
+    )
+    reservation = proxy_service.ApiKeyUsageReservationData(
+        reservation_id="resv_stream_failed_background",
+        key_id=api_key.id,
+        model="gpt-5.5",
+    )
+    settlement = proxy_service._StreamSettlement(
+        status="success",
+        model="gpt-5.5",
+        input_tokens=12,
+        output_tokens=34,
+    )
+
+    caller = asyncio.create_task(
+        service._settle_stream_api_key_usage(
+            api_key,
+            reservation,
+            settlement,
+            request_id="req_stream_failed_background",
+        )
+    )
+    await started.wait()
+    caller.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await caller
+
+    release_finalize.set()
+    for _ in range(50):
+        if not service._background_cleanup_tasks:
+            break
+        await asyncio.sleep(0)
+
+    assert service._background_cleanup_tasks == set()
+    assert released == ["resv_stream_failed_background"]
 
 
 @pytest.mark.asyncio
