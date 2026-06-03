@@ -975,6 +975,47 @@ async def test_opportunistic_admission_honors_stream_account_cap(monkeypatch):
     assert selection.error_message == "opportunistic burn window closed: no account capacity available"
 
 
+@pytest.mark.asyncio
+async def test_probe_stream_startup_error_preserves_event_error_when_conversion_disabled():
+    raw_error = (
+        'data: {"type":"error","sequence_number":"error","error_type":"server_error",'
+        '"message":"native upstream error"}\n\n'
+    )
+
+    async def stream():
+        yield raw_error
+
+    probed, startup_error = await proxy_api._probe_stream_startup_error(
+        stream(),
+        convert_event_errors=False,
+    )
+
+    assert startup_error is None
+    assert [chunk async for chunk in probed] == [raw_error]
+
+
+@pytest.mark.asyncio
+async def test_probe_stream_startup_error_converts_event_error_when_contract_enabled():
+    raw_error = (
+        'data: {"type":"error","sequence_number":"error","error_type":"server_error",'
+        '"message":"native upstream error"}\n\n'
+    )
+
+    async def stream():
+        yield raw_error
+
+    probed, startup_error = await proxy_api._probe_stream_startup_error(
+        stream(),
+        convert_event_errors=True,
+    )
+
+    assert startup_error is not None
+    assert not isinstance(startup_error, proxy_module.ProxyResponseError)
+    assert startup_error.error is not None
+    assert startup_error.error.code == "upstream_error"
+    assert [chunk async for chunk in probed] == []
+
+
 def test_has_native_codex_transport_headers_requires_allowlisted_originator():
     assert proxy_module._has_native_codex_transport_headers({"originator": "codex_cli_rs"}) is True
     assert proxy_module._has_native_codex_transport_headers({"originator": "codex_exec"}) is True
