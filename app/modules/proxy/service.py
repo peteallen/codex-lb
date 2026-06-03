@@ -113,7 +113,7 @@ from app.core.metrics.prometheus import (
     continuity_owner_resolution_total,
 )
 from app.core.openai.exceptions import ClientPayloadError
-from app.core.openai.models import CompactResponsePayload, OpenAIEvent, OpenAIResponsePayload
+from app.core.openai.models import CompactResponsePayload, OpenAIError, OpenAIEvent, OpenAIResponsePayload
 from app.core.openai.parsing import parse_sse_event
 from app.core.openai.requests import (
     ResponsesCompactRequest,
@@ -13025,7 +13025,7 @@ class ProxyService:
                     response = event.response
                     error = response.error if response else None
                 else:
-                    error = event.error
+                    error = _stream_event_error(event, event_type, first_payload)
                 response_id = (
                     event.response.id
                     if event.type == "response.failed" and event.response and event.response.id
@@ -13198,7 +13198,7 @@ class ProxyService:
                                 response_id = response.id
                                 settlement.response_id = response_id
                         else:
-                            error = event.error
+                            error = _stream_event_error(event, event_type, event_payload)
                         raw_error_code = _normalize_error_code(
                             error.code if error else None,
                             error.type if error else None,
@@ -15231,6 +15231,22 @@ def _normalize_http_bridge_error_event(
     normalized_payload = parse_sse_data_json(normalized_event_block)
     parsed_event = parse_sse_event(normalized_event_block)
     return normalized_event_block, normalized_payload, parsed_event, "response.failed"
+
+
+def _stream_event_error(
+    event: OpenAIEvent | None,
+    event_type: str | None,
+    payload: dict[str, JsonValue] | None,
+) -> OpenAIError | None:
+    if event is not None and event.error is not None:
+        return event.error
+    raw_error = _websocket_event_error_payload(event_type, payload)
+    if not isinstance(raw_error, dict):
+        return None
+    try:
+        return OpenAIError.model_validate(raw_error)
+    except ValidationError:
+        return None
 
 
 def _websocket_response_id(event: OpenAIEvent | None, payload: dict[str, JsonValue] | None) -> str | None:

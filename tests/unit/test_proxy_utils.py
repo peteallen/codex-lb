@@ -6025,10 +6025,8 @@ async def test_service_stream_responses_preserves_raw_codex_error_after_created(
     service = proxy_service.ProxyService(_repo_factory(request_logs))
     account = _make_account("acc_stream_raw_error")
     captured: dict[str, object] = {}
-    raw_error_line = (
-        'data: {"type":"error","sequence_number":"error","error_type":"server_error",'
-        '"message":"OpenCode stream failed"}\n\n'
-    )
+    handle_stream_error = AsyncMock()
+    raw_error_line = 'data: {"type":"error","code":"rate_limit_exceeded","message":"OpenCode stream failed"}\n\n'
 
     monkeypatch.setattr(proxy_service, "get_settings_cache", lambda: _SettingsCache(settings))
     monkeypatch.setattr(proxy_service, "get_settings", lambda: settings)
@@ -6039,6 +6037,7 @@ async def test_service_stream_responses_preserves_raw_codex_error_after_created(
     )
     monkeypatch.setattr(service, "_ensure_fresh", AsyncMock(return_value=account))
     monkeypatch.setattr(service, "_settle_stream_api_key_usage", AsyncMock(return_value=True))
+    monkeypatch.setattr(service, "_handle_stream_error", handle_stream_error)
 
     async def fake_stream(
         payload,
@@ -6080,8 +6079,12 @@ async def test_service_stream_responses_preserves_raw_codex_error_after_created(
     error_payload = parse_sse_data_json(chunks[1])
     assert error_payload is not None
     assert error_payload["type"] == "error"
-    assert error_payload["sequence_number"] == "error"
-    assert error_payload["error_type"] == "server_error"
+    assert error_payload["code"] == "rate_limit_exceeded"
+    handle_stream_error.assert_awaited_once()
+    handle_args = handle_stream_error.await_args
+    assert handle_args is not None
+    assert handle_args.args[0] == account
+    assert handle_args.args[2] == "rate_limit_exceeded"
 
 
 @pytest.mark.asyncio
