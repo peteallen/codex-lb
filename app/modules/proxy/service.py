@@ -12150,10 +12150,10 @@ class ProxyService:
                         "route": route,
                         "allow_direct_egress": route is None,
                         "route_trace": route_trace,
+                        "upstream_stream_transport_override": upstream_stream_transport,
+                        "enforce_openai_sdk_contract": enforce_openai_sdk_contract,
                     },
                     raise_for_status=True,
-                    upstream_stream_transport_override=upstream_stream_transport,
-                    enforce_openai_sdk_contract=enforce_openai_sdk_contract,
                 )
             else:
                 stream = _call_stream_with_supported_optional_kwargs(
@@ -12166,9 +12166,9 @@ class ProxyService:
                         "route": route,
                         "allow_direct_egress": route is None,
                         "route_trace": route_trace,
+                        "enforce_openai_sdk_contract": enforce_openai_sdk_contract,
                     },
                     raise_for_status=True,
-                    enforce_openai_sdk_contract=enforce_openai_sdk_contract,
                 )
             iterator = stream.__aiter__()
             try:
