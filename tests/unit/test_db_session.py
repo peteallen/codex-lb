@@ -597,3 +597,48 @@ async def test_get_background_session_falls_back_to_main_pool_when_not_initializ
     async with session_module.get_background_session() as session:
         assert session is not None
         assert isinstance(session, session_module.AsyncSession)
+
+
+@pytest.mark.asyncio
+async def test_safe_close_outlives_caller_cancellation() -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+    closed = asyncio.Event()
+
+    class FakeSession:
+        async def close(self) -> None:
+            started.set()
+            await release.wait()
+            closed.set()
+
+    task = asyncio.create_task(session_module._safe_close(cast(session_module.AsyncSession, FakeSession())))
+    await started.wait()
+    task.cancel()
+    await task
+
+    release.set()
+    await asyncio.wait_for(closed.wait(), timeout=1.0)
+
+
+@pytest.mark.asyncio
+async def test_safe_rollback_outlives_caller_cancellation() -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+    rolled_back = asyncio.Event()
+
+    class FakeSession:
+        def in_transaction(self) -> bool:
+            return True
+
+        async def rollback(self) -> None:
+            started.set()
+            await release.wait()
+            rolled_back.set()
+
+    task = asyncio.create_task(session_module._safe_rollback(cast(session_module.AsyncSession, FakeSession())))
+    await started.wait()
+    task.cancel()
+    await task
+
+    release.set()
+    await asyncio.wait_for(rolled_back.wait(), timeout=1.0)

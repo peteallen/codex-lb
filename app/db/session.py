@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import sqlite3
@@ -156,8 +157,7 @@ def _startup_sqlite_check_mode(raw_mode: str) -> SqliteIntegrityCheckMode | None
 
 
 async def _shielded(awaitable: Awaitable[object]) -> None:
-    with anyio.CancelScope(shield=True):
-        await awaitable
+    await asyncio.shield(awaitable)
 
 
 async def _safe_rollback(session: AsyncSession) -> None:
