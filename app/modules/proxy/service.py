@@ -922,7 +922,7 @@ class ProxyService:
         rewritten_file_account_id: str | None = None,
         enforce_openai_sdk_contract: bool = True,
     ) -> AsyncIterator[str]:
-        del suppress_text_done_events, enforce_openai_sdk_contract
+        del suppress_text_done_events
         request_id = ensure_request_id()
         dashboard_settings = await get_settings_cache().get()
         runtime_config = _http_bridge_runtime_config(dashboard_settings, get_settings())
@@ -1019,6 +1019,7 @@ class ProxyService:
                     api_key=api_key,
                     api_key_reservation=api_key_reservation,
                     request_id=request_id,
+                    enforce_openai_sdk_contract=enforce_openai_sdk_contract,
                 )
                 del _fresh_request_state
                 _log_http_bridge_event(
@@ -1058,6 +1059,7 @@ class ProxyService:
             api_key=api_key,
             api_key_reservation=api_key_reservation,
             request_id=request_id,
+            enforce_openai_sdk_contract=enforce_openai_sdk_contract,
         )
         if downstream_turn_state is not None:
             request_state.session_id = _normalize_session_id(downstream_turn_state)
@@ -1186,6 +1188,7 @@ class ProxyService:
                 api_key=api_key,
                 api_key_reservation=api_key_reservation,
                 request_id=request_id,
+                enforce_openai_sdk_contract=enforce_openai_sdk_contract,
             )
             if downstream_turn_state is not None:
                 request_state.session_id = _normalize_session_id(downstream_turn_state)
@@ -1348,6 +1351,7 @@ class ProxyService:
                         api_key=api_key,
                         api_key_reservation=retry_api_key_reservation,
                         request_id=request_id,
+                        enforce_openai_sdk_contract=enforce_openai_sdk_contract,
                     )
                     if downstream_turn_state is not None:
                         retry_request_state.session_id = _normalize_session_id(downstream_turn_state)
@@ -1441,6 +1445,7 @@ class ProxyService:
                 api_key=api_key,
                 api_key_reservation=api_key_reservation,
                 request_id=request_id,
+                enforce_openai_sdk_contract=enforce_openai_sdk_contract,
             )
             request_state.transport = _REQUEST_TRANSPORT_HTTP
             request_state.request_stage = _http_bridge_request_stage(
@@ -1491,6 +1496,7 @@ class ProxyService:
                     api_key=api_key,
                     api_key_reservation=api_key_reservation,
                     request_id=request_id,
+                    enforce_openai_sdk_contract=enforce_openai_sdk_contract,
                 )
                 if downstream_turn_state is not None:
                     request_state.session_id = _normalize_session_id(downstream_turn_state)
@@ -1762,6 +1768,7 @@ class ProxyService:
                     api_key=api_key,
                     api_key_reservation=retry_api_key_reservation,
                     request_id=request_id,
+                    enforce_openai_sdk_contract=enforce_openai_sdk_contract,
                 )
                 if downstream_turn_state is not None:
                     retry_request_state.session_id = _normalize_session_id(downstream_turn_state)
@@ -5293,6 +5300,7 @@ class ProxyService:
         api_key: ApiKeyData | None,
         api_key_reservation: ApiKeyUsageReservationData | None,
         request_id: str | None = None,
+        enforce_openai_sdk_contract: bool = True,
     ) -> tuple[_WebSocketRequestState, str]:
         return self._prepare_response_bridge_request_state(
             payload,
@@ -5304,6 +5312,7 @@ class ProxyService:
             client_metadata=_response_create_client_metadata(payload.to_payload(), headers=headers),
             session_id=_owner_lookup_session_id_from_headers(headers),
             request_log_id=request_id or get_request_id() or ensure_request_id(None),
+            enforce_openai_sdk_contract=enforce_openai_sdk_contract,
         )
 
     def _prepare_response_bridge_request_state(
@@ -5319,6 +5328,7 @@ class ProxyService:
         session_id: str | None = None,
         request_id: str | None = None,
         request_log_id: str | None = None,
+        enforce_openai_sdk_contract: bool = True,
     ) -> tuple[_WebSocketRequestState, str]:
         deduped_replayed_input_count: int | None = None
         deduped_replayed_input_fingerprint: str | None = None
@@ -5368,6 +5378,7 @@ class ProxyService:
             session_id=_normalize_session_id(session_id),
             input_item_count=input_item_count,
             input_full_fingerprint=input_full_fingerprint,
+            enforce_openai_sdk_contract=enforce_openai_sdk_contract,
         )
         if deduped_replayed_input_count is not None:
             request_state.input_item_count = deduped_replayed_input_count
@@ -9494,16 +9505,17 @@ class ProxyService:
             http_status = _http_error_status_from_payload(payload)
             if status_request_state is not None:
                 status_request_state.error_http_status_override = http_status
-            (
-                event_block,
-                payload,
-                event,
-                event_type,
-            ) = _normalize_http_bridge_error_event(
-                event=event,
-                payload=payload,
-                request_state=terminal_request_state or matched_request_state,
-            )
+            if status_request_state is None or status_request_state.enforce_openai_sdk_contract:
+                (
+                    event_block,
+                    payload,
+                    event,
+                    event_type,
+                ) = _normalize_http_bridge_error_event(
+                    event=event,
+                    payload=payload,
+                    request_state=terminal_request_state or matched_request_state,
+                )
 
         if event_type == "response.created" and release_create_gate and created_request_state is not None:
             await _release_websocket_response_create_gate(created_request_state, session.response_create_gate)
@@ -11352,6 +11364,7 @@ class ProxyService:
         try:
             return await asyncio.shield(task)
         except asyncio.CancelledError:
+            settlement.usage_settlement_transferred = True
             self._track_stream_usage_settlement_task(task, api_key=api_key, request_id=request_id)
             raise
 
@@ -12756,7 +12769,12 @@ class ProxyService:
         finally:
             for account_lease in account_leases:
                 await self._load_balancer.release_account_lease(account_lease)
-            if not settled and api_key is not None and api_key_reservation is not None:
+            if (
+                not settled
+                and not settlement.usage_settlement_transferred
+                and api_key is not None
+                and api_key_reservation is not None
+            ):
                 release_coro = self._release_unsettled_stream_api_key_usage(
                     api_key=api_key,
                     api_key_reservation=api_key_reservation,
@@ -14389,6 +14407,7 @@ class _StreamSettlement:
     downstream_visible: bool = False
     downstream_text_visible: bool = False
     response_id: str | None = None
+    usage_settlement_transferred: bool = False
 
 
 def _stream_settlement_error_payload(settlement: _StreamSettlement) -> UpstreamError:
@@ -14630,6 +14649,7 @@ class _WebSocketRequestState:
     suppress_next_created_downstream: bool = False
     replay_downstream_response_id: str | None = None
     draining_until_terminal: bool = False
+    enforce_openai_sdk_contract: bool = True
 
 
 @dataclass(frozen=True, slots=True)
