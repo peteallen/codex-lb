@@ -8064,7 +8064,7 @@ class ProxyService:
                 account_id=session.account.id,
                 surface="http_bridge",
                 bridge_session=session,
-                apply_gate_timeout=False,
+                apply_gate_timeout=True,
             )
             gate_acquired = True
             async with session.lifecycle_lock:
@@ -8350,13 +8350,14 @@ class ProxyService:
         request_enqueued: bool,
         counted_in_queue: bool,
     ) -> None:
+        del gate_acquired
         async with session.pending_lock:
             if request_enqueued and request_state in session.pending_requests:
                 session.pending_requests.remove(request_state)
             if counted_in_queue:
                 session.queued_request_count = max(0, session.queued_request_count - 1)
         self._cancel_request_state_api_key_reservation_heartbeat(request_state)
-        if gate_acquired:
+        if request_state.response_create_gate is not None:
             await _release_websocket_response_create_gate(request_state, session.response_create_gate)
 
     async def _detach_http_bridge_request(

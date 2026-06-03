@@ -10,7 +10,7 @@ from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any, cast
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import aiohttp
 import anyio
@@ -7696,6 +7696,54 @@ async def test_submit_http_bridge_request_starts_api_key_reservation_heartbeat(
     send_text.assert_awaited_once_with(request_state.request_text)
 
     service._cancel_request_state_api_key_reservation_heartbeat(request_state)
+
+
+@pytest.mark.asyncio
+async def test_cleanup_http_bridge_submit_interruption_releases_gate_state_when_gate_already_acquired() -> None:
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    admission = cast(Any, SimpleNamespace(release=Mock()))
+    release_lease = AsyncMock()
+    lease = proxy_service.AccountLease(
+        lease_id="lease-held",
+        account_id="acc-bridge",
+        kind="stream",
+        acquired_at=1.0,
+    )
+    gate = asyncio.Semaphore(0)
+    request_state = proxy_service._WebSocketRequestState(
+        request_id="req-submit-leak",
+        model="gpt-5.4",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=time.monotonic(),
+        response_create_gate=gate,
+        response_create_gate_acquired=True,
+        response_create_admission=admission,
+        account_response_create_lease=lease,
+        account_response_create_release=release_lease,
+        awaiting_response_created=True,
+    )
+    session = _make_bridge_session(key_value="bridge-held-acquire")
+    session.response_create_gate = gate
+
+    await service._cleanup_http_bridge_submit_interruption(
+        session,
+        request_state=request_state,
+        gate_acquired=False,
+        request_enqueued=False,
+        counted_in_queue=False,
+    )
+
+    release_lease.assert_awaited_once_with(lease)
+    assert admission.release.call_count == 1
+    assert request_state.account_response_create_lease is None
+    assert request_state.account_response_create_release is None
+    assert request_state.response_create_gate is None
+    assert request_state.response_create_admission is None
+    assert request_state.awaiting_response_created is False
+    assert request_state.response_create_gate_acquired is False
+    assert gate._value == 1
 
 
 def test_websocket_admission_rejection_cancels_reservation_heartbeat_before_release() -> None:
