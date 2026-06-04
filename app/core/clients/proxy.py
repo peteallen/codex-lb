@@ -1354,6 +1354,7 @@ async def _stream_websocket_events(
     idle_timeout_seconds: float,
     total_timeout_seconds: float | None,
     max_event_bytes: int,
+    enforce_openai_sdk_contract: bool = True,
 ) -> AsyncIterator[str]:
     deadline = None if total_timeout_seconds is None else time.monotonic() + total_timeout_seconds
 
@@ -1396,7 +1397,7 @@ async def _stream_websocket_events(
             continue
         if not isinstance(payload, dict):
             continue
-        normalized = _normalize_stream_event_payload(payload)
+        normalized = payload if not enforce_openai_sdk_contract else _normalize_stream_event_payload(payload)
         event_type = normalized.get("type")
         yield format_sse_event(normalized)
         if isinstance(event_type, str) and event_type in _RESPONSE_STREAM_TERMINAL_EVENT_TYPES:
@@ -1409,6 +1410,7 @@ async def _stream_codex_websocket_events(
     idle_timeout_seconds: float,
     total_timeout_seconds: float | None,
     max_event_bytes: int,
+    enforce_openai_sdk_contract: bool = True,
 ) -> AsyncIterator[str]:
     deadline = None if total_timeout_seconds is None else time.monotonic() + total_timeout_seconds
 
@@ -1445,7 +1447,7 @@ async def _stream_codex_websocket_events(
             continue
         if not isinstance(payload, dict):
             continue
-        normalized = _normalize_stream_event_payload(payload)
+        normalized = payload if not enforce_openai_sdk_contract else _normalize_stream_event_payload(payload)
         event_type = normalized.get("type")
         yield format_sse_event(normalized)
         if isinstance(event_type, str) and event_type in _RESPONSE_STREAM_TERMINAL_EVENT_TYPES:
@@ -1479,6 +1481,7 @@ async def _stream_responses_via_websocket(
     codex_client: CodexClient | None = None,
     route_trace: UpstreamProxyRouteTrace | None = None,
     allow_direct_egress: bool = True,
+    enforce_openai_sdk_contract: bool = True,
 ) -> AsyncIterator[str]:
     websocket_url = _to_websocket_upstream_url(url)
     request_started_at = time.monotonic()
@@ -1615,6 +1618,7 @@ async def _stream_responses_via_websocket(
                 idle_timeout_seconds=effective_idle_timeout,
                 total_timeout_seconds=remaining_total_timeout,
                 max_event_bytes=max_event_bytes,
+                enforce_openai_sdk_contract=enforce_openai_sdk_contract,
             )
             if route is not None
             else _stream_websocket_events(
@@ -1622,6 +1626,7 @@ async def _stream_responses_via_websocket(
                 idle_timeout_seconds=effective_idle_timeout,
                 total_timeout_seconds=remaining_total_timeout,
                 max_event_bytes=max_event_bytes,
+                enforce_openai_sdk_contract=enforce_openai_sdk_contract,
             )
         )
         async for event in event_iter:
@@ -2533,6 +2538,7 @@ async def _stream_responses_with_session(
                     route=route,
                     codex_client=codex_client,
                     route_trace=route_trace,
+                    enforce_openai_sdk_contract=enforce_openai_sdk_contract,
                 ):
                     if status_code is None:
                         status_code = 101

@@ -4023,7 +4023,9 @@ async def test_stream_responses_via_websocket_counts_connect_and_send_against_to
         idle_timeout_seconds: float,
         total_timeout_seconds: float | None,
         max_event_bytes: int,
+        enforce_openai_sdk_contract: bool = True,
     ):
+        del enforce_openai_sdk_contract
         recorded["total_timeout_seconds"] = total_timeout_seconds
         if False:
             yield ""
@@ -4050,6 +4052,50 @@ async def test_stream_responses_via_websocket_counts_connect_and_send_against_to
     assert events == []
     assert recorded["connect_timeout_seconds"] == pytest.approx(5.0)
     assert recorded["total_timeout_seconds"] == pytest.approx(0.25)
+
+
+@pytest.mark.asyncio
+async def test_stream_responses_via_websocket_preserves_raw_error_when_sdk_contract_disabled(monkeypatch):
+    raw_payload: dict[str, object] = {
+        "type": "error",
+        "code": "rate_limit_exceeded",
+        "message": "OpenCode stream failed",
+    }
+    websocket = _WsResponse([_ws_text_message(raw_payload)])
+
+    async def fake_open_upstream_websocket(
+        *,
+        session,
+        url: str,
+        headers,
+        connect_timeout_seconds: float,
+        max_msg_size: int,
+        account_id: str | None = None,
+        hold_half_open_probe: bool = False,
+    ):
+        del session, url, headers, connect_timeout_seconds, max_msg_size, account_id, hold_half_open_probe
+        return websocket, websocket
+
+    monkeypatch.setattr(proxy_module, "_open_upstream_websocket", fake_open_upstream_websocket)
+
+    events = [
+        event
+        async for event in proxy_module._stream_responses_via_websocket(
+            payload_dict={"model": "gpt-5.1", "type": "response.create"},
+            url="https://chatgpt.com/backend-api/codex/responses",
+            headers={"originator": "codex_cli_rs"},
+            client_session=cast(proxy_module.aiohttp.ClientSession, SimpleNamespace()),
+            effective_total_timeout=5.0,
+            effective_connect_timeout=8.0,
+            effective_idle_timeout=45.0,
+            max_event_bytes=1024,
+            raise_for_status=True,
+            enforce_openai_sdk_contract=False,
+        )
+    ]
+
+    assert len(events) == 1
+    assert parse_sse_data_json(events[0]) == raw_payload
 
 
 @pytest.mark.asyncio
