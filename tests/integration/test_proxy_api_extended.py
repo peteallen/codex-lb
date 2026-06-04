@@ -903,7 +903,7 @@ async def test_proxy_stream_classifies_core_generated_eof_failure(async_client, 
         assert log.failure_detail == "upstream_eof_before_terminal_event"
 
 
-async def test_proxy_stream_classifies_first_core_generated_eof_failure(async_client, monkeypatch):
+async def test_proxy_stream_retries_first_core_generated_eof_before_no_accounts(async_client, monkeypatch):
     expected_account_id = await _import_account(
         async_client,
         "acc_stream_first_core_eof",
@@ -940,7 +940,7 @@ async def test_proxy_stream_classifies_first_core_generated_eof_failure(async_cl
         json.loads(line[6:]) for line in lines if line.startswith("data: ") and not line.startswith("data: [DONE]")
     ][-1]
     assert event["type"] == "response.failed"
-    assert event["response"]["error"]["code"] == "stream_incomplete"
+    assert event["response"]["error"]["code"] == "no_accounts"
 
     async with SessionLocal() as session:
         result = await session.execute(
@@ -948,7 +948,8 @@ async def test_proxy_stream_classifies_first_core_generated_eof_failure(async_cl
             .where(RequestLog.account_id == expected_account_id)
             .order_by(RequestLog.requested_at.desc())
         )
-        log = result.scalars().first()
+        logs = list(result.scalars().all())
+        log = next((item for item in logs if item.error_code == "stream_incomplete"), None)
         assert log is not None
         assert log.status == "error"
         assert log.error_code == "stream_incomplete"
