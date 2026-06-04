@@ -1112,6 +1112,19 @@ class ProxyService:
                 session_id=request_state.session_id,
                 surface="http_bridge",
             )
+        if request_state.previous_response_id is not None and request_state.preferred_account_id is None:
+            message = "Previous response owner account is unavailable; retry later."
+            _record_continuity_fail_closed(
+                surface="http_bridge",
+                reason="owner_account_unavailable",
+                previous_response_id=request_state.previous_response_id,
+                session_id=request_state.session_id,
+                upstream_error_code="owner_lookup_miss",
+            )
+            raise ProxyResponseError(
+                502,
+                openai_error("previous_response_owner_unavailable", message),
+            )
         file_required_preferred_account = False
         if request_state.preferred_account_id is None:
             # ``input_file.file_id`` references must land on the account
@@ -1129,19 +1142,6 @@ class ProxyService:
             if resolved_file_account_id is not None:
                 request_state.preferred_account_id = resolved_file_account_id
                 file_required_preferred_account = True
-        if request_state.previous_response_id is not None and request_state.preferred_account_id is None:
-            message = "Previous response owner account is unavailable; retry later."
-            _record_continuity_fail_closed(
-                surface="http_bridge",
-                reason="owner_account_unavailable",
-                previous_response_id=request_state.previous_response_id,
-                session_id=request_state.session_id,
-                upstream_error_code="owner_lookup_miss",
-            )
-            raise ProxyResponseError(
-                502,
-                openai_error("previous_response_owner_unavailable", message),
-            )
         if proxy_injected_previous_response_id:
             request_state.proxy_injected_previous_response_id = True
             request_state.fresh_upstream_request_text = fresh_upstream_request_text or text_data

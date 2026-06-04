@@ -9008,6 +9008,75 @@ async def test_create_http_bridge_session_fails_closed_when_previous_response_ow
 
 
 @pytest.mark.asyncio
+async def test_stream_via_http_bridge_fails_closed_before_file_affinity_when_previous_response_owner_misses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    await service._pin_file_account("file_from_other_account", "acc-file")
+    payload = proxy_service.ResponsesRequest.model_validate(
+        {
+            "model": "gpt-5.4",
+            "instructions": "hi",
+            "previous_response_id": "resp_missing_owner",
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "continue with this file"},
+                        {"type": "input_file", "file_id": "file_from_other_account"},
+                    ],
+                }
+            ],
+        }
+    )
+    get_or_create = AsyncMock()
+
+    monkeypatch.setattr(
+        proxy_service,
+        "get_settings_cache",
+        lambda: cast(
+            Any,
+            SimpleNamespace(
+                get=AsyncMock(
+                    return_value=SimpleNamespace(
+                        sticky_threads_enabled=False,
+                        openai_cache_affinity_max_age_seconds=1800,
+                        http_responses_session_bridge_prompt_cache_idle_ttl_seconds=3600,
+                        http_responses_session_bridge_gateway_safe_mode=False,
+                    )
+                )
+            ),
+        ),
+    )
+    monkeypatch.setattr(proxy_service, "get_settings", lambda: _make_app_settings())
+    monkeypatch.setattr(service._durable_bridge, "lookup_request_targets", AsyncMock(return_value=None))
+    monkeypatch.setattr(service, "_http_bridge_local_owner_account_id", AsyncMock(return_value=None))
+    monkeypatch.setattr(service, "_resolve_websocket_previous_response_owner", AsyncMock(return_value=None))
+    monkeypatch.setattr(service, "_get_or_create_http_bridge_session", get_or_create)
+
+    with pytest.raises(ProxyResponseError) as exc_info:
+        async for _ in service._stream_via_http_bridge(
+            payload,
+            headers={},
+            codex_session_affinity=True,
+            propagate_http_errors=True,
+            openai_cache_affinity=True,
+            api_key=None,
+            api_key_reservation=None,
+            suppress_text_done_events=False,
+            idle_ttl_seconds=120.0,
+            codex_idle_ttl_seconds=1800.0,
+            max_sessions=8,
+            queue_limit=4,
+        ):
+            pass
+
+    assert exc_info.value.status_code == 502
+    assert exc_info.value.payload["error"]["code"] == "previous_response_owner_unavailable"
+    get_or_create.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_stream_via_http_bridge_replays_durable_full_resend_when_owner_is_unavailable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
