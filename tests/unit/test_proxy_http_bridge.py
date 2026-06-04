@@ -7840,6 +7840,52 @@ async def test_cleanup_http_bridge_submit_interruption_releases_gate_state_when_
     assert gate._value == 1
 
 
+@pytest.mark.asyncio
+async def test_cleanup_http_bridge_submit_interruption_does_not_release_unacquired_gate() -> None:
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    release_lease = AsyncMock()
+    lease = proxy_service.AccountLease(
+        lease_id="lease-held",
+        account_id="acc-bridge",
+        kind="stream",
+        acquired_at=1.0,
+    )
+    gate = asyncio.Semaphore(1)
+    await gate.acquire()
+    request_state = proxy_service._WebSocketRequestState(
+        request_id="req-submit-overload",
+        model="gpt-5.4",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=time.monotonic(),
+        response_create_gate=gate,
+        response_create_gate_acquired=False,
+        account_response_create_lease=lease,
+        account_response_create_release=release_lease,
+        awaiting_response_created=True,
+    )
+    session = _make_bridge_session(key_value="bridge-held-unacquired")
+    session.response_create_gate = gate
+
+    await service._cleanup_http_bridge_submit_interruption(
+        session,
+        request_state=request_state,
+        gate_acquired=False,
+        request_enqueued=False,
+        counted_in_queue=False,
+    )
+
+    release_lease.assert_awaited_once_with(lease)
+    assert request_state.account_response_create_lease is None
+    assert request_state.account_response_create_release is None
+    assert request_state.response_create_gate is None
+    assert request_state.awaiting_response_created is False
+    assert request_state.response_create_gate_acquired is False
+    assert gate.locked() is True
+    gate.release()
+
+
 def test_websocket_admission_rejection_cancels_reservation_heartbeat_before_release() -> None:
     source = inspect.getsource(proxy_service.ProxyService.proxy_responses_websocket)
     start_index = source.index("except ProxyResponseError as exc:", source.index("not request_state_registered"))

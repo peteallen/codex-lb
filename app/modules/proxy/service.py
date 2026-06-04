@@ -8386,7 +8386,6 @@ class ProxyService:
         request_enqueued: bool,
         counted_in_queue: bool,
     ) -> None:
-        del gate_acquired
         async with session.pending_lock:
             if request_enqueued and request_state in session.pending_requests:
                 session.pending_requests.remove(request_state)
@@ -8394,7 +8393,21 @@ class ProxyService:
                 session.queued_request_count = max(0, session.queued_request_count - 1)
         self._cancel_request_state_api_key_reservation_heartbeat(request_state)
         if request_state.response_create_gate is not None:
-            await _release_websocket_response_create_gate(request_state, session.response_create_gate)
+            if gate_acquired or request_state.response_create_gate_acquired:
+                await _release_websocket_response_create_gate(request_state, session.response_create_gate)
+            else:
+                account_response_create_lease = request_state.account_response_create_lease
+                account_response_create_release = request_state.account_response_create_release
+                request_state.account_response_create_lease = None
+                request_state.account_response_create_release = None
+                if account_response_create_lease is not None and account_response_create_release is not None:
+                    await account_response_create_release(account_response_create_lease)
+                if request_state.response_create_admission is not None:
+                    request_state.response_create_admission.release()
+                    request_state.response_create_admission = None
+                request_state.awaiting_response_created = False
+                request_state.response_create_gate = None
+                request_state.response_create_gate_acquired = False
 
     async def _detach_http_bridge_request(
         self,
