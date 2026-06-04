@@ -13030,15 +13030,15 @@ class ProxyService:
                 response_id = event.response.id
                 settlement.response_id = response_id
             terminal_stream_error: _TerminalStreamError | None = None
-            if event and event.type in ("response.failed", "error"):
-                if event.type == "response.failed":
-                    response = event.response
+            if event_type in ("response.failed", "error"):
+                if event_type == "response.failed":
+                    response = event.response if event is not None else None
                     error = response.error if response else None
                 else:
                     error = _stream_event_error(event, event_type, first_payload)
                 response_id = (
                     event.response.id
-                    if event.type == "response.failed" and event.response and event.response.id
+                    if event is not None and event_type == "response.failed" and event.response and event.response.id
                     else request_id
                 )
                 code = _normalize_error_code(
@@ -13196,78 +13196,81 @@ class ProxyService:
                     saw_text_delta=saw_text_delta,
                 ):
                     continue
+                if event_type in ("response.failed", "error"):
+                    status = "error"
+                    if event_type == "response.failed":
+                        response = event.response if event is not None else None
+                        error = response.error if response else None
+                        if response and response.id:
+                            response_id = response.id
+                            settlement.response_id = response_id
+                    else:
+                        error = _stream_event_error(event, event_type, event_payload)
+                    raw_error_code = _normalize_error_code(
+                        error.code if error else None,
+                        error.type if error else None,
+                    )
+                    if (
+                        event_type == "error"
+                        and raw_error_code == "error"
+                        and _websocket_event_error_code(event_type, event_payload) is None
+                    ):
+                        raw_error_code = "upstream_error"
+                    rewritten_error = (
+                        None
+                        if preserve_raw_sse_line
+                        else _rewrite_previous_response_stream_error(
+                            previous_response_id=payload.previous_response_id,
+                            preferred_account_id=preferred_account_id,
+                            error_code=raw_error_code,
+                            error_type=error.type if error else None,
+                            error_message=error.message if error else None,
+                            error_param=error.param if error else None,
+                        )
+                    )
+                    if rewritten_error is not None:
+                        response_id = (
+                            event.response.id
+                            if event is not None
+                            and event_type == "response.failed"
+                            and event.response
+                            and event.response.id
+                            else request_id
+                        )
+                        rewritten_code, rewritten_message, upstream_error_code = rewritten_error
+                        if upstream_error_code is not None:
+                            await self._handle_stream_error(
+                                account,
+                                _upstream_error_from_openai(error),
+                                upstream_error_code,
+                            )
+                        line, event, event_payload, event_type = _build_rewritten_stream_response_failed_event(
+                            response_id=response_id,
+                            error_code=rewritten_code,
+                            error_message=rewritten_message,
+                        )
+                        error_code = rewritten_code
+                        error_message = rewritten_message
+                        settlement.error = _upstream_error_from_openai(error)
+                        settlement.record_success = False
+                        settlement.account_health_error = False
+                    else:
+                        error_code = raw_error_code
+                        error_message = error.message if error else None
+                        settlement.error = _upstream_error_from_openai(error)
+                        settlement.record_success = False
+                        core_generated_eof = (
+                            error_code == "stream_incomplete" and error_message == _RAW_HTTP_UPSTREAM_EOF_MESSAGE
+                        )
+                        if core_generated_eof:
+                            failure_metadata = _RequestLogFailureMetadata(
+                                failure_phase="upstream",
+                                failure_detail="upstream_eof_before_terminal_event",
+                            )
+                        settlement.account_health_error = _should_penalize_stream_error(error_code) and (
+                            core_generated_eof or not saw_text_delta
+                        )
                 if event:
-                    if event_type in ("response.failed", "error"):
-                        status = "error"
-                        if event_type == "response.failed":
-                            response = event.response
-                            error = response.error if response else None
-                            if response and response.id:
-                                response_id = response.id
-                                settlement.response_id = response_id
-                        else:
-                            error = _stream_event_error(event, event_type, event_payload)
-                        raw_error_code = _normalize_error_code(
-                            error.code if error else None,
-                            error.type if error else None,
-                        )
-                        if (
-                            event_type == "error"
-                            and raw_error_code == "error"
-                            and _websocket_event_error_code(event_type, event_payload) is None
-                        ):
-                            raw_error_code = "upstream_error"
-                        rewritten_error = (
-                            None
-                            if preserve_raw_sse_line
-                            else _rewrite_previous_response_stream_error(
-                                previous_response_id=payload.previous_response_id,
-                                preferred_account_id=preferred_account_id,
-                                error_code=raw_error_code,
-                                error_type=error.type if error else None,
-                                error_message=error.message if error else None,
-                                error_param=error.param if error else None,
-                            )
-                        )
-                        if rewritten_error is not None:
-                            response_id = (
-                                event.response.id
-                                if event_type == "response.failed" and event.response and event.response.id
-                                else request_id
-                            )
-                            rewritten_code, rewritten_message, upstream_error_code = rewritten_error
-                            if upstream_error_code is not None:
-                                await self._handle_stream_error(
-                                    account,
-                                    _upstream_error_from_openai(error),
-                                    upstream_error_code,
-                                )
-                            line, event, event_payload, event_type = _build_rewritten_stream_response_failed_event(
-                                response_id=response_id,
-                                error_code=rewritten_code,
-                                error_message=rewritten_message,
-                            )
-                            error_code = rewritten_code
-                            error_message = rewritten_message
-                            settlement.error = _upstream_error_from_openai(error)
-                            settlement.record_success = False
-                            settlement.account_health_error = False
-                        else:
-                            error_code = raw_error_code
-                            error_message = error.message if error else None
-                            settlement.error = _upstream_error_from_openai(error)
-                            settlement.record_success = False
-                            core_generated_eof = (
-                                error_code == "stream_incomplete" and error_message == _RAW_HTTP_UPSTREAM_EOF_MESSAGE
-                            )
-                            if core_generated_eof:
-                                failure_metadata = _RequestLogFailureMetadata(
-                                    failure_phase="upstream",
-                                    failure_detail="upstream_eof_before_terminal_event",
-                                )
-                            settlement.account_health_error = _should_penalize_stream_error(error_code) and (
-                                core_generated_eof or not saw_text_delta
-                            )
                     if event_type in ("response.completed", "response.incomplete"):
                         response = event.response if event is not None else None
                         usage = response.usage if response else None
