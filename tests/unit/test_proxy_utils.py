@@ -4062,6 +4062,16 @@ async def test_stream_responses_via_websocket_preserves_raw_error_when_sdk_contr
         "message": "OpenCode stream failed",
     }
     websocket = _WsResponse([_ws_text_message(raw_payload)])
+    successes = 0
+    failures: list[Exception] = []
+
+    class _CircuitBreakerStub:
+        async def _record_failure(self, exc: Exception) -> None:
+            failures.append(exc)
+
+        async def _record_success(self) -> None:
+            nonlocal successes
+            successes += 1
 
     async def fake_open_upstream_websocket(
         *,
@@ -4077,6 +4087,7 @@ async def test_stream_responses_via_websocket_preserves_raw_error_when_sdk_contr
         return websocket, websocket
 
     monkeypatch.setattr(proxy_module, "_open_upstream_websocket", fake_open_upstream_websocket)
+    monkeypatch.setattr(proxy_module, "get_circuit_breaker_for_account", lambda _aid, _settings: _CircuitBreakerStub())
 
     events = [
         event
@@ -4090,12 +4101,47 @@ async def test_stream_responses_via_websocket_preserves_raw_error_when_sdk_contr
             effective_idle_timeout=45.0,
             max_event_bytes=1024,
             raise_for_status=True,
+            account_id="acc_1",
             enforce_openai_sdk_contract=False,
         )
     ]
 
     assert len(events) == 1
     assert parse_sse_data_json(events[0]) == raw_payload
+    assert successes == 1
+    assert failures == []
+
+
+@pytest.mark.asyncio
+async def test_stream_codex_websocket_events_treats_raw_error_as_terminal_when_sdk_contract_disabled():
+    raw_payload = {"type": "error", "code": "rate_limit_exceeded", "message": "OpenCode stream failed"}
+
+    class _CodexWebSocket:
+        def __init__(self) -> None:
+            self.recv_calls = 0
+
+        async def recv(self):
+            self.recv_calls += 1
+            if self.recv_calls == 1:
+                return json.dumps(raw_payload, separators=(",", ":")).encode(), int(proxy_module.CurlWsFlag.TEXT)
+            return b"", int(proxy_module.CurlWsFlag.CLOSE)
+
+    websocket = _CodexWebSocket()
+
+    events = [
+        event
+        async for event in proxy_module._stream_codex_websocket_events(
+            websocket,
+            idle_timeout_seconds=45.0,
+            total_timeout_seconds=5.0,
+            max_event_bytes=1024,
+            enforce_openai_sdk_contract=False,
+        )
+    ]
+
+    assert len(events) == 1
+    assert parse_sse_data_json(events[0]) == raw_payload
+    assert websocket.recv_calls == 1
 
 
 @pytest.mark.asyncio

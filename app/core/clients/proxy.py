@@ -104,6 +104,13 @@ _RESPONSE_STREAM_TERMINAL_EVENT_TYPES = frozenset(
     }
 )
 
+
+def _is_response_stream_terminal_event_type(event_type: str, *, enforce_openai_sdk_contract: bool) -> bool:
+    if event_type in _RESPONSE_STREAM_TERMINAL_EVENT_TYPES:
+        return True
+    return event_type == "error" and not enforce_openai_sdk_contract
+
+
 _SSE_READ_CHUNK_SIZE = 1 * 1024
 _IMAGE_INLINE_MAX_BYTES = 8 * 1024 * 1024
 _IMAGE_INLINE_CHUNK_SIZE = 64 * 1024
@@ -1400,7 +1407,10 @@ async def _stream_websocket_events(
         normalized = payload if not enforce_openai_sdk_contract else _normalize_stream_event_payload(payload)
         event_type = normalized.get("type")
         yield format_sse_event(normalized)
-        if isinstance(event_type, str) and event_type in _RESPONSE_STREAM_TERMINAL_EVENT_TYPES:
+        if isinstance(event_type, str) and _is_response_stream_terminal_event_type(
+            event_type,
+            enforce_openai_sdk_contract=enforce_openai_sdk_contract,
+        ):
             break
 
 
@@ -1450,7 +1460,10 @@ async def _stream_codex_websocket_events(
         normalized = payload if not enforce_openai_sdk_contract else _normalize_stream_event_payload(payload)
         event_type = normalized.get("type")
         yield format_sse_event(normalized)
-        if isinstance(event_type, str) and event_type in _RESPONSE_STREAM_TERMINAL_EVENT_TYPES:
+        if isinstance(event_type, str) and _is_response_stream_terminal_event_type(
+            event_type,
+            enforce_openai_sdk_contract=enforce_openai_sdk_contract,
+        ):
             break
 
 
@@ -1642,7 +1655,10 @@ async def _stream_responses_via_websocket(
                 extra={"event_format": "sse"},
             )
             parsed_event = parse_sse_event(event)
-            if parsed_event and parsed_event.type in _RESPONSE_STREAM_TERMINAL_EVENT_TYPES:
+            if parsed_event and _is_response_stream_terminal_event_type(
+                parsed_event.type,
+                enforce_openai_sdk_contract=enforce_openai_sdk_contract,
+            ):
                 seen_terminal = True
                 await _record_lifecycle_success()
             yield event
@@ -2545,7 +2561,10 @@ async def _stream_responses_with_session(
                     event = parse_sse_event(event_block)
                     if event:
                         event_type = event.type
-                        if event_type in _RESPONSE_STREAM_TERMINAL_EVENT_TYPES:
+                        if _is_response_stream_terminal_event_type(
+                            event_type,
+                            enforce_openai_sdk_contract=enforce_openai_sdk_contract,
+                        ):
                             seen_terminal = True
                     yield event_block
             except aiohttp.WSServerHandshakeError as exc:
