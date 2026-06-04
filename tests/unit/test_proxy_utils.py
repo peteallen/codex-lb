@@ -6552,6 +6552,68 @@ async def test_stream_responses_first_event_upstream_unavailable_fails_over(monk
 
 
 @pytest.mark.asyncio
+async def test_stream_responses_first_event_raw_eof_fails_over_before_downstream_visible(monkeypatch):
+    settings = _make_proxy_settings(log_proxy_service_tier_trace=False)
+    request_logs = _RequestLogsRecorder()
+    service = proxy_service.ProxyService(_repo_factory(request_logs))
+    account_a = _make_account("acc_raw_eof_event_a")
+    account_b = _make_account("acc_raw_eof_event_b")
+    record_error = AsyncMock()
+    record_errors = AsyncMock()
+    record_success = AsyncMock()
+    seen_excluded_account_ids: list[set[str]] = []
+
+    monkeypatch.setattr(proxy_service, "get_settings_cache", lambda: _SettingsCache(settings))
+    monkeypatch.setattr(proxy_service, "get_settings", lambda: settings)
+
+    async def select_account(**kwargs: object) -> AccountSelection:
+        excluded_account_ids = kwargs.get("exclude_account_ids")
+        seen_excluded_account_ids.append(set(cast(set[str], excluded_account_ids)))
+        if len(seen_excluded_account_ids) == 1:
+            return AccountSelection(account=account_a, error_message=None)
+        return AccountSelection(account=account_b, error_message=None)
+
+    monkeypatch.setattr(service._load_balancer, "select_account", select_account)
+    monkeypatch.setattr(service._load_balancer, "record_error", record_error)
+    monkeypatch.setattr(service._load_balancer, "record_errors", record_errors)
+    monkeypatch.setattr(service._load_balancer, "record_success", record_success)
+    monkeypatch.setattr(service, "_ensure_fresh", AsyncMock(side_effect=[account_a, account_b]))
+
+    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False):
+        del payload, headers, access_token, base_url, raise_for_status
+        if account_id == account_a.chatgpt_account_id:
+            for _ in range(3):
+                yield (
+                    'data: {"type":"response.failed","response":{"id":"resp_raw_eof_event",'
+                    '"error":{"code":"stream_incomplete",'
+                    '"message":"Upstream closed stream without completion"}}}\n\n'
+                )
+        else:
+            yield (
+                'data: {"type":"response.completed","response":{"id":"resp_raw_eof_ok",'
+                '"usage":{"input_tokens":1,"output_tokens":2}}}\n\n'
+            )
+
+    monkeypatch.setattr(proxy_service, "core_stream_responses", fake_stream)
+
+    payload = ResponsesRequest.model_validate({"model": "gpt-5.1", "instructions": "hi", "input": [], "stream": True})
+
+    chunks = [chunk async for chunk in service.stream_responses(payload, {"session_id": "sid-stream"})]
+
+    event = json.loads(chunks[0].split("data: ", 1)[1])
+    assert event["type"] == "response.completed"
+    assert event["response"]["id"] == "resp_raw_eof_ok"
+    assert seen_excluded_account_ids == [set(), {account_a.id}]
+    assert request_logs.calls[0]["error_code"] == "stream_incomplete"
+    assert request_logs.calls[0]["failure_detail"] == "upstream_eof_before_terminal_event"
+    assert request_logs.calls[-1]["status"] == "success"
+    assert request_logs.calls[-1]["account_id"] == account_b.id
+    record_error.assert_awaited_once_with(account_a)
+    record_errors.assert_awaited_once_with(account_a, 2)
+    record_success.assert_awaited_once_with(account_b)
+
+
+@pytest.mark.asyncio
 async def test_stream_responses_suppresses_contiguous_side_effect_replay_across_response_ids(monkeypatch):
     settings = _make_proxy_settings(log_proxy_service_tier_trace=False)
     request_logs = _RequestLogsRecorder()

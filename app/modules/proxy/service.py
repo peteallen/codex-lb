@@ -11452,6 +11452,16 @@ class ProxyService:
                     api_key.id,
                     request_id,
                 )
+                release_coro = self._release_unsettled_stream_api_key_usage(
+                    api_key=api_key,
+                    api_key_reservation=api_key_reservation,
+                    request_id=request_id,
+                )
+                self._schedule_cancel_safe_cleanup(
+                    release_coro,
+                    action="release_stream_api_key_reservation_after_cancelled_settlement",
+                    request_id=request_id,
+                )
             except Exception as exc:
                 logger.warning(
                     "Stream API key settlement task failed key_id=%s request_id=%s",
@@ -13081,8 +13091,6 @@ class ProxyService:
                             failure_phase="upstream",
                             failure_detail="upstream_eof_before_terminal_event",
                         )
-                        allow_retry = False
-                        allow_transient_retry = False
                     settlement.account_health_error = _should_penalize_stream_error(code)
                     if allow_retry and code == "stream_idle_timeout":
                         raise _RetryableStreamError(code, settlement.error, exclude_account=True)
