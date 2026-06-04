@@ -890,10 +890,8 @@ class LoadBalancer:
                 )
                 return selection_inputs
 
-            standard_latest_primary, standard_latest_secondary = await asyncio.gather(
-                repos.usage.latest_by_account(),
-                repos.usage.latest_by_account(window="secondary"),
-            )
+            standard_latest_primary = await repos.usage.latest_by_account()
+            standard_latest_secondary = await repos.usage.latest_by_account(window="secondary")
             if effective_limit_name:
                 model_allowed_plans = get_model_registry().plan_types_for_model(model) if model else None
                 latest_primary = additional_filter.latest_primary
