@@ -2751,12 +2751,13 @@ async def _stream_responses_with_session(
             operation="stream",
             exc=exc,
         )
+        response_error_message = cast(str, error_message)
         failure_phase = "upstream"
         failure_detail = "transport_error"
         failure_exception_type = type(exc).__name__
         retryable_same_contract = True
         yield format_sse_event(
-            response_failed_event("upstream_unavailable", error_message, response_id=get_request_id()),
+            response_failed_event("upstream_unavailable", response_error_message, response_id=get_request_id()),
         )
         return
     except Exception as exc:
