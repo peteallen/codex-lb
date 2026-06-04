@@ -368,9 +368,21 @@ Environment variables with `CODEX_LB_` prefix or `.env.local`. See [`.env.exampl
 SQLite is the default database backend; PostgreSQL is optional via `CODEX_LB_DATABASE_URL` (for example `postgresql+asyncpg://...`).
 
 The Docker Compose `postgres` profile uses the Postgres 18 image and mounts the named data volume at
-`/var/lib/postgresql`, the parent of the image's versioned `PGDATA` directory. Existing Postgres 16 compose volumes
-are not upgraded in place; dump and restore the database before switching an existing volume to the Postgres 18
-profile.
+`/var/lib/postgresql`, the parent of the image's versioned `PGDATA` directory.
+
+Existing Postgres 16 compose volumes must be upgraded before the Postgres 18 container starts:
+
+```bash
+docker compose --profile postgres stop postgres
+docker run --rm -v codex-lb-postgres-data:/var/lib/postgresql -v "$PWD:/backup" alpine \
+  tar -C /var/lib/postgresql -czf /backup/codex-lb-postgres-data-before-pg18.tgz .
+docker compose --profile postgres-upgrade run --rm postgres-upgrade
+docker compose --profile postgres up -d postgres
+```
+
+The `postgres-upgrade` profile runs `pg_upgrade` in one-shot mode against the same named volume and exits after the
+data directory has been upgraded to the Postgres 18 layout. Keep the backup until the application has started and
+`codex-lb-db check` succeeds against the upgraded database.
 
 ### Dashboard authentication modes
 

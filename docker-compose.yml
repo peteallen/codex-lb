@@ -76,6 +76,18 @@ services:
       - codex-lb-postgres-data:/var/lib/postgresql
     restart: unless-stopped
 
+  postgres-upgrade:
+    image: pgautoupgrade/pgautoupgrade:18-alpine
+    profiles: ["postgres-upgrade"]
+    environment:
+      POSTGRES_USER: codex_lb
+      POSTGRES_PASSWORD: codex_lb
+      POSTGRES_DB: codex_lb
+      PGAUTO_ONESHOT: "yes"
+    volumes:
+      - codex-lb-postgres-data:/var/lib/postgresql
+    restart: "no"
+
 volumes:
   codex-lb-data:
     name: codex-lb-data
