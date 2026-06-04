@@ -61,6 +61,17 @@ services:
   postgres:
     image: postgres:18-alpine
     profiles: ["postgres"]
+    entrypoint:
+      - sh
+      - -ceu
+      - |
+        if [ -f /var/lib/postgresql/PG_VERSION ]; then
+          echo >&2 "Detected a pre-Postgres-18 data directory at /var/lib/postgresql."
+          echo >&2 "Run: docker compose --profile postgres-upgrade run --rm postgres-upgrade"
+          echo >&2 "Refusing to start postgres:18-alpine before the named volume is upgraded."
+          exit 1
+        fi
+        exec docker-entrypoint.sh postgres
     environment:
       POSTGRES_USER: codex_lb
       POSTGRES_PASSWORD: codex_lb

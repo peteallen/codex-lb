@@ -1,0 +1,15 @@
+## 1. Compose upgrade guard
+
+- [x] 1.1 Mount the Postgres named volume at the Postgres 18 parent data directory.
+- [x] 1.2 Add a one-shot `postgres-upgrade` profile using `pgautoupgrade/pgautoupgrade:18-alpine`.
+- [x] 1.3 Refuse normal Postgres 18 startup when the named volume still has the pre-18 root `PG_VERSION` marker.
+
+## 2. Operator documentation
+
+- [x] 2.1 Document the stop, backup, upgrade, start, and database-check sequence.
+- [x] 2.2 Document the fail-fast guard and required recovery action.
+
+## 3. Validation
+
+- [x] 3.1 Validate the OpenSpec change strictly.
+- [x] 3.2 Validate the Compose service shape.

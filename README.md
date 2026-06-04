@@ -384,6 +384,9 @@ The `postgres-upgrade` profile runs `pg_upgrade` in one-shot mode against the sa
 data directory has been upgraded to the Postgres 18 layout. Keep the backup until the application has started and
 `codex-lb-db check` succeeds against the upgraded database.
 
+The normal `postgres` service refuses to start when it detects the old root-level `PG_VERSION` file from a pre-18
+Compose volume. If that guard fires, run the `postgres-upgrade` profile above before starting Postgres again.
+
 ### Dashboard authentication modes
 
 `codex-lb` supports three dashboard auth modes via environment variables:
