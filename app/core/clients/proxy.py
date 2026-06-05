@@ -34,7 +34,6 @@ import aiohttp
 from aiohttp import hdrs
 from aiohttp.client_ws import DEFAULT_WS_CLIENT_TIMEOUT, WebSocketDataQueue
 from aiohttp.http_websocket import WS_KEY, WebSocketReader, WebSocketWriter
-from curl_cffi.const import CurlWsFlag
 from multidict import CIMultiDict
 
 from app.core.clients.codex import (
@@ -1397,20 +1396,22 @@ async def _stream_codex_websocket_events(
             timeout_seconds = min(timeout_seconds, remaining)
 
         try:
-            data, flags = await asyncio.wait_for(websocket.recv(), timeout=timeout_seconds)
+            msg = await asyncio.wait_for(websocket.receive(), timeout=timeout_seconds)
         except asyncio.TimeoutError as exc:
             if deadline is not None and deadline - time.monotonic() <= 0:
                 raise
             raise StreamIdleTimeoutError() from exc
 
-        if flags & int(CurlWsFlag.CLOSE):
+        if msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSING, aiohttp.WSMsgType.CLOSED):
             break
-        if flags & int(CurlWsFlag.TEXT):
-            text = data.decode("utf-8", errors="replace") if isinstance(data, bytes) else str(data)
-        elif isinstance(data, bytes):
-            text = data.decode("utf-8", errors="replace")
+        if msg.type == aiohttp.WSMsgType.ERROR:
+            break
+        if msg.type == aiohttp.WSMsgType.TEXT:
+            text = msg.data if isinstance(msg.data, str) else str(msg.data)
+        elif msg.type == aiohttp.WSMsgType.BINARY:
+            text = msg.data.decode("utf-8", errors="replace") if isinstance(msg.data, bytes) else str(msg.data)
         else:
-            text = str(data)
+            text = str(msg.data) if msg.data is not None else ""
         text_bytes = text.encode("utf-8")
         if len(text_bytes) > max_event_bytes:
             raise StreamEventTooLargeError(len(text_bytes), max_event_bytes)

@@ -6,7 +6,6 @@ from typing import Any, cast
 import pytest
 
 from app.core.clients.codex import CodexClient, require_route_or_direct_egress_opt_in
-from app.core.clients.codex_tls import codex_tls_kwargs
 from app.core.upstream_proxy import ResolvedProxyEndpoint, ResolvedUpstreamRoute
 
 pytestmark = pytest.mark.unit
@@ -94,13 +93,11 @@ async def test_request_passes_resolver_proxy_and_builtin_fingerprint(route: Reso
     await client.request("POST", "https://upstream.test", route=route, json={"x": 1})
 
     assert session.calls[0]["proxy"] == "http://u:p@proxy.test:8080"
-    for key, value in codex_tls_kwargs().items():
-        assert session.calls[0][key] == value
     assert session.calls[0]["json"] == {"x": 1}
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("override", ["proxy", "proxies", "impersonate", "ja3", "akamai", "extra_fp"])
+@pytest.mark.parametrize("override", ["proxy", "proxies"])
 async def test_runtime_route_and_fingerprint_overrides_are_rejected(
     route: ResolvedUpstreamRoute,
     override: str,

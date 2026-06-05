@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from typing import Any, cast
 
+import aiohttp
 import pytest
-from curl_cffi.const import CurlWsFlag
 
 import app.core.clients.proxy as proxy_module
 from app.core.clients.codex import CodexTransportError, CodexWebSocketResult
@@ -124,10 +124,10 @@ class _FakeCodexWebSocket:
             raise OSError("proxy http://user:pass@proxy.test:8080 send failed")
         self.sent.append(payload)
 
-    async def recv(self) -> tuple[bytes, int]:
+    async def receive(self) -> aiohttp.WSMessage:
         if self.fail_receive:
-            raise OSError("proxy http://user:pass@proxy.test:8080 websocket failed")
-        return b'{"type":"response.completed"}', int(CurlWsFlag.TEXT)
+            raise OSError("proxy http://user:***@proxy.test:8080 websocket failed")
+        return aiohttp.WSMessage(aiohttp.WSMsgType.TEXT, '{"type":"response.completed"}', None)
 
     def close(self) -> None:
         self.closed = True

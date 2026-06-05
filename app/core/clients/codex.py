@@ -4,10 +4,9 @@ import asyncio
 from dataclasses import dataclass
 from typing import Any, Mapping
 
-from app.core.clients.codex_tls import codex_tls_kwargs
 from app.core.upstream_proxy import ResolvedUpstreamRoute
 
-_RESERVED = frozenset({"proxy", "proxies", "impersonate", "ja3", "akamai", "extra_fp"})
+_RESERVED = frozenset({"proxy", "proxies"})
 
 
 class CodexTransportError(RuntimeError):
@@ -66,9 +65,7 @@ class CodexClient:
         for index, endpoint in enumerate(endpoints):
             candidate = route.with_endpoint(endpoint, tuple(endpoints[index + 1 :]))
             try:
-                response = await self._session.request(
-                    method, url, proxy=endpoint.proxy_url, **codex_tls_kwargs(), **kwargs
-                )
+                response = await self._session.request(method, url, proxy=endpoint.proxy_url, **kwargs)
                 return CodexRequestResult(response, candidate, index > 0)
             except Exception as exc:
                 if index == len(endpoints) - 1 or not allow_fallback:
@@ -79,7 +76,7 @@ class CodexClient:
         if route is None:
             raise ValueError("Codex upstream calls require a resolved upstream proxy route")
         _reject_reserved(kwargs)
-        result = self._session.ws_connect(url, proxy=route.proxy_url, **codex_tls_kwargs(), **kwargs)
+        result = self._session.ws_connect(url, proxy=route.proxy_url**kwargs)
         if asyncio.iscoroutine(result):
             return await result
         return result
@@ -98,7 +95,6 @@ class CodexClient:
                 context = self._session.ws_connect(
                     url,
                     proxy=endpoint.proxy_url,
-                    **codex_tls_kwargs(),
                     **kwargs,
                 )
                 if asyncio.iscoroutine(context):
@@ -129,9 +125,12 @@ class CodexClient:
 
 
 def create_codex_session(*, max_clients: int = 10) -> Any:
-    from curl_cffi.requests import AsyncSession
+    import aiohttp
 
-    return AsyncSession(max_clients=max_clients, trust_env=False, **codex_tls_kwargs())
+    from app.core.clients.http import _build_ssl_context
+
+    connector = aiohttp.TCPConnector(limit=max_clients, ssl=_build_ssl_context())
+    return aiohttp.ClientSession(connector=connector, timeout=aiohttp.ClientTimeout(total=None), trust_env=False)
 
 
 def _reject_reserved(kwargs: Mapping[str, Any]) -> None:
