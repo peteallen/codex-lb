@@ -8,6 +8,8 @@ When the profile uses Postgres 18 or newer, the service SHALL mount that named v
 
 The Compose configuration SHALL provide an explicit one-shot upgrade profile for existing pre-18 named volumes.
 
+The `postgres-upgrade` service SHALL pin the upgrade helper image by digest because the helper mounts the same named Postgres data volume read-write and mutates the stored database cluster.
+
 The normal Postgres service SHALL fail before starting Postgres 18 when it detects a pre-18 root-level `PG_VERSION` marker in the mounted named volume.
 
 The normal Postgres service SHALL fail before starting Postgres 18 when it detects a nested `/var/lib/postgresql/data/PG_VERSION` marker with a pre-18 major version.
