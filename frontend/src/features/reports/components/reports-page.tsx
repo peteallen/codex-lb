@@ -174,10 +174,10 @@ export function ReportsPage({ initialFilters }: ReportsPageProps = {}) {
     <div className="mx-auto w-full max-w-[1500px] flex-1 space-y-6 px-4 py-8 sm:px-6">
       <div>
         <h1 className="text-2xl font-semibold tracking-tight text-foreground">
-          Cost Report
+          Cost report
         </h1>
         <p className="text-sm text-muted-foreground">
-          Usage history by date range
+          Usage history by time period
         </p>
       </div>
 

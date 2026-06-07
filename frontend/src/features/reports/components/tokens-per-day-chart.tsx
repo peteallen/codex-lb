@@ -33,7 +33,7 @@ export function TokensPerDayChart({ startDate, endDate, data }: TokensPerDayChar
 
   return (
     <div className="rounded-xl border bg-card p-5">
-      <div className="text-sm font-semibold text-foreground">Tokens by Day</div>
+      <div className="text-sm font-semibold text-foreground">Tokens per day</div>
       <div className="mt-4 h-[200px]">
         <ResponsiveContainer width="100%" height="100%">
           <AreaChart data={chartData} margin={{ top: 5, right: 10, left: 10, bottom: 0 }}>

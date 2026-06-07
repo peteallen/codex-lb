@@ -56,5 +56,5 @@ export function formatReportBucketDate(date: string): string {
   if (!year || !month || !day) {
     return date;
   }
-  return `${year}-${month}-${day}`;
+  return `${month}/${day}`;
 }

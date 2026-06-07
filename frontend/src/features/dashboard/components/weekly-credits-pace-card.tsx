@@ -22,6 +22,10 @@ function formatSignedPercent(value: number): string {
   return `${Math.round(Math.abs(value))}%`;
 }
 
+function formatPaceMultiplier(value: number): string {
+  return `${value.toFixed(2)}x scheduled active pace`;
+}
+
 function formatProAccountEquivalent(value: number): string {
   if (value < 1) {
     return value >= 0.1 ? value.toFixed(2) : value.toFixed(3);
@@ -29,36 +33,46 @@ function formatProAccountEquivalent(value: number): string {
   return value < 10 ? value.toFixed(1) : value.toFixed(0);
 }
 
-function statusLabel(pace: WeeklyCreditPace): string {
-  if (pace.status === "on_track") return "On pace";
+function currentGapLabel(pace: WeeklyCreditPace): string {
+  if (Math.abs(pace.deltaPercent) < 0.5) {
+    return "On schedule";
+  }
   if (pace.status === "danger" && pace.projectedShortfallCredits > 0 && pace.deltaPercent <= 0) {
     return "Recent burn shortfall";
   }
-  const direction = pace.deltaPercent > 0 ? "over planned usage" : "below planned usage";
+  const direction = pace.deltaPercent > 0 ? "over schedule" : "under schedule";
   return `${formatSignedPercent(pace.deltaPercent)} ${direction}`;
 }
 
 function scheduleGapLine(pace: WeeklyCreditPace): string {
   if (pace.scheduleGapCredits > 0) {
-    return `${formatCompactNumber(pace.scheduleGapCredits)} credits over planned usage now`;
+    return `${formatCompactNumber(pace.scheduleGapCredits)} credits over scheduled spend now`;
   }
   if (pace.deltaPercent < 0) {
-    return `${formatSignedPercent(pace.deltaPercent)} below planned usage now`;
+    const cushionCredits = Math.max(0, pace.totalActualRemainingCredits - pace.totalExpectedRemainingCredits);
+    if (cushionCredits > 0) {
+      return `${formatCompactNumber(cushionCredits)} credits more cushion than schedule now`;
+    }
+    return `${formatSignedPercent(pace.deltaPercent)} under scheduled spend now`;
   }
   return "On the current linear weekly schedule";
 }
 
 function forecastLine(pace: WeeklyCreditPace): string {
+  const ratePrefix =
+    pace.paceMultiplier != null && pace.paceMultiplier > 0
+      ? `Recent burn is ${formatPaceMultiplier(pace.paceMultiplier)}; `
+      : "";
   if (pace.projectedShortfallCredits > 0) {
-    return `${formatCompactNumber(pace.projectedShortfallCredits)} credits projected short before reset`;
+    return `${ratePrefix}${formatCompactNumber(pace.projectedShortfallCredits)} credits could run short before a reset if it continues`;
   }
   if (pace.forecastBurnRateCreditsPerHour === 0) {
-    return "No weekly shortfall projected at recent pace";
+    return "No weekly shortfall projected from recent burn";
   }
   if (pace.projectedMinimumRemainingCredits != null) {
-    return `${formatCompactNumber(pace.projectedMinimumRemainingCredits)} credits projected low-water mark`;
+    return `${ratePrefix}${formatCompactNumber(pace.projectedMinimumRemainingCredits)} credits projected low-water mark`;
   }
-  return "Pool covers recent pace through upcoming resets";
+  return `${ratePrefix}pool covers recent burn through upcoming resets`;
 }
 
 function formatDurationHours(hours: number): string {
@@ -81,14 +95,13 @@ function breakEvenLine(pace: WeeklyCreditPace): string | null {
     return null;
   }
   if (pace.pauseForBreakEvenHours == null) {
-    return "Until reset";
+    return "Until the next reset";
   }
-  return `${formatDurationHours(pace.pauseForBreakEvenHours)} until reset`;
+  return `${formatDurationHours(pace.pauseForBreakEvenHours)} of active use`;
 }
 
 function proAccountsLine(pace: WeeklyCreditPace): string | null {
-  const gapCredits =
-    pace.projectedShortfallCredits > 0 ? pace.projectedShortfallCredits : Math.max(0, pace.scheduleGapCredits);
+  const gapCredits = pace.projectedShortfallCredits > 0 ? pace.projectedShortfallCredits : 0;
   const equivalent =
     pace.proAccountEquivalentToCoverOverPlan ?? (gapCredits > 0 ? gapCredits / PRO_WEEKLY_CAPACITY_CREDITS : null);
   const accounts = pace.proAccountsToCoverOverPlan ?? (gapCredits > 0 ? Math.ceil(gapCredits / PRO_WEEKLY_CAPACITY_CREDITS) : null);
@@ -112,8 +125,11 @@ export function WeeklyCreditsPaceCard({ pace }: WeeklyCreditsPaceCardProps) {
     return null;
   }
 
+  const forecastRiskWithCurrentCushion = pace.status === "danger" && pace.deltaPercent < 0;
   const statusClass =
-    pace.status === "danger"
+    forecastRiskWithCurrentCushion
+      ? "border-amber-500/25 bg-amber-500/10 text-amber-700 dark:text-amber-300"
+      : pace.status === "danger"
       ? "border-red-500/25 bg-red-500/10 text-red-700 dark:text-red-300"
       : pace.status === "ahead"
         ? "border-amber-500/25 bg-amber-500/10 text-amber-700 dark:text-amber-300"
@@ -123,12 +139,15 @@ export function WeeklyCreditsPaceCard({ pace }: WeeklyCreditsPaceCardProps) {
   const actualBarWidth = Math.max(0, Math.min(100, pace.actualUsedPercent));
   const scheduledMarkerLeft = Math.max(0, Math.min(100, pace.scheduledUsedPercent));
   const actualBarClass =
-    pace.status === "danger" ? "bg-red-500" : pace.status === "ahead" ? "bg-amber-500" : "bg-primary";
+    pace.status === "danger" && !forecastRiskWithCurrentCushion
+      ? "bg-red-500"
+      : pace.status === "ahead"
+        ? "bg-amber-500"
+        : "bg-primary";
   const throttle = throttleLine(pace);
   const proAccounts = proAccountsLine(pace);
   const breakEven = breakEvenLine(pace);
   const showRecommendations =
-    pace.scheduleGapCredits > 0 ||
     pace.projectedShortfallCredits > 0 ||
     Boolean(breakEven) ||
     Boolean(throttle) ||
@@ -157,8 +176,8 @@ export function WeeklyCreditsPaceCard({ pace }: WeeklyCreditsPaceCardProps) {
               <p className="mt-1 text-sm font-semibold tabular-nums">{formatPercent(pace.scheduledUsedPercent)}</p>
             </div>
             <div className="min-w-0 rounded-md bg-muted/30 px-3 py-2">
-              <p className="text-muted-foreground">Pace gap</p>
-              <p className="mt-1 text-sm font-semibold tabular-nums">{statusLabel(pace)}</p>
+              <p className="text-muted-foreground">Current gap</p>
+              <p className="mt-1 text-sm font-semibold tabular-nums">{currentGapLabel(pace)}</p>
             </div>
           </div>
           <div className="relative h-1.5 rounded-full bg-muted">
@@ -186,11 +205,11 @@ export function WeeklyCreditsPaceCard({ pace }: WeeklyCreditsPaceCardProps) {
 
         {showRecommendations ? (
           <div className="rounded-lg border bg-background/60 px-3 py-2 text-xs">
-            <p className="font-medium">Recommendations</p>
+            <p className="font-medium">If recent burn continues</p>
             <div className="mt-2 grid gap-1.5">
               {breakEven ? (
                 <div className="flex items-baseline justify-between gap-3">
-                  <span className="shrink-0 text-muted-foreground">Pause</span>
+                  <span className="shrink-0 text-muted-foreground">Pause active use</span>
                   <span className="min-w-0 text-right tabular-nums">{breakEven}</span>
                 </div>
               ) : null}

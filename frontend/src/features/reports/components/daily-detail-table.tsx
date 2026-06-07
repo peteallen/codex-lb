@@ -42,7 +42,7 @@ export function DailyDetailTable({ startDate, endDate, data }: DailyDetailTableP
   return (
     <div className="rounded-xl border bg-card p-5">
       <div className="mb-3 flex items-center justify-between">
-        <div className="text-sm font-semibold text-foreground">Daily Breakdown</div>
+        <div className="text-sm font-semibold text-foreground">Daily detail</div>
         <Button
           variant="outline"
           size="sm"

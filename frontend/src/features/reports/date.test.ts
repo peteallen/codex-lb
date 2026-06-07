@@ -76,7 +76,7 @@ describe("reports date helpers", () => {
   });
 
   it("formats report bucket strings without parsing them as UTC instants", () => {
-    expect(formatReportBucketDate("2026-06-01")).toBe("2026-06-01");
+    expect(formatReportBucketDate("2026-06-01")).toBe("06/01");
   });
 
   it("returns the live browser timezone and refreshes the cached value", () => {

@@ -15,9 +15,9 @@ export type ReportsSummaryCardsProps = {
 export function ReportsSummaryCards({ summary, comparison }: ReportsSummaryCardsProps) {
   const cards = [
     {
-      label: "Total Cost",
+      label: "Total cost",
       value: `$${summary.totalCostUsd.toFixed(2)}`,
-      sub: `avg $${summary.avgCostPerDay.toFixed(2)}/day`,
+      sub: `average $${summary.avgCostPerDay.toFixed(2)}/day`,
       comparison: buildComparison(summary.totalCostUsd, comparison.previous.totalCostUsd, comparison.canCompare),
     },
     {
@@ -33,7 +33,7 @@ export function ReportsSummaryCards({ summary, comparison }: ReportsSummaryCards
     {
       label: "Requests",
       value: formatNumber(summary.totalRequests),
-      sub: `avg ${summary.avgRequestsPerDay.toFixed(0)}/day · ${summary.activeAccounts} accounts`,
+      sub: `average ${summary.avgRequestsPerDay.toFixed(0)}/day · ${summary.activeAccounts} accounts`,
       comparison: buildComparison(summary.totalRequests, comparison.previous.totalRequests, comparison.canCompare),
     },
   ];

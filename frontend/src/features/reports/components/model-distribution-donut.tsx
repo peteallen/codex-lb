@@ -79,7 +79,7 @@ export function ModelDistributionDonut({ data }: ModelDistributionDonutProps) {
   return (
     <div className="rounded-xl border bg-card p-5">
       <div className="flex items-start justify-between gap-3">
-        <div className="text-sm font-semibold text-foreground">Distribution by Model</div>
+        <div className="text-sm font-semibold text-foreground">Model distribution</div>
         <DistributionMetricToggle metric={metric} onChange={setMetric} />
       </div>
       <div className="mt-4 flex items-center gap-4">
