@@ -2,13 +2,12 @@ import { useEffect, useState } from "react";
 import { Activity, ArrowRightLeft, ArrowUpCircle, Tag } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
 
+import { APP_REPOSITORY_URL } from "@/config/branding";
 import { getDashboardOverview } from "@/features/dashboard/api";
 import { DEFAULT_OVERVIEW_TIMEFRAME } from "@/features/dashboard/schemas";
 import { getRuntimeVersion } from "@/features/runtime/api";
 import { getSettings } from "@/features/settings/api";
 import { formatTimeLong } from "@/utils/formatters";
-
-const GITHUB_REPOSITORY_URL = "https://github.com/soju06/codex-lb";
 
 type RoutingStrategy =
   | "usage_weighted"
@@ -139,12 +138,12 @@ export function StatusBar() {
           </span>
         </div>
         <a
-          aria-label="Open official GitHub repository"
+          aria-label="Open Pete's fork on GitHub"
           className="ml-auto inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-full border border-border/70 bg-background/70 text-muted-foreground transition-colors hover:bg-muted/70 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
-          href={GITHUB_REPOSITORY_URL}
+          href={APP_REPOSITORY_URL}
           rel="noreferrer"
           target="_blank"
-          title="GitHub"
+          title="Pete's fork on GitHub"
         >
           <svg className="h-3.5 w-3.5" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
             <path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82A7.63 7.63 0 0 1 8 3.86c.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z" />

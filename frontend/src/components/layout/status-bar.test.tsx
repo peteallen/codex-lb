@@ -23,12 +23,12 @@ function renderStatusBar() {
 }
 
 describe("StatusBar", () => {
-  it("links to the official GitHub repository", () => {
+  it("links to Pete's fork on GitHub", () => {
     renderStatusBar();
 
-    const link = screen.getByRole("link", { name: "Open official GitHub repository" });
+    const link = screen.getByRole("link", { name: "Open Pete's fork on GitHub" });
 
-    expect(link).toHaveAttribute("href", "https://github.com/soju06/codex-lb");
+    expect(link).toHaveAttribute("href", "https://github.com/peteallen/codex-lb");
     expect(link).toHaveAttribute("target", "_blank");
     expect(link).toHaveAttribute("rel", "noreferrer");
   });
