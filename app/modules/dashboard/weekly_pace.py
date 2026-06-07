@@ -137,7 +137,7 @@ def build_weekly_credit_pace(
     schedule_gap_credits = max(0.0, total_expected_remaining_credits - total_actual_remaining_credits)
 
     forecast_rate = forecast_burn_rate_credits_per_hour if rate_sample_count > 0 else None
-    projection = _project_weekly_pool(pace_accounts, now_ms, forecast_rate)
+    projection = _project_weekly_pool(pace_accounts, now_ms, forecast_rate, working_days)
     projected_shortfall_credits = projection.projected_shortfall_credits
     pace_multiplier = (
         forecast_rate / scheduled_burn_rate_credits_per_hour
@@ -251,6 +251,7 @@ def _project_weekly_pool(
     accounts: list[_PaceAccount],
     now_ms: float,
     forecast_burn_rate_credits_per_hour: float | None,
+    working_days: set[int] | None,
 ) -> _Projection:
     total_remaining = sum(account.remaining_credits for account in accounts)
     if forecast_burn_rate_credits_per_hour is None or forecast_burn_rate_credits_per_hour <= 0:
@@ -278,12 +279,20 @@ def _project_weekly_pool(
         simulation_accounts.sort(key=lambda account: account.reset_at_ms)
         next_reset = simulation_accounts[0]
         next_event_at_ms = min(next_reset.reset_at_ms, horizon_ms)
-        interval_ms = max(0.0, next_event_at_ms - cursor_ms)
-        interval_burn = burn_rate_credits_per_ms * interval_ms
+        interval_burnable_ms = _forecast_burn_duration_ms(cursor_ms, next_event_at_ms, working_days)
+        interval_burn = burn_rate_credits_per_ms * interval_burnable_ms
         total_balance = _total_balance(simulation_accounts)
 
         if interval_burn > total_balance:
-            depletion_wait_ms = total_balance / burn_rate_credits_per_ms if burn_rate_credits_per_ms > 0 else 0.0
+            depletion_burnable_wait_ms = (
+                total_balance / burn_rate_credits_per_ms if burn_rate_credits_per_ms > 0 else 0.0
+            )
+            depletion_wait_ms = _wall_time_for_forecast_burn_duration_ms(
+                cursor_ms,
+                next_event_at_ms,
+                depletion_burnable_wait_ms,
+                working_days,
+            )
             return _Projection(
                 projected_shortfall_credits=interval_burn - total_balance,
                 projected_depletion_hours=(cursor_ms - now_ms + depletion_wait_ms) / 3_600_000.0,
@@ -319,6 +328,40 @@ def _consume_balance(accounts: list[_SimulationAccount], amount_credits: float) 
 
 def _total_balance(accounts: list[_SimulationAccount]) -> float:
     return sum(account.balance_credits for account in accounts)
+
+
+def _forecast_burn_duration_ms(start_ms: float, end_ms: float, working_days: set[int] | None) -> float:
+    if end_ms <= start_ms:
+        return 0.0
+    if not working_days:
+        return end_ms - start_ms
+    return _working_duration_ms(start_ms, end_ms, working_days)
+
+
+def _wall_time_for_forecast_burn_duration_ms(
+    start_ms: float,
+    end_ms: float,
+    burn_duration_ms: float,
+    working_days: set[int] | None,
+) -> float:
+    if burn_duration_ms <= 0 or end_ms <= start_ms:
+        return 0.0
+    if not working_days:
+        return min(end_ms - start_ms, burn_duration_ms)
+
+    cursor_ms = start_ms
+    remaining_burn_duration_ms = burn_duration_ms
+    while cursor_ms < end_ms:
+        next_day_ms = _day_start_ms(cursor_ms) + 86_400_000.0
+        segment_end_ms = min(end_ms, next_day_ms)
+        segment_ms = segment_end_ms - cursor_ms
+        if _weekday(cursor_ms) in working_days:
+            if remaining_burn_duration_ms <= segment_ms:
+                return (cursor_ms - start_ms) + remaining_burn_duration_ms
+            remaining_burn_duration_ms -= segment_ms
+        cursor_ms = segment_end_ms
+
+    return end_ms - start_ms
 
 
 def _advance_reset_at(reset_at_ms: float, window_ms: float, now_ms: float) -> float:

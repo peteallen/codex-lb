@@ -10,6 +10,6 @@ describe("reports date helpers", () => {
   });
 
   it("formats report bucket strings without parsing them as UTC instants", () => {
-    expect(formatReportBucketDate("2026-06-01")).toBe("01/06");
+    expect(formatReportBucketDate("2026-06-01")).toBe("06/01");
   });
 });

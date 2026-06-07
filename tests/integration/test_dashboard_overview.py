@@ -497,6 +497,55 @@ async def test_dashboard_projections_weekly_credit_pace_uses_configured_working_
 
 
 @pytest.mark.asyncio
+async def test_dashboard_projections_weekly_credit_pace_forecast_skips_non_working_days(
+    async_client,
+    db_setup,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    fixed_now = datetime(2026, 5, 24, 12, 0, 0)
+    monkeypatch.setattr("app.modules.dashboard.service.utcnow", lambda: fixed_now)
+    reset_at = int(naive_utc_to_epoch(datetime(2026, 5, 25, 0, 0, 0)))
+
+    settings_response = await async_client.put("/api/settings", json={"weeklyPaceWorkingDays": "0,1,2,3,4"})
+    assert settings_response.status_code == 200
+
+    async with SessionLocal() as session:
+        accounts_repo = AccountsRepository(session)
+        usage_repo = UsageRepository(session)
+
+        await accounts_repo.upsert(
+            _make_account("acc_weekday_forecast", "weekday-forecast@example.com", plan_type="pro")
+        )
+        await usage_repo.add_entry(
+            "acc_weekday_forecast",
+            97.4,
+            window="secondary",
+            window_minutes=10080,
+            reset_at=reset_at,
+            recorded_at=fixed_now - timedelta(hours=3),
+        )
+        await usage_repo.add_entry(
+            "acc_weekday_forecast",
+            98.0,
+            window="secondary",
+            window_minutes=10080,
+            reset_at=reset_at,
+            recorded_at=fixed_now - timedelta(minutes=1),
+        )
+
+    response = await async_client.get("/api/dashboard/projections")
+    assert response.status_code == 200
+    payload = response.json()
+
+    pace = payload["weeklyCreditPace"]
+    assert pace["actualUsedPercent"] == pytest.approx(98.0)
+    assert pace["scheduledUsedPercent"] == pytest.approx(100.0)
+    assert pace["forecastBurnRateCreditsPerHour"] == pytest.approx(101.34, abs=0.1)
+    assert pace["projectedShortfallCredits"] == 0
+    assert pace["status"] == "on_track"
+
+
+@pytest.mark.asyncio
 async def test_dashboard_projections_compute_depletion_from_recent_db_history(async_client, db_setup):
     now = utcnow().replace(microsecond=0)
 

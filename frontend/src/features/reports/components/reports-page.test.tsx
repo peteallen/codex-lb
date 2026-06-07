@@ -72,6 +72,24 @@ describe("ReportsPage", () => {
     });
   });
 
+  it("renders the reports page in English", () => {
+    useReportsMock.mockReturnValue(
+      asUseReportsResult({
+        data: EMPTY_REPORT,
+        isLoading: false,
+        isError: false,
+        refetch: vi.fn(),
+      }),
+    );
+
+    renderWithProviders(<ReportsPage />);
+
+    expect(screen.getByRole("heading", { name: "Cost report" })).toBeInTheDocument();
+    expect(screen.getByText("Usage history by time period")).toBeInTheDocument();
+    expect(screen.getByText("Total cost")).toBeInTheDocument();
+    expect(screen.queryByText("Relatório de Custo")).not.toBeInTheDocument();
+  });
+
   it("keeps model options from the unfiltered model catalog", async () => {
     const user = userEvent.setup();
     useReportsMock.mockImplementation((filters) =>
