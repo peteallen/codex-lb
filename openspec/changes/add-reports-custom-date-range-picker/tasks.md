@@ -1,0 +1,7 @@
+- [x] 1.1 Update the reports filter toolbar quick presets to `1d`, `7d`, and `30d`.
+- [x] 1.2 Add a Custom range picker that exposes start and end date controls in a popover.
+- [x] 1.3 Allow calendar range selection to update the same `startDate` and `endDate` filter values.
+- [x] 1.4 Keep future dates disabled in custom range controls.
+- [x] 1.5 Add or update focused frontend coverage for quick presets, custom range edits, and preset clearing.
+- [x] 1.6 Run affected frontend tests and TypeScript validation.
+- [ ] 1.7 Validate the OpenSpec change once the OpenSpec CLI is available locally. Blocked in this shell because `openspec`, `uv`, and `uvx` are unavailable, and `npx --yes openspec ...` does not expose an executable.

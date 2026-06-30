@@ -108,24 +108,72 @@ describe("ReportsFilters", () => {
       />,
     );
 
+    const button1d = screen.getByRole("button", { name: "1d" });
     const button7d = screen.getByRole("button", { name: "7d" });
     const button30d = screen.getByRole("button", { name: "30d" });
+    const customButton = screen.getByRole("button", {
+      name: /Custom range 2026-06-01 to 2026-06-07/i,
+    });
 
+    expect(button1d).toHaveAttribute("aria-pressed", "false");
     expect(button7d).toHaveAttribute("aria-pressed", "false");
     expect(button7d).toHaveAttribute("data-variant", "outline");
     expect(button30d).toHaveAttribute("aria-pressed", "true");
     expect(button30d).toHaveAttribute("data-variant", "default");
+    expect(customButton).toHaveAttribute("aria-pressed", "false");
+    expect(screen.queryByRole("button", { name: "90d" })).not.toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: "90d" }));
+    fireEvent.click(button1d);
 
-    expect(onPresetSelect).toHaveBeenCalledWith(90);
+    expect(onPresetSelect).toHaveBeenCalledWith(1);
   });
 
-  it("limits both date inputs to the current browser-local day", () => {
+  it("shows the custom range picker and updates date filters", async () => {
+    const user = userEvent.setup();
+    const onFiltersChange = vi.fn();
+
+    render(
+      <ReportsFilters
+        filters={FILTERS}
+        selectedPresetDays={null}
+        accountOptions={[]}
+        modelOptions={[]}
+        useragentOptions={[]}
+        onPresetSelect={vi.fn()}
+        onFiltersChange={onFiltersChange}
+      />,
+    );
+
+    const customButton = screen.getByRole("button", {
+      name: /Custom range 2026-06-01 to 2026-06-07/i,
+    });
+    expect(customButton).toHaveAttribute("aria-pressed", "true");
+    expect(customButton).toHaveAttribute("data-variant", "default");
+
+    await user.click(customButton);
+    fireEvent.change(screen.getByLabelText("Start date"), {
+      target: { value: "2026-05-15" },
+    });
+    fireEvent.change(screen.getByLabelText("End date"), {
+      target: { value: "2026-06-10" },
+    });
+
+    expect(onFiltersChange).toHaveBeenCalledWith({
+      ...FILTERS,
+      startDate: "2026-05-15",
+    });
+    expect(onFiltersChange).toHaveBeenCalledWith({
+      ...FILTERS,
+      endDate: "2026-06-10",
+    });
+  });
+
+  it("limits both custom range date inputs to the current browser-local day", () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-06-12T12:00:00"));
+    const onFiltersChange = vi.fn();
 
-    const { container } = render(
+    render(
       <ReportsFilters
         filters={FILTERS}
         selectedPresetDays={30}
@@ -133,13 +181,22 @@ describe("ReportsFilters", () => {
         modelOptions={[]}
         useragentOptions={[]}
         onPresetSelect={vi.fn()}
-        onFiltersChange={vi.fn()}
+        onFiltersChange={onFiltersChange}
       />,
     );
 
-    const dateInputs = container.querySelectorAll<HTMLInputElement>('input[type="date"]');
-    expect(dateInputs).toHaveLength(2);
-    expect(dateInputs[0]).toHaveAttribute("max", "2026-06-12");
-    expect(dateInputs[1]).toHaveAttribute("max", "2026-06-12");
+    fireEvent.click(screen.getByRole("button", { name: /Custom/i }));
+
+    expect(screen.getByLabelText("Start date")).toHaveAttribute("max", "2026-06-12");
+    expect(screen.getByLabelText("End date")).toHaveAttribute("max", "2026-06-12");
+
+    fireEvent.change(screen.getByLabelText("End date"), {
+      target: { value: "2026-06-20" },
+    });
+
+    expect(onFiltersChange).toHaveBeenCalledWith({
+      ...FILTERS,
+      endDate: "2026-06-12",
+    });
   });
 });

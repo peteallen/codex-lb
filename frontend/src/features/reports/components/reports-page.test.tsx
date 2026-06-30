@@ -398,13 +398,15 @@ describe("ReportsPage", () => {
       }),
     );
 
-    const { container } = renderWithProviders(<ReportsPage />);
+    renderWithProviders(<ReportsPage />);
 
     const button7d = screen.getByRole("button", { name: "7d" });
     const button30d = screen.getByRole("button", { name: "30d" });
+    const customButton = screen.getByRole("button", { name: /Custom/i });
 
     expect(button7d).toHaveAttribute("aria-pressed", "true");
     expect(button30d).toHaveAttribute("aria-pressed", "false");
+    expect(customButton).toHaveAttribute("aria-pressed", "false");
 
     fireEvent.click(button30d);
 
@@ -417,10 +419,12 @@ describe("ReportsPage", () => {
       "America/Los_Angeles",
     );
 
-    const [startDateInput] = container.querySelectorAll<HTMLInputElement>('input[type="date"]');
+    fireEvent.click(screen.getByRole("button", { name: /Custom/i }));
+    const startDateInput = screen.getByLabelText("Start date");
     fireEvent.change(startDateInput, { target: { value: "2030-01-01" } });
 
     expect(button30d).toHaveAttribute("aria-pressed", "false");
+    expect(screen.getByRole("button", { name: /Custom/i })).toHaveAttribute("aria-pressed", "true");
     expect(useReportsMock).toHaveBeenLastCalledWith(
       expect.objectContaining({
         startDate: "2030-01-01",
