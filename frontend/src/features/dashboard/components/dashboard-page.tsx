@@ -24,16 +24,20 @@ import { useRequestLogs } from "@/features/dashboard/hooks/use-request-logs";
 import { buildDashboardView } from "@/features/dashboard/utils";
 import {
   DEFAULT_OVERVIEW_TIMEFRAME,
+  type DashboardOverviewRange,
   parseOverviewTimeframe,
   type AccountSummary,
   type OverviewTimeframe,
 } from "@/features/dashboard/schemas";
+import { getBrowserReportsTimeZone } from "@/features/reports/date";
 import { useDashboardPreferencesStore } from "@/hooks/use-dashboard-preferences";
 import { useThemeStore } from "@/hooks/use-theme";
 import { REQUEST_STATUS_LABELS } from "@/utils/constants";
 import { formatModelLabel, formatSlug } from "@/utils/formatters";
 
 const MODEL_OPTION_DELIMITER = ":::";
+const OVERVIEW_START_DATE_PARAM = "overviewStartDate";
+const OVERVIEW_END_DATE_PARAM = "overviewEndDate";
 
 export function DashboardPage() {
   const navigate = useNavigate();
@@ -46,11 +50,20 @@ export function DashboardPage() {
   const setAccountViewMode = useDashboardPreferencesStore((s) => s.setAccountViewMode);
   const setAccountListSort = useDashboardPreferencesStore((s) => s.setAccountListSort);
   const canWrite = useAuthStore((state) => state.canWrite);
-  const overviewTimeframe = useMemo(
-    () => parseOverviewTimeframe(searchParams.get("overviewTimeframe")),
+  const overviewRange = useMemo(
+    () => parseDashboardOverviewRange(searchParams),
     [searchParams],
   );
-  const dashboardQuery = useDashboard(overviewTimeframe);
+  const dashboardOverviewRange = useMemo<DashboardOverviewRange>(() => {
+    if (overviewRange.mode !== "custom") {
+      return overviewRange;
+    }
+    return {
+      ...overviewRange,
+      timezone: getBrowserReportsTimeZone(),
+    };
+  }, [overviewRange]);
+  const dashboardQuery = useDashboard(dashboardOverviewRange);
   const projectionsQuery = useDashboardProjections(Boolean(dashboardQuery.data));
   const { filters, logsQuery, optionsQuery, updateFilters } = useRequestLogs();
   const { resumeMutation, limitWarmupMutation } = useAccountMutations();
@@ -63,14 +76,27 @@ export function DashboardPage() {
     void queryClient.invalidateQueries({ queryKey: ["dashboard"] });
   }, [queryClient]);
 
-  const handleOverviewTimeframeChange = useCallback(
+  const handleOverviewPresetSelect = useCallback(
     (timeframe: OverviewTimeframe) => {
       const next = new URLSearchParams(searchParams);
+      next.delete(OVERVIEW_START_DATE_PARAM);
+      next.delete(OVERVIEW_END_DATE_PARAM);
       if (timeframe === DEFAULT_OVERVIEW_TIMEFRAME) {
         next.delete("overviewTimeframe");
       } else {
         next.set("overviewTimeframe", timeframe);
       }
+      setSearchParams(next);
+    },
+    [searchParams, setSearchParams],
+  );
+
+  const handleOverviewCustomRangeChange = useCallback(
+    (range: Pick<Extract<DashboardOverviewRange, { mode: "custom" }>, "startDate" | "endDate">) => {
+      const next = new URLSearchParams(searchParams);
+      next.delete("overviewTimeframe");
+      next.set(OVERVIEW_START_DATE_PARAM, range.startDate);
+      next.set(OVERVIEW_END_DATE_PARAM, range.endDate);
       setSearchParams(next);
     },
     [searchParams, setSearchParams],
@@ -189,8 +215,9 @@ export function DashboardPage() {
         </div>
         <div className="flex items-center gap-2">
           <OverviewTimeframeSelect
-            value={overviewTimeframe}
-            onChange={handleOverviewTimeframeChange}
+            value={overviewRange}
+            onPresetSelect={handleOverviewPresetSelect}
+            onCustomRangeChange={handleOverviewCustomRangeChange}
           />
           <button
             type="button"
@@ -319,4 +346,24 @@ export function DashboardPage() {
 
     </div>
   );
+}
+
+function parseDashboardOverviewRange(params: URLSearchParams): DashboardOverviewRange {
+  const startDate = params.get(OVERVIEW_START_DATE_PARAM);
+  const endDate = params.get(OVERVIEW_END_DATE_PARAM);
+  if (isISODate(startDate) && isISODate(endDate) && startDate <= endDate) {
+    return { mode: "custom", startDate, endDate };
+  }
+  return {
+    mode: "preset",
+    timeframe: parseOverviewTimeframe(params.get("overviewTimeframe")),
+  };
+}
+
+function isISODate(value: string | null): value is string {
+  if (!value || !/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+    return false;
+  }
+  const date = new Date(`${value}T00:00:00Z`);
+  return !Number.isNaN(date.getTime()) && date.toISOString().slice(0, 10) === value;
 }

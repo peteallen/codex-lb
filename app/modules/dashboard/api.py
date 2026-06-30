@@ -1,15 +1,19 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Query
+from datetime import date
+from typing import Annotated
+
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from app.core.auth.dependencies import set_dashboard_error_format, validate_dashboard_session
 from app.core.openai.model_registry import get_model_registry, is_public_model
 from app.dependencies import DashboardContext, get_dashboard_context
 from app.modules.dashboard.schemas import (
     DashboardOverviewResponse,
-    DashboardOverviewTimeframeKey,
+    DashboardOverviewPresetKey,
     DashboardProjectionsResponse,
 )
+from app.modules.dashboard.service import DashboardOverviewRangeError
 
 router = APIRouter(
     prefix="/api",
@@ -20,10 +24,21 @@ router = APIRouter(
 
 @router.get("/dashboard/overview", response_model=DashboardOverviewResponse)
 async def get_overview(
-    timeframe: DashboardOverviewTimeframeKey = Query("7d"),
+    timeframe: DashboardOverviewPresetKey = Query("7d"),
+    start_date: Annotated[date | None, Query()] = None,
+    end_date: Annotated[date | None, Query()] = None,
+    report_timezone: Annotated[str | None, Query(alias="timezone")] = None,
     context: DashboardContext = Depends(get_dashboard_context),
 ) -> DashboardOverviewResponse:
-    return await context.service.get_overview(timeframe)
+    try:
+        return await context.service.get_overview(
+            timeframe,
+            start_date=start_date,
+            end_date=end_date,
+            report_timezone=report_timezone,
+        )
+    except DashboardOverviewRangeError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
 
 @router.get("/dashboard/projections", response_model=DashboardProjectionsResponse)

@@ -83,7 +83,10 @@ export function StatusBar() {
   const { t } = useTranslation();
   const { data: lastSyncAt = null } = useQuery({
     queryKey: ["dashboard", "overview", DEFAULT_OVERVIEW_TIMEFRAME],
-    queryFn: () => getDashboardOverview({ timeframe: DEFAULT_OVERVIEW_TIMEFRAME }),
+    queryFn: () =>
+      getDashboardOverview({
+        range: { mode: "preset", timeframe: DEFAULT_OVERVIEW_TIMEFRAME },
+      }),
     refetchInterval: 60_000,
     refetchIntervalInBackground: false,
     select: (data) => data.lastSyncAt,

@@ -1,0 +1,7 @@
+- [x] 1.1 Extend the dashboard overview API to accept a custom calendar date range.
+- [x] 1.2 Add a dashboard overview range picker with `1d`, `7d`, `30d`, and Custom controls.
+- [x] 1.3 Preserve existing preset dashboard URL behavior while adding custom range URL state.
+- [x] 1.4 Keep future dates disabled or clamped in custom dashboard range controls.
+- [x] 1.5 Add focused backend and frontend coverage for custom dashboard overview ranges.
+- [x] 1.6 Validate affected frontend tests, TypeScript, and Python module compilation.
+- [ ] 1.7 Run backend integration tests and strict OpenSpec validation when the local tooling is available. Blocked in this shell because `openspec`, `uv`, and `uvx` are unavailable; `npx --yes openspec ...` does not expose an executable; and the temporary `uv` Docker container cannot read this bind-mounted checkout path.

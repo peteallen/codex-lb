@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta, timezone
+from math import ceil
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from app.core import usage as usage_core
 from app.core.config.settings import get_settings
@@ -10,6 +13,7 @@ from app.core.utils.time import utcnow
 from app.db.models import UsageHistory
 from app.modules.accounts.mappers import build_account_summaries
 from app.modules.dashboard.builders import (
+    DashboardOverviewTimeframeConfig,
     build_dashboard_overview_summary,
     build_overview_timeframe,
     resolve_overview_timeframe,
@@ -19,7 +23,7 @@ from app.modules.dashboard.schemas import (
     DashboardMetricsComparison,
     DashboardMetricsComparisonPrevious,
     DashboardOverviewResponse,
-    DashboardOverviewTimeframeKey,
+    DashboardOverviewPresetKey,
     DashboardProjectionsResponse,
     DashboardUsageWindows,
     DepletionResponse,
@@ -30,6 +34,7 @@ from app.modules.usage.builders import (
     build_activity_summaries,
     build_trends_from_buckets,
     build_usage_window_response,
+    floor_bucket_window_start,
 )
 from app.modules.usage.depletion_service import (
     compute_aggregate_depletion,
@@ -52,6 +57,24 @@ def _parse_weekly_pace_working_days(value: str) -> set[int]:
     return days
 
 
+MAX_DASHBOARD_OVERVIEW_RANGE_DAYS = 730
+
+
+class DashboardOverviewRangeError(ValueError):
+    pass
+
+
+@dataclass(frozen=True)
+class _OverviewWindow:
+    timeframe: DashboardOverviewTimeframeConfig
+    activity_since: datetime
+    activity_until: datetime
+    bucket_query_since: datetime
+    trend_since: datetime
+    previous_since: datetime
+    previous_until: datetime
+
+
 class DashboardService:
     def __init__(self, repo: DashboardRepository) -> None:
         self._repo = repo
@@ -59,10 +82,21 @@ class DashboardService:
 
     async def get_overview(
         self,
-        timeframe_key: DashboardOverviewTimeframeKey = "7d",
+        timeframe_key: DashboardOverviewPresetKey = "7d",
+        *,
+        start_date: date | None = None,
+        end_date: date | None = None,
+        report_timezone: str | None = None,
     ) -> DashboardOverviewResponse:
         now = utcnow()
-        overview_timeframe = resolve_overview_timeframe(timeframe_key)
+        overview_window = _resolve_overview_window(
+            timeframe_key,
+            now=now,
+            start_date=start_date,
+            end_date=end_date,
+            report_timezone=report_timezone,
+        )
+        overview_timeframe = overview_window.timeframe
         accounts = await self._repo.list_accounts()
         account_ids = [account.id for account in accounts]
         primary_usage = await self._repo.latest_usage_by_account("primary")
@@ -91,25 +125,26 @@ class DashboardService:
             secondary_rows_raw,
         )
 
-        bucket_since = now - timedelta(minutes=overview_timeframe.window_minutes)
-        bucket_query_since = align_bucket_window_start(
-            bucket_since,
-            overview_timeframe.bucket_seconds,
-        )
         bucket_rows = await self._repo.aggregate_logs_by_bucket(
-            bucket_query_since,
+            overview_window.bucket_query_since,
             overview_timeframe.bucket_seconds,
+            overview_window.activity_until,
         )
         trends, _, _ = build_trends_from_buckets(
             bucket_rows,
-            bucket_since,
+            overview_window.trend_since,
             bucket_seconds=overview_timeframe.bucket_seconds,
             bucket_count=overview_timeframe.bucket_count,
         )
-        previous_window_start = bucket_since - timedelta(minutes=overview_timeframe.window_minutes)
-        activity_aggregate = await self._repo.aggregate_activity_between(bucket_since, now)
-        previous_activity_aggregate = await self._repo.aggregate_activity_between(previous_window_start, bucket_since)
-        top_error = await self._repo.top_error_between(bucket_since, now)
+        activity_aggregate = await self._repo.aggregate_activity_between(
+            overview_window.activity_since,
+            overview_window.activity_until,
+        )
+        previous_activity_aggregate = await self._repo.aggregate_activity_between(
+            overview_window.previous_since,
+            overview_window.previous_until,
+        )
+        top_error = await self._repo.top_error_between(overview_window.activity_since, overview_window.activity_until)
         earliest_activity_at = await self._repo.earliest_activity_at()
         activity_metrics, activity_cost = build_activity_summaries(
             activity_aggregate,
@@ -117,7 +152,7 @@ class DashboardService:
         )
         previous_metrics, previous_cost = build_activity_summaries(previous_activity_aggregate)
         comparison = DashboardMetricsComparison(
-            canCompare=earliest_activity_at is not None and earliest_activity_at <= previous_window_start,
+            canCompare=earliest_activity_at is not None and earliest_activity_at <= overview_window.previous_since,
             previous=DashboardMetricsComparisonPrevious(
                 requests=previous_metrics.requests or 0,
                 tokens=previous_metrics.tokens or 0,
@@ -198,6 +233,103 @@ class DashboardService:
             depletion_secondary=sec_depletion,
             weekly_credit_pace=weekly_credit_pace,
         )
+
+
+def _resolve_overview_window(
+    timeframe_key: DashboardOverviewPresetKey,
+    *,
+    now: datetime,
+    start_date: date | None,
+    end_date: date | None,
+    report_timezone: str | None,
+) -> _OverviewWindow:
+    if start_date is not None or end_date is not None:
+        return _resolve_custom_overview_window(
+            now=now,
+            start_date=start_date,
+            end_date=end_date,
+            report_timezone=report_timezone,
+        )
+
+    timeframe = resolve_overview_timeframe(timeframe_key)
+    activity_since = now - timedelta(minutes=timeframe.window_minutes)
+    window_delta = timedelta(minutes=timeframe.window_minutes)
+    return _OverviewWindow(
+        timeframe=timeframe,
+        activity_since=activity_since,
+        activity_until=now,
+        bucket_query_since=align_bucket_window_start(activity_since, timeframe.bucket_seconds),
+        trend_since=activity_since,
+        previous_since=activity_since - window_delta,
+        previous_until=activity_since,
+    )
+
+
+def _resolve_custom_overview_window(
+    *,
+    now: datetime,
+    start_date: date | None,
+    end_date: date | None,
+    report_timezone: str | None,
+) -> _OverviewWindow:
+    timezone_info = _resolve_timezone(report_timezone)
+    local_now = now.replace(tzinfo=timezone.utc).astimezone(timezone_info)
+    resolved_end_date = end_date or local_now.date()
+    resolved_start_date = start_date or resolved_end_date - timedelta(days=6)
+    window_days = (resolved_end_date - resolved_start_date).days + 1
+    if window_days <= 0:
+        raise DashboardOverviewRangeError("dashboard overview start date must be on or before end date")
+    if window_days > MAX_DASHBOARD_OVERVIEW_RANGE_DAYS:
+        raise DashboardOverviewRangeError(
+            f"dashboard overview date range must be {MAX_DASHBOARD_OVERVIEW_RANGE_DAYS} days or less"
+        )
+
+    activity_since = _local_midnight_to_utc_naive(resolved_start_date, timezone_info)
+    activity_until = _local_midnight_to_utc_naive(resolved_end_date + timedelta(days=1), timezone_info)
+    window_delta = activity_until - activity_since
+    if window_delta.total_seconds() <= 0:
+        raise DashboardOverviewRangeError("dashboard overview date range must cover at least one minute")
+
+    duration_seconds = int(window_delta.total_seconds())
+    bucket_seconds = _custom_bucket_seconds(window_days, duration_seconds)
+    trend_since = floor_bucket_window_start(activity_since, bucket_seconds)
+    bucket_count = max(1, ceil((activity_until - trend_since).total_seconds() / bucket_seconds))
+    timeframe = DashboardOverviewTimeframeConfig(
+        key="custom",
+        window_minutes=max(1, ceil(duration_seconds / 60)),
+        bucket_seconds=bucket_seconds,
+        bucket_count=bucket_count,
+    )
+    return _OverviewWindow(
+        timeframe=timeframe,
+        activity_since=activity_since,
+        activity_until=activity_until,
+        bucket_query_since=activity_since,
+        trend_since=trend_since,
+        previous_since=activity_since - window_delta,
+        previous_until=activity_since,
+    )
+
+
+def _custom_bucket_seconds(window_days: int, duration_seconds: int) -> int:
+    if duration_seconds <= 24 * 60 * 60:
+        return 60 * 60
+    if window_days <= 90:
+        return 24 * 60 * 60
+    return 7 * 24 * 60 * 60
+
+
+def _resolve_timezone(value: str | None) -> ZoneInfo | timezone:
+    if not value:
+        return timezone.utc
+    try:
+        return ZoneInfo(value)
+    except ZoneInfoNotFoundError:
+        return timezone.utc
+
+
+def _local_midnight_to_utc_naive(value: date, timezone_info: ZoneInfo | timezone) -> datetime:
+    return datetime.combine(value, datetime.min.time(), tzinfo=timezone_info).astimezone(timezone.utc).replace(tzinfo=None)
 
 
 async def _load_projection_histories(

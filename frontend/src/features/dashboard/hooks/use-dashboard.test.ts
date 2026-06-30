@@ -81,6 +81,63 @@ describe("useDashboard", () => {
     expect(requestedTimeframe).toBe("1d");
   });
 
+  it("passes custom date ranges to the overview endpoint", async () => {
+    const requestedParams: Record<string, string | null> = {};
+    server.use(
+      http.get("/api/dashboard/overview", ({ request }) => {
+        const params = new URL(request.url).searchParams;
+        requestedParams.timeframe = params.get("timeframe");
+        requestedParams.startDate = params.get("start_date");
+        requestedParams.endDate = params.get("end_date");
+        requestedParams.timezone = params.get("timezone");
+        return HttpResponse.json({
+          lastSyncAt: "2026-01-01T00:00:00Z",
+          timeframe: { key: "custom", windowMinutes: 10080, bucketSeconds: 86400, bucketCount: 7 },
+          accounts: [],
+          summary: {
+            primaryWindow: {
+              remainingPercent: 80,
+              capacityCredits: 100,
+              remainingCredits: 80,
+              resetAt: "2026-01-01T00:00:00Z",
+              windowMinutes: 300,
+            },
+            secondaryWindow: null,
+            cost: { currency: "USD", totalUsd: 0 },
+            metrics: null,
+          },
+          windows: {
+            primary: { windowKey: "primary", windowMinutes: 300, accounts: [] },
+            secondary: null,
+          },
+          trends: { requests: [], tokens: [], cost: [], errorRate: [] },
+        });
+      }),
+    );
+
+    const queryClient = createTestQueryClient();
+    const { result } = renderHook(
+      () =>
+        useDashboard({
+          mode: "custom",
+          startDate: "2026-06-01",
+          endDate: "2026-06-07",
+          timezone: "America/Denver",
+        }),
+      {
+        wrapper: createWrapper(queryClient),
+      },
+    );
+
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(requestedParams).toEqual({
+      timeframe: null,
+      startDate: "2026-06-01",
+      endDate: "2026-06-07",
+      timezone: "America/Denver",
+    });
+  });
+
   it("exposes error state on request failure", async () => {
     server.use(
       http.get("/api/dashboard/overview", () =>

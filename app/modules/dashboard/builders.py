@@ -9,6 +9,7 @@ from app.modules.dashboard.schemas import (
     DashboardMetricsComparison,
     DashboardOverviewSummary,
     DashboardOverviewTimeframe,
+    DashboardOverviewPresetKey,
     DashboardOverviewTimeframeKey,
     DashboardUsageCost,
     DashboardUsageMetrics,
@@ -28,7 +29,7 @@ class DashboardOverviewTimeframeConfig:
     bucket_count: int
 
 
-_OVERVIEW_TIMEFRAME_CONFIGS: dict[DashboardOverviewTimeframeKey, DashboardOverviewTimeframeConfig] = {
+_OVERVIEW_TIMEFRAME_CONFIGS: dict[DashboardOverviewPresetKey, DashboardOverviewTimeframeConfig] = {
     "1d": DashboardOverviewTimeframeConfig(
         key="1d",
         window_minutes=1440,
@@ -51,7 +52,7 @@ _OVERVIEW_TIMEFRAME_CONFIGS: dict[DashboardOverviewTimeframeKey, DashboardOvervi
 
 
 def resolve_overview_timeframe(
-    key: DashboardOverviewTimeframeKey,
+    key: DashboardOverviewPresetKey,
 ) -> DashboardOverviewTimeframeConfig:
     return _OVERVIEW_TIMEFRAME_CONFIGS[key]
 

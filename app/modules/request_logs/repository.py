@@ -86,6 +86,7 @@ class RequestLogsRepository:
         self,
         since: datetime,
         bucket_seconds: int = 21600,
+        until: datetime | None = None,
     ) -> list[BucketModelAggregate]:
         bind = self._session.get_bind()
         dialect = bind.dialect.name if bind else "sqlite"
@@ -115,6 +116,8 @@ class RequestLogsRepository:
             .group_by(bucket_col, RequestLog.model, RequestLog.service_tier)
             .order_by(bucket_col)
         )
+        if until is not None:
+            stmt = stmt.where(RequestLog.requested_at < until)
         result = await self._session.execute(stmt)
         return [
             BucketModelAggregate(
