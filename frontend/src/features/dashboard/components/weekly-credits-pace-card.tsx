@@ -34,26 +34,31 @@ function formatProAccountEquivalent(value: number): string {
 }
 
 function currentGapLabel(pace: WeeklyCreditPace): string {
-  if (Math.abs(pace.deltaPercent) < 0.5) {
+  const deltaPercent = pace.smoothedDeltaPercent ?? pace.deltaPercent;
+  if (Math.abs(deltaPercent) < 0.5) {
     return "On schedule";
   }
-  if (pace.status === "danger" && pace.projectedShortfallCredits > 0 && pace.deltaPercent <= 0) {
+  if (pace.status === "danger" && pace.projectedShortfallCredits > 0 && deltaPercent <= 0) {
     return "Recent burn shortfall";
   }
-  const direction = pace.deltaPercent > 0 ? "over schedule" : "under schedule";
-  return `${formatSignedPercent(pace.deltaPercent)} ${direction}`;
+  const direction = deltaPercent > 0 ? "over schedule" : "under schedule";
+  return `${formatSignedPercent(deltaPercent)} ${direction}`;
 }
 
 function scheduleGapLine(pace: WeeklyCreditPace): string {
-  if (pace.scheduleGapCredits > 0) {
-    return `${formatCompactNumber(pace.scheduleGapCredits)} credits over scheduled spend now`;
+  const scheduleGapCredits = pace.smoothedScheduleGapCredits ?? pace.scheduleGapCredits;
+  const deltaPercent = pace.smoothedDeltaPercent ?? pace.deltaPercent;
+  const smoothingMinutes = pace.paceGapSmoothingMinutes ?? 0;
+  const suffix = smoothingMinutes > 0 ? ` over ${formatDurationHours(smoothingMinutes / 60)}` : " now";
+  if (scheduleGapCredits > 0) {
+    return `${formatCompactNumber(scheduleGapCredits)} credits over scheduled spend${suffix}`;
   }
-  if (pace.deltaPercent < 0) {
+  if (deltaPercent < 0) {
     const cushionCredits = Math.max(0, pace.totalActualRemainingCredits - pace.totalExpectedRemainingCredits);
     if (cushionCredits > 0) {
-      return `${formatCompactNumber(cushionCredits)} credits more cushion than schedule now`;
+      return `${formatCompactNumber(cushionCredits)} credits more cushion than schedule${suffix}`;
     }
-    return `${formatSignedPercent(pace.deltaPercent)} under scheduled spend now`;
+    return `${formatSignedPercent(deltaPercent)} under scheduled spend${suffix}`;
   }
   return "On the current linear weekly schedule";
 }

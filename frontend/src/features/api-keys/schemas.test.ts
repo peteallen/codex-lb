@@ -6,6 +6,7 @@ import {
   ApiKeySchema,
   ApiKeyUpdateRequestSchema,
   LimitRuleCreateSchema,
+  ModelItemSchema,
 } from "@/features/api-keys/schemas";
 
 const ISO = "2026-01-01T00:00:00+00:00";
@@ -82,6 +83,24 @@ describe("ApiKeySchema", () => {
     expect(parsed.pooledCapacityCreditsPrimary).toBe(225.0);
   });
 
+  it("parses assigned model source ids", () => {
+    const parsed = ApiKeySchema.parse({
+      id: "key-1",
+      name: "Service Key",
+      keyPrefix: "sk-live",
+      allowedModels: null,
+      sourceAssignmentScopeEnabled: true,
+      assignedSourceIds: ["src_vllm"],
+      expiresAt: null,
+      isActive: true,
+      createdAt: ISO,
+      lastUsedAt: null,
+    });
+
+    expect(parsed.sourceAssignmentScopeEnabled).toBe(true);
+    expect(parsed.assignedSourceIds).toEqual(["src_vllm"]);
+  });
+
   it("defaults usage sections to both visible sections", () => {
     const parsed = ApiKeySchema.parse({
       id: "key-1",
@@ -117,6 +136,20 @@ describe("ApiKeyCreateResponseSchema", () => {
   });
 });
 
+describe("ModelItemSchema", () => {
+  it("accepts extended GPT-5.6 reasoning efforts", () => {
+    const parsed = ModelItemSchema.parse({
+      id: "gpt-5.6-sol",
+      name: "GPT-5.6-Sol",
+      sourceOnly: false,
+      supportedReasoningEfforts: ["low", "medium", "high", "xhigh", "max", "ultra"],
+      defaultReasoningEffort: "low",
+    });
+
+    expect(parsed.supportedReasoningEfforts).toEqual(["low", "medium", "high", "xhigh", "max", "ultra"]);
+  });
+});
+
 describe("ApiKeyCreateRequestSchema", () => {
   it("accepts optional assigned accounts", () => {
     const parsed = ApiKeyCreateRequestSchema.parse({
@@ -129,6 +162,15 @@ describe("ApiKeyCreateRequestSchema", () => {
     expect(parsed.usageSections).toBe("account_pool_usage");
   });
 
+  it("accepts optional assigned model sources", () => {
+    const parsed = ApiKeyCreateRequestSchema.parse({
+      name: "Source Scoped Key",
+      assignedSourceIds: ["src_vllm"],
+    });
+
+    expect(parsed.assignedSourceIds).toEqual(["src_vllm"]);
+  });
+
   it("accepts opportunistic traffic class in create payload", () => {
     const parsed = ApiKeyCreateRequestSchema.parse({
       name: "Opportunistic Key",
@@ -136,6 +178,15 @@ describe("ApiKeyCreateRequestSchema", () => {
     });
 
     expect(parsed.trafficClass).toBe("opportunistic");
+  });
+
+  it("accepts extended GPT-5.6 enforced reasoning in create payload", () => {
+    const parsed = ApiKeyCreateRequestSchema.parse({
+      name: "Extended reasoning key",
+      enforcedReasoningEffort: "ultra",
+    });
+
+    expect(parsed.enforcedReasoningEffort).toBe("ultra");
   });
 
   it("rejects invalid traffic class in create payload", () => {
@@ -191,6 +242,14 @@ describe("ApiKeyUpdateRequestSchema", () => {
     });
 
     expect(parsed.resetUsage).toBe(true);
+  });
+
+  it("accepts clearing assigned model sources", () => {
+    const parsed = ApiKeyUpdateRequestSchema.parse({
+      assignedSourceIds: [],
+    });
+
+    expect(parsed.assignedSourceIds).toEqual([]);
   });
 
   it("accepts opportunistic traffic class in update payload", () => {

@@ -12,6 +12,9 @@ const BASE_PACE: WeeklyCreditPace = {
   scheduledUsedPercent: 14,
   deltaPercent: 36,
   scheduleGapCredits: 360_000,
+  smoothedDeltaPercent: 24,
+  smoothedScheduleGapCredits: 240_000,
+  paceGapSmoothingMinutes: 30,
   overPlanCredits: 360_000,
   projectedShortfallCredits: 360_000,
   pauseForBreakEvenHours: 60.5,
@@ -42,7 +45,7 @@ describe("WeeklyCreditsPaceCard", () => {
     expect(screen.getByText("Current gap")).toBeInTheDocument();
     expect(screen.getByText("50%")).toBeInTheDocument();
     expect(screen.getByText("14%")).toBeInTheDocument();
-    expect(screen.getByText("36% over schedule")).toBeInTheDocument();
+    expect(screen.getByText("24% over schedule")).toBeInTheDocument();
     expect(screen.getByText("If recent burn continues")).toBeInTheDocument();
     expect(screen.getByText("Pause active use")).toBeInTheDocument();
     expect(screen.getByText("2d 12h of active use")).toBeInTheDocument();
@@ -50,7 +53,7 @@ describe("WeeklyCreditsPaceCard", () => {
     expect(screen.getByText("Reduce ongoing weekly-credit load by ~72%")).toBeInTheDocument();
     expect(screen.getByText("Add capacity")).toBeInTheDocument();
     expect(screen.getByText("7.1x Pro weekly pool (~8 accounts)")).toBeInTheDocument();
-    expect(screen.getByText("360K credits over scheduled spend now")).toBeInTheDocument();
+    expect(screen.getByText("240K credits over scheduled spend over 30m")).toBeInTheDocument();
     expect(
       screen.getByText(
         "Recent burn is 3.57x scheduled active pace; 360K credits could run short before a reset if it continues",
@@ -67,6 +70,8 @@ describe("WeeklyCreditsPaceCard", () => {
           ...BASE_PACE,
           deltaPercent: -8,
           scheduleGapCredits: 0,
+          smoothedDeltaPercent: -8,
+          smoothedScheduleGapCredits: 0,
           overPlanCredits: 0,
           projectedShortfallCredits: 0,
           pauseForBreakEvenHours: null,
@@ -85,7 +90,7 @@ describe("WeeklyCreditsPaceCard", () => {
     expect(screen.queryByText("If recent burn continues")).not.toBeInTheDocument();
     expect(screen.queryByText("No pause needed")).not.toBeInTheDocument();
     expect(screen.getByText("8% under schedule")).toBeInTheDocument();
-    expect(screen.getByText("8% under scheduled spend now")).toBeInTheDocument();
+    expect(screen.getByText("8% under scheduled spend over 30m")).toBeInTheDocument();
     expect(screen.queryByText("80K credits projected low-water mark")).not.toBeInTheDocument();
   });
 
@@ -110,6 +115,9 @@ describe("WeeklyCreditsPaceCard", () => {
         pace={{
           ...BASE_PACE,
           scheduleGapCredits: 3_096,
+          smoothedDeltaPercent: 36,
+          smoothedScheduleGapCredits: 3_096,
+          paceGapSmoothingMinutes: 0,
           overPlanCredits: 3_096,
           projectedShortfallCredits: 0,
           pauseForBreakEvenHours: null,
@@ -141,6 +149,8 @@ describe("WeeklyCreditsPaceCard", () => {
           ...BASE_PACE,
           deltaPercent: -5,
           scheduleGapCredits: 0,
+          smoothedDeltaPercent: -5,
+          smoothedScheduleGapCredits: 0,
           overPlanCredits: 0,
           projectedShortfallCredits: 42_000,
           status: "danger",
