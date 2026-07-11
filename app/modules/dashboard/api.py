@@ -10,8 +10,8 @@ from app.core.openai.model_registry import get_model_registry, is_public_model
 from app.db.session import detach_session_objects, get_background_session
 from app.dependencies import DashboardContext, get_dashboard_context
 from app.modules.dashboard.schemas import (
-    DashboardOverviewResponse,
     DashboardOverviewPresetKey,
+    DashboardOverviewResponse,
     DashboardProjectionsResponse,
 )
 from app.modules.dashboard.service import DashboardOverviewRangeError
