@@ -4779,7 +4779,11 @@ class _WebSocketMixin:
                     )
             await proxy._write_request_log(
                 account_id=account_id_value,
-                api_key=api_key,
+                # Reader-driven failure paths (idle timeout, stream_incomplete,
+                # missing response.created) pass api_key=None because they have
+                # no single caller key; fall back to the request's own key so
+                # the log row keeps its API-key attribution.
+                api_key=api_key if api_key is not None else request_state.api_key,
                 request_id=request_state.response_id or request_state.request_log_id or request_state.request_id,
                 archive_request_id=request_state.archive_request_id,
                 model=request_state.model or "",

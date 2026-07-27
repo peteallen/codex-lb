@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections import deque
 from dataclasses import replace
 from typing import Any, TypeVar, cast
+
+import anyio
 
 from app.core.clients.files import create_file as core_create_file  # noqa: F401
 from app.core.clients.files import finalize_file as core_finalize_file  # noqa: F401
@@ -49,6 +52,7 @@ from app.modules.proxy._service.http_bridge.helpers import (
     _http_bridge_eventless_precreated_deadline,
     _http_bridge_request_budget_seconds,
     _http_bridge_request_counts_against_queue,
+    _http_bridge_request_has_downstream_progress,
     _log_http_bridge_event,
     _normalize_http_bridge_error_event,
     _record_http_bridge_stuck_retire,
@@ -278,6 +282,89 @@ async def _cancel_http_bridge_reader_child(task: asyncio.Task[Any] | None, *, la
 
 
 class _HTTPBridgeUpstreamEventsMixin:
+    async def _invalidate_http_bridge_timed_out_reattach_anchors(
+        self: Any,
+        session: "_HTTPBridgeSession",
+        expired_requests: list["_WebSocketRequestState"],
+        *,
+        error_message: str,
+    ) -> None:
+        """Drop a durable reattach anchor upstream accepted and then ignored.
+
+        Only a *proxy-injected* anchor is invalidated, and only on an exact
+        ``latest_response_id`` match, so a newer anchor recorded by a concurrent
+        turn is never clobbered and a client-supplied ``previous_response_id`` is
+        never discarded. Without this the durable row keeps handing the same dead
+        anchor to every later request for the lane, and the hang repeats; after
+        it, the next request for the lane reattaches unanchored.
+        """
+        if session.durable_session_id is None:
+            return
+        for request_state in expired_requests:
+            if not request_state.proxy_injected_previous_response_id:
+                continue
+            anchor_id = request_state.previous_response_id
+            if anchor_id is None:
+                continue
+            try:
+                invalidated = await self._durable_bridge.invalidate_latest_response_id(
+                    session_id=session.durable_session_id,
+                    response_id=anchor_id,
+                )
+            except Exception:
+                logger.warning(
+                    "Failed to invalidate unresumable HTTP bridge reattach anchor session_id=%s",
+                    session.durable_session_id,
+                    exc_info=True,
+                )
+                continue
+            if not invalidated:
+                continue
+            _log_http_bridge_event(
+                "missing_response_created_anchor_invalidated",
+                session.key,
+                account_id=session.account.id,
+                model=session.request_model,
+                pending_count=len(session.pending_requests),
+                detail=_HTTP_BRIDGE_MISSING_RESPONSE_CREATED_TIMEOUT_DETAIL,
+                cache_key_family=session.key.affinity_kind,
+                model_class=_extract_model_class(session.request_model) if session.request_model else None,
+            )
+            if request_state.error_message_override is None:
+                request_state.error_message_override = (
+                    f"{error_message} The proxy-injected continuation anchor was dropped; "
+                    "a retry will start a fresh turn without the prior server-side conversation state."
+                )
+
+    async def _fail_http_bridge_eventless_requests_and_quarantine(
+        self: Any,
+        session: "_HTTPBridgeSession",
+        expired_requests: list["_WebSocketRequestState"],
+        *,
+        error_message: str,
+    ) -> None:
+        """Fail only the unacknowledged requests and quarantine the bridge.
+
+        Used when another request on the same websocket is already streaming
+        downstream: that sibling proves the transport is alive, so the socket
+        must not be closed under it. The bridge is marked for reconnect and
+        retirement after drain instead, which keeps future requests off it
+        without destroying the in-flight stream.
+        """
+        session.upstream_control.reconnect_requested = True
+        session.upstream_control.retire_after_drain = True
+        await self._fail_pending_websocket_requests(
+            account=session.account,
+            account_id_value=session.account.id,
+            pending_requests=deque(expired_requests),
+            pending_lock=anyio.Lock(),
+            error_code="upstream_request_timeout",
+            error_message=error_message,
+            api_key=None,
+            response_create_gate=session.response_create_gate,
+            penalize_account=False,
+        )
+
     async def _fail_http_bridge_reader_and_maybe_retire(
         self: Any,
         session: "_HTTPBridgeSession",
@@ -409,8 +496,8 @@ class _HTTPBridgeUpstreamEventsMixin:
                             async with session.pending_lock:
                                 if receive_task is not None and receive_task.done():
                                     continue
-                                expired_owner = any(
-                                    deadline is not None and deadline <= now
+                                expired_requests = [
+                                    request_state
                                     for request_state in session.pending_requests
                                     if (
                                         deadline := _http_bridge_eventless_precreated_deadline(
@@ -419,17 +506,69 @@ class _HTTPBridgeUpstreamEventsMixin:
                                         )
                                     )
                                     is not None
-                                )
-                                if not expired_owner:
+                                    and deadline <= now
+                                ]
+                                if not expired_requests:
                                     continue
                                 pending_count = len(session.pending_requests)
-                                for request_state in session.pending_requests:
+                                # A request that already produced downstream
+                                # output never arms this deadline, and it is the
+                                # only proof the shared socket is still
+                                # delivering frames. Closing the socket under
+                                # such a sibling destroys a working stream, so
+                                # quarantine the bridge instead. A sibling that
+                                # merely holds a response_id has proven nothing
+                                # and is still failed with the owner.
+                                expired_identities = {id(request_state) for request_state in expired_requests}
+                                retained_requests = [
+                                    request_state
+                                    for request_state in session.pending_requests
+                                    if id(request_state) not in expired_identities
+                                ]
+                                has_surviving_visible_request = any(
+                                    _http_bridge_request_has_downstream_progress(request_state)
+                                    for request_state in retained_requests
+                                )
+                                failing_requests = (
+                                    expired_requests if has_surviving_visible_request else session.pending_requests
+                                )
+                                for request_state in failing_requests:
                                     if request_state.failure_phase_override is None:
                                         request_state.failure_phase_override = "upstream"
                                     if request_state.failure_detail_override is None:
                                         request_state.failure_detail_override = (
                                             _HTTP_BRIDGE_MISSING_RESPONSE_CREATED_TIMEOUT_DETAIL
                                         )
+                                if has_surviving_visible_request:
+                                    session.pending_requests.clear()
+                                    session.pending_requests.extend(retained_requests)
+                                    for request_state in expired_requests:
+                                        if _http_bridge_request_counts_against_queue(request_state):
+                                            session.queued_request_count = max(0, session.queued_request_count - 1)
+                            if has_surviving_visible_request:
+                                _log_http_bridge_event(
+                                    "missing_response_created_timeout_quarantined",
+                                    session.key,
+                                    account_id=session.account.id,
+                                    model=session.request_model,
+                                    pending_count=pending_count,
+                                    detail=_HTTP_BRIDGE_MISSING_RESPONSE_CREATED_TIMEOUT_DETAIL,
+                                    cache_key_family=session.key.affinity_kind,
+                                    model_class=(
+                                        _extract_model_class(session.request_model) if session.request_model else None
+                                    ),
+                                )
+                                await self._invalidate_http_bridge_timed_out_reattach_anchors(
+                                    session,
+                                    expired_requests,
+                                    error_message=receive_timeout.error_message,
+                                )
+                                await self._fail_http_bridge_eventless_requests_and_quarantine(
+                                    session,
+                                    expired_requests,
+                                    error_message=receive_timeout.error_message,
+                                )
+                                continue
                             # Claim the session before cancelling receive so a
                             # gate waiter cannot reopen this ambiguous socket.
                             session.closed = True
@@ -455,6 +594,11 @@ class _HTTPBridgeUpstreamEventsMixin:
                                 model_class=(
                                     _extract_model_class(session.request_model) if session.request_model else None
                                 ),
+                            )
+                            await self._invalidate_http_bridge_timed_out_reattach_anchors(
+                                session,
+                                expired_requests,
+                                error_message=receive_timeout.error_message,
                             )
                             await self._fail_http_bridge_reader_and_maybe_retire(
                                 session,

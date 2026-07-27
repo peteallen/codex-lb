@@ -649,6 +649,17 @@ def _http_bridge_eventless_precreated_deadline(
     )
 
 
+def _http_bridge_request_has_downstream_progress(request_state: _WebSocketRequestState) -> bool:
+    """Report whether this request already produced downstream-visible output.
+
+    Downstream progress is the same signal that disarms the eventless
+    response.created watchdog, so it is also the only evidence that the shared
+    upstream websocket is still delivering frames. A sibling that merely holds a
+    ``response_id`` has not proven that; a sibling that has emitted output has.
+    """
+    return request_state.downstream_visible or request_state.last_downstream_sequence_number is not None
+
+
 def _http_bridge_session_has_admission_waiter(session: object | None) -> bool:
     """Keep a closed bridge registered while an unsent request owns its handoff."""
     return session is not None and bool(getattr(session, "admission_waiter_count", 0))
@@ -2243,6 +2254,8 @@ def _log_http_bridge_event(
         "reallocation_orphan",
         "context_overflow_rollover",
         "missing_response_created_timeout",
+        "missing_response_created_timeout_quarantined",
+        "missing_response_created_anchor_invalidated",
     }:
         level = logging.WARNING
     logger.log(

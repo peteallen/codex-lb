@@ -365,6 +365,38 @@ class DurableBridgeRepository:
             values=values,
         )
 
+    async def invalidate_latest_response_id(
+        self,
+        *,
+        session_id: str,
+        response_id: str,
+    ) -> bool:
+        """Clear a continuation anchor that upstream refused to resume.
+
+        Guarded by an exact anchor match so a newer response id recorded by a
+        concurrent turn is never clobbered. Not owner-fenced: clearing a dead
+        optimization hint is safe from any holder, and the caller may already
+        be releasing its lease.
+        """
+        async with sqlite_writer_section():
+            result = await self._session.execute(
+                update(HttpBridgeSessionRecord)
+                .where(
+                    HttpBridgeSessionRecord.id == session_id,
+                    HttpBridgeSessionRecord.latest_response_id == response_id,
+                )
+                .values(
+                    latest_response_id=None,
+                    latest_input_item_count=None,
+                    latest_input_full_fingerprint=None,
+                    last_seen_at=utcnow(),
+                )
+                .returning(HttpBridgeSessionRecord.id)
+            )
+            updated_row = result.one_or_none()
+            await self._session.commit()
+        return updated_row is not None
+
     async def _execute_fenced_session_update(
         self,
         *,

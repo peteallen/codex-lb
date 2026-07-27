@@ -374,6 +374,18 @@ class DurableBridgeSessionCoordinator:
                 latest_input_full_fingerprint=input_full_fingerprint,
             )
 
+    async def invalidate_latest_response_id(
+        self,
+        *,
+        session_id: str,
+        response_id: str,
+    ) -> bool:
+        async with self._session() as session:
+            return await DurableBridgeRepository(session).invalidate_latest_response_id(
+                session_id=session_id,
+                response_id=response_id,
+            )
+
     async def register_session_header(
         self,
         *,
