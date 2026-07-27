@@ -432,8 +432,9 @@ async def test_aggregate_daily_rows_calculates_sql_medians_for_odd_even_and_inva
     async_session.add(_make_account(account_id, "reports-speed-medians@example.com"))
     async_session.add_all(
         [
-            # Day one ignores missing TTFT and invalid TPS samples: TTFT [100, 200, 300], TPS [10].
-            # TPS excludes the two reasoning tokens from the valid sample.
+            # Day one ignores missing TTFT and invalid TPS samples: TTFT [100, 200, 300],
+            # TPS [11.67]. TPS counts total output tokens (14, reasoning included) over
+            # the generation window, because reasoning time sits inside that window.
             RequestLog(
                 account_id=account_id,
                 request_id="report-speed-even-1",
@@ -478,6 +479,21 @@ async def test_aggregate_daily_rows_calculates_sql_medians_for_odd_even_and_inva
                 output_tokens=9,
                 latency_ms=200,
                 latency_first_token_ms=200,
+            ),
+            # A tool-only turn: no client-visible token, so no TTFT, but a first
+            # upstream event. Before the anchor fallback this contributed nothing
+            # to TPS at all; now it is measured like any other turn.
+            RequestLog(
+                account_id=account_id,
+                request_id="report-speed-even-tool-only",
+                requested_at=datetime(2026, 6, 1, 12, 0),
+                model="gpt-5.1",
+                status="success",
+                output_tokens=30,
+                latency_ms=1200,
+                latency_first_token_ms=None,
+                latency_first_upstream_event_ms=200,
+                latency_queue_ms=50,
             ),
             # Day two ignores reasoning-only and zero-output rows for TPS: TTFT [100, 200, 300, 400], TPS [4, 20].
             RequestLog(
@@ -532,7 +548,7 @@ async def test_aggregate_daily_rows_calculates_sql_medians_for_odd_even_and_inva
     rows = await repo.aggregate_daily_rows(date(2026, 6, 1), date(2026, 6, 2), timezone.utc)
 
     assert [(row.date, row.median_ttft_ms, row.median_tps, row.median_queue_ms) for row in rows] == [
-        ("2026-06-01", 200.0, 10.0, 50.0),
+        ("2026-06-01", 200.0, pytest.approx((14 / 1.2 + 30 / 1.0) / 2), 50.0),
         ("2026-06-02", 250.0, 12.0, 30.0),
     ]
 

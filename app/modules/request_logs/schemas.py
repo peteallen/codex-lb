@@ -56,6 +56,12 @@ class RequestLogEntry(DashboardModel):
     cost_breakdown: RequestLogCostBreakdown = Field(default_factory=RequestLogCostBreakdown)
     latency_ms: int | None = None
     latency_first_token_ms: int | None = None
+    # Time to the first upstream event of any kind. Unlike TTFT this is recorded
+    # even when a turn produces no client-visible token -- the common shape for
+    # agentic tool-call turns -- so it is the throughput anchor the dashboard can
+    # rely on for nearly every request.
+    latency_first_upstream_event_ms: int | None = None
+    latency_response_created_ms: int | None = None
     latency_queue_ms: int | None = None
 
 

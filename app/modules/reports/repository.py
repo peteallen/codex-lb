@@ -400,7 +400,19 @@ def _daily_speed_medians_stmt(
             *([useragent_group_clause] if useragent_group_clause is not None else []),
         ),
     )
-    token_count = RequestLog.output_tokens - func.coalesce(RequestLog.reasoning_tokens, 0)
+    # Throughput anchor: the earliest point at which upstream had begun producing
+    # this response. TTFT alone covers only turns with a client-visible token, so
+    # it misses the agentic tool-call turns that dominate real traffic. The first
+    # upstream event is recorded for effectively every request, so anchoring here
+    # takes throughput coverage from a small minority of requests to nearly all of
+    # them. Reasoning time falls inside the window, so the matching numerator is
+    # total output tokens rather than visible-only tokens.
+    generation_anchor_ms = func.coalesce(
+        RequestLog.latency_first_upstream_event_ms,
+        RequestLog.latency_response_created_ms,
+        RequestLog.latency_first_token_ms,
+    )
+    generation_token_count = RequestLog.output_tokens
     ttft_values_cte = (
         select(
             day_ranges_cte.c.report_date,
@@ -413,15 +425,15 @@ def _daily_speed_medians_stmt(
     tps_values_cte = (
         select(
             day_ranges_cte.c.report_date,
-            (token_count * 1000.0 / (RequestLog.latency_ms - RequestLog.latency_first_token_ms)).label("tps"),
+            (generation_token_count * 1000.0 / (RequestLog.latency_ms - generation_anchor_ms)).label("tps"),
         )
         .select_from(traffic_join)
         .where(
-            token_count.is_not(None),
-            token_count > 0,
+            generation_token_count.is_not(None),
+            generation_token_count > 0,
             RequestLog.latency_ms.is_not(None),
-            RequestLog.latency_first_token_ms.is_not(None),
-            RequestLog.latency_ms > RequestLog.latency_first_token_ms,
+            generation_anchor_ms.is_not(None),
+            RequestLog.latency_ms > generation_anchor_ms,
         )
         .cte("daily_tps_values")
     )

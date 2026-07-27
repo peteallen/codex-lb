@@ -137,18 +137,60 @@ function formatRequestCostSummary(request: RequestLog | null, t: ReturnType<type
   return `${formatCurrency(totalUsd)} = ${segments.join(" + ")}`;
 }
 
+/**
+ * Earliest point at which upstream had begun producing this response.
+ *
+ * TTFT only exists for turns that emitted a client-visible token, which excludes
+ * the agentic tool-call turns that dominate real traffic. The first upstream
+ * event is recorded for effectively every request, so it is the anchor that
+ * makes throughput measurable almost everywhere.
+ */
+function generationAnchorMs(request: RequestLog): number | null {
+  return (
+    request.latencyFirstUpstreamEventMs ??
+    request.latencyResponseCreatedMs ??
+    request.latencyFirstTokenMs ??
+    null
+  );
+}
+
+/**
+ * Total generation throughput: every output token over the time from first
+ * output to completion.
+ *
+ * Reasoning time sits inside that window, so reasoning tokens stay in the
+ * numerator. Excluding them here while the denominator still spans the reasoning
+ * phase would understate throughput on exactly the turns that reason the most.
+ */
 function formatGenerationSpeed(request: RequestLog): string | null {
-  if (request.outputTokensRaw == null || request.latencyMs == null || request.latencyFirstTokenMs == null) {
+  const anchorMs = generationAnchorMs(request);
+  if (request.outputTokensRaw == null || request.latencyMs == null || anchorMs == null) {
     return null;
   }
 
-  const outputCount = request.outputTokensRaw - (request.reasoningTokens ?? 0);
-  const generationMs = request.latencyMs - request.latencyFirstTokenMs;
+  const outputCount = request.outputTokensRaw;
+  const generationMs = request.latencyMs - anchorMs;
   if (outputCount <= 0 || generationMs <= 0) {
     return null;
   }
 
   return (outputCount / (generationMs / 1000)).toFixed(1);
+}
+
+/**
+ * TTFT means time to first *client-visible* token, and stays that way.
+ *
+ * A tool-only turn never emits one, so rather than rendering "--" for the
+ * majority of agentic traffic we fall back to time-to-first-output and mark it
+ * as approximate, keeping the two meanings distinguishable.
+ */
+function firstTokenDisplay(request: RequestLog): { text: string; approximate: boolean } | null {
+  const exact = formatCompactElapsed(request.latencyFirstTokenMs);
+  if (exact != null) {
+    return { text: exact, approximate: false };
+  }
+  const fallback = formatCompactElapsed(generationAnchorMs(request));
+  return fallback == null ? null : { text: fallback, approximate: true };
 }
 
 function formatCompactElapsed(ms: number | null | undefined): string | null {
@@ -242,6 +284,7 @@ export function RecentRequestsTable({
               const planLabel = planType ? formatSlug(planType) : "--";
               const upstreamTransport = request.upstreamTransport;
               const generationSpeed = formatGenerationSpeed(request);
+              const firstToken = firstTokenDisplay(request);
 
               return (
                 <TableRow key={request.requestId}>
@@ -319,7 +362,21 @@ export function RecentRequestsTable({
                     </Badge>
                   </TableCell>
                   <TableCell className="text-right align-top font-mono text-xs tabular-nums">
-                    {formatCompactElapsed(request.latencyFirstTokenMs) ?? "--"}
+                    {firstToken == null ? (
+                      "--"
+                    ) : firstToken.approximate ? (
+                      <span
+                        className="text-muted-foreground"
+                        title={t("dashboard.requests.firstOutputApproxHint", {
+                          defaultValue:
+                            "No client-visible token in this turn; showing time to first output instead.",
+                        })}
+                      >
+                        ~{firstToken.text}
+                      </span>
+                    ) : (
+                      firstToken.text
+                    )}
                   </TableCell>
                   <TableCell className="text-right align-top font-mono text-xs tabular-nums">
                     {generationSpeed ?? "--"}
