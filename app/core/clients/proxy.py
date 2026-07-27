@@ -4294,14 +4294,18 @@ async def codex_control_request(
             decoded = json.loads(payload)
             if isinstance(decoded, dict):
                 payload_summary = cast(dict[str, JsonValue], decoded)
+    # Realtime call creation can contain SDP, session metadata, and other
+    # Voice setup material.  Never emit any of that content even when the
+    # operator has enabled full upstream request payload tracing globally.
+    suppress_payload_logging = normalized_path == "realtime/calls"
     _maybe_log_upstream_request_start(
         kind=f"codex_control_{normalized_path.replace('/', '_')}",
         url=url,
         headers=upstream_headers,
         method=request_method,
-        payload_summary=_summarize_json_payload(payload_summary or {}),
+        payload_summary="" if suppress_payload_logging else _summarize_json_payload(payload_summary or {}),
         payload_json=payload.decode("utf-8", errors="replace")
-        if payload is not None and "upstream_payload" in settings.trace_channels
+        if payload is not None and "upstream_payload" in settings.trace_channels and not suppress_payload_logging
         else None,
     )
     try:
@@ -4418,7 +4422,10 @@ async def codex_control_request(
                 started_at=started_at,
                 status_code=status_code,
                 error_code=error_code,
-                error_message=error_message,
+                # Upstream validation errors may echo SDP or session fields.
+                # Preserve the status/code while keeping Voice setup content
+                # out of operator logs.
+                error_message=None if suppress_payload_logging else error_message,
             )
         finally:
             if lease is not None:

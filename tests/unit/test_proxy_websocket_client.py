@@ -20,6 +20,7 @@ from app.core.clients.proxy import ProxyResponseError
 from app.core.clients.proxy_websocket import (
     CodexResponsesWebSocket,
     UpstreamWebSocketTransportError,
+    connect_realtime_voice_websocket,
     connect_responses_websocket,
 )
 from app.core.upstream_proxy import ResolvedProxyEndpoint, ResolvedUpstreamRoute
@@ -204,6 +205,241 @@ async def test_codex_responses_websocket_closes_owned_client_when_context_exit_f
         await websocket.close()
 
     assert codex_client.closed is True
+
+
+@pytest.mark.asyncio
+async def test_connect_realtime_voice_websocket_uses_direct_transport_and_preserves_query(monkeypatch, caplog):
+    fake_connection = _FakeConnection()
+    seen: dict[str, object] = {}
+    caplog.set_level("INFO", logger="app.core.clients.proxy_websocket")
+
+    async def fake_websocket_connect(url: str, **kwargs):
+        seen["url"] = url
+        seen["kwargs"] = kwargs
+        return fake_connection
+
+    monkeypatch.setattr(proxy_websocket_module, "websocket_connect", fake_websocket_connect)
+    monkeypatch.setattr(
+        proxy_websocket_module,
+        "get_settings",
+        lambda: SimpleNamespace(
+            upstream_base_url="https://chatgpt.com/backend-api",
+            upstream_connect_timeout_seconds=7.0,
+            max_sse_event_bytes=4321,
+            upstream_websocket_trust_env=False,
+        ),
+    )
+
+    websocket = await connect_realtime_voice_websocket(
+        {
+            "openai-alpha": "quicksilver=v2",
+            "openai-beta": "responses_websockets=2026-02-06",
+            "x-session-id": "voice-session",
+            "thread-id": "voice-thread-secret",
+            "originator": "voice-originator-secret",
+            "x-oai-attestation": '{"v":1,"s":0,"t":"opaque-attestation-secret"}',
+            "User-Agent": "Codex Desktop Test",
+            "Origin": "https://chatgpt.com",
+        },
+        "access-token",
+        "account-123",
+        call_id="rtc_direct",
+        query="intent=quicksilver&intent=second&architecture=avas",
+        allow_direct_egress=True,
+    )
+    await websocket.close()
+
+    assert seen["url"] == ("wss://api.openai.com/v1/live/rtc_direct?intent=quicksilver&intent=second&architecture=avas")
+    kwargs = cast(dict[str, object], seen["kwargs"])
+    assert kwargs["origin"] == "https://chatgpt.com"
+    assert kwargs["user_agent_header"] == "Codex Desktop Test"
+    assert kwargs["compression"] is None
+    headers = cast(dict[str, str], kwargs["additional_headers"])
+    assert headers["Authorization"] == "Bearer access-token"
+    assert headers["chatgpt-account-id"] == "account-123"
+    assert headers["openai-alpha"] == "quicksilver=v2"
+    assert headers["x-session-id"] == "voice-session"
+    assert all(key.lower() != "openai-beta" for key in headers)
+    assert "attestation_envelope_valid=True" in caplog.text
+    assert "attestation_version=1" in caplog.text
+    assert "attestation_status=0" in caplog.text
+    assert "attestation_token_present=True" in caplog.text
+    for secret in (
+        "opaque-attestation-secret",
+        "access-token",
+        "account-123",
+        "voice-session",
+        "voice-thread-secret",
+        "voice-originator-secret",
+        "Codex Desktop Test",
+        "quicksilver=v2",
+        "rtc_direct",
+        "intent=quicksilver",
+        "architecture=avas",
+    ):
+        assert secret not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_connect_realtime_voice_websocket_uses_bound_proxy_route(monkeypatch):
+    route = ResolvedUpstreamRoute(
+        mode="account_bound",
+        pool_id="pool_voice",
+        endpoint=ResolvedProxyEndpoint("ep_voice", "http", "proxy.test", 8080),
+    )
+    codex_client = _FakeCodexClient()
+    monkeypatch.setattr(
+        proxy_websocket_module,
+        "get_settings",
+        lambda: SimpleNamespace(
+            upstream_base_url="https://chatgpt.com/backend-api",
+            upstream_connect_timeout_seconds=7.0,
+            max_sse_event_bytes=4321,
+            upstream_websocket_trust_env=False,
+        ),
+    )
+
+    websocket = await connect_realtime_voice_websocket(
+        {"openai-alpha": "quicksilver=v2", "x-session-id": "voice-session"},
+        "access-token",
+        "account-123",
+        call_id="rtc_routed",
+        query="intent=quicksilver",
+        route=route,
+        codex_client=cast(Any, codex_client),
+    )
+    await websocket.close()
+
+    assert len(codex_client.calls) == 1
+    call = codex_client.calls[0]
+    assert call["url"] == "wss://api.openai.com/v1/live/rtc_routed?intent=quicksilver"
+    assert call["route"] is route
+    headers = cast(dict[str, str], call["headers"])
+    assert headers["Authorization"] == "Bearer access-token"
+    assert headers["chatgpt-account-id"] == "account-123"
+    assert headers["openai-alpha"] == "quicksilver=v2"
+
+
+@pytest.mark.asyncio
+async def test_connect_realtime_voice_websocket_reports_sanitized_upstream_403_metadata(monkeypatch, caplog):
+    async def fake_websocket_connect(url: str, **kwargs):
+        del url, kwargs
+        raise InvalidStatus(
+            Response(
+                403,
+                "Forbidden",
+                Headers(
+                    [
+                        ("Content-Type", "application/json"),
+                        ("CF-Ray", "sensitive-edge-request-id"),
+                        ("Server", "sensitive-server-value"),
+                        ("Set-Cookie", "sensitive-cookie-one"),
+                        ("Set-Cookie", "sensitive-cookie-two"),
+                    ]
+                ),
+                b'{"error":{"message":"sensitive body","type":"permission_error",'
+                b'"code":"evil\\nlog-injection-secret"}}',
+            )
+        )
+
+    caplog.set_level("INFO", logger="app.core.clients.proxy_websocket")
+    monkeypatch.setattr(proxy_websocket_module, "websocket_connect", fake_websocket_connect)
+    monkeypatch.setattr(
+        proxy_websocket_module,
+        "get_settings",
+        lambda: SimpleNamespace(
+            upstream_base_url="https://chatgpt.com/backend-api",
+            upstream_connect_timeout_seconds=7.0,
+            max_sse_event_bytes=4321,
+            upstream_websocket_trust_env=False,
+        ),
+    )
+
+    with pytest.raises(ProxyResponseError) as exc_info:
+        await connect_realtime_voice_websocket(
+            {
+                "openai-alpha": "quicksilver=v2",
+                "x-oai-attestation": '{"v":1,"s":0,"t":"opaque-attestation-secret"}',
+            },
+            "access-token",
+            "account-123",
+            call_id="rtc_denied",
+            allow_direct_egress=True,
+        )
+
+    error = exc_info.value
+    assert error.status_code == 403
+    assert error.failure_phase == "upstream_handshake_status"
+    assert error.upstream_status_code == 403
+    assert error.upstream_error_code == "unclassified_upstream_error"
+    assert "response_json_content_type=True" in caplog.text
+    assert "response_openai_error_parsed=True" in caplog.text
+    assert "cloudflare_marker_present=True" in caplog.text
+    assert "server_header_present=True" in caplog.text
+    for secret in (
+        "opaque-attestation-secret",
+        "access-token",
+        "account-123",
+        "sensitive body",
+        "sensitive-edge-request-id",
+        "sensitive-server-value",
+        "sensitive-cookie-one",
+        "sensitive-cookie-two",
+        "log-injection-secret",
+        "rtc_denied",
+    ):
+        assert secret not in caplog.text
+
+
+def test_handshake_error_payload_tolerates_repeated_content_type_headers() -> None:
+    payload = proxy_websocket_module._handshake_error_payload(
+        403,
+        "Forbidden",
+        Headers(
+            [
+                ("Content-Type", "text/plain"),
+                ("Content-Type", "application/problem+json"),
+            ]
+        ),
+        b'{"error":{"message":"denied","type":"permission_error","code":"forbidden"}}',
+    )
+
+    assert payload["error"]["code"] == "forbidden"
+
+
+@pytest.mark.asyncio
+async def test_connect_realtime_voice_routed_transport_error_has_handshake_metadata(monkeypatch):
+    route = ResolvedUpstreamRoute(
+        mode="account_bound",
+        pool_id="pool_voice",
+        endpoint=ResolvedProxyEndpoint("ep_voice", "http", "proxy.test", 8080),
+    )
+    monkeypatch.setattr(
+        proxy_websocket_module,
+        "get_settings",
+        lambda: SimpleNamespace(
+            upstream_base_url="https://chatgpt.com/backend-api",
+            upstream_connect_timeout_seconds=7.0,
+            max_sse_event_bytes=4321,
+            upstream_websocket_trust_env=False,
+        ),
+    )
+
+    with pytest.raises(ProxyResponseError) as exc_info:
+        await connect_realtime_voice_websocket(
+            {"openai-alpha": "quicksilver=v2"},
+            "access-token",
+            "account-123",
+            call_id="rtc_routed_denied",
+            route=route,
+            codex_client=cast(Any, _FailingCodexClient()),
+        )
+
+    error = exc_info.value
+    assert error.status_code == 502
+    assert error.failure_phase == "upstream_handshake"
+    assert error.upstream_status_code is None
+    assert error.upstream_error_code == "upstream_unavailable"
 
 
 @pytest.mark.asyncio

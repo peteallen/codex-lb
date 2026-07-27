@@ -18,8 +18,9 @@ from app.core.auth import generate_unique_account_id
 from app.core.auth.refresh import RefreshError
 from app.core.clients import proxy as core_proxy
 from app.core.clients.proxy import ProxyResponseError
+from app.core.errors import openai_error
 from app.core.utils.sse import CODEX_KEEPALIVE_FRAME, SSE_KEEPALIVE_FRAME
-from app.db.models import Account, AccountStatus, RequestLog
+from app.db.models import Account, AccountStatus, RealtimeCallBinding, RequestLog
 from app.db.session import SessionLocal
 from app.dependencies import ProxyContext
 from app.modules.proxy._service.support import _signal_propagated_capacity_startup_ready
@@ -772,7 +773,7 @@ async def test_codex_alpha_search_preserves_normalized_control_error_contract(as
 
 @pytest.mark.asyncio
 async def test_codex_realtime_call_forwards_raw_sdp_and_location(async_client, monkeypatch):
-    await _import_account(async_client, "acc_codex_realtime", "codex-realtime@example.com")
+    expected_account_id = await _import_account(async_client, "acc_codex_realtime", "codex-realtime@example.com")
     calls = []
 
     async def fake_codex_control_request(
@@ -791,7 +792,7 @@ async def test_codex_realtime_call_forwards_raw_sdp_and_location(async_client, m
         return core_proxy.CodexControlResponse(
             status_code=201,
             body=b"v=answer\r\n",
-            headers={"content-type": "application/sdp", "location": "/v1/realtime/calls/call_123"},
+            headers={"content-type": "application/sdp", "location": "/v1/realtime/calls/rtc_call_123"},
         )
 
     monkeypatch.setattr(proxy_module, "core_codex_control_request", fake_codex_control_request)
@@ -804,7 +805,7 @@ async def test_codex_realtime_call_forwards_raw_sdp_and_location(async_client, m
 
     assert response.status_code == 201
     assert response.content == b"v=answer\r\n"
-    assert response.headers["location"] == "/v1/realtime/calls/call_123"
+    assert response.headers["location"] == "/v1/realtime/calls/rtc_call_123"
     assert calls == [
         (
             "realtime/calls",
@@ -818,6 +819,178 @@ async def test_codex_realtime_call_forwards_raw_sdp_and_location(async_client, m
     ]
     assert isinstance(calls[0][6], float)
     assert calls[0][6] > 0
+    async with SessionLocal() as session:
+        binding = await session.get(RealtimeCallBinding, "rtc_call_123")
+        assert binding is not None
+        assert binding.account_id == expected_account_id
+        assert binding.api_key_id is None
+        log = (
+            await session.execute(select(RequestLog).where(RequestLog.request_kind == "codex_control_realtime_calls"))
+        ).scalar_one()
+        assert log.status == "success"
+
+
+@pytest.mark.asyncio
+async def test_codex_realtime_call_does_not_persist_echoed_error_content(async_client, monkeypatch):
+    await _import_account(async_client, "acc_codex_realtime_error", "codex-realtime-error@example.com")
+    sentinel = "private-sdp-or-session-sentinel"
+
+    async def fake_codex_control_request(*_args, **_kwargs):
+        raise ProxyResponseError(
+            400,
+            {"error": {"code": "invalid_sdp", "message": sentinel, "type": "invalid_request_error"}},
+            failure_phase="status",
+            failure_detail=sentinel,
+        )
+
+    monkeypatch.setattr(proxy_module, "core_codex_control_request", fake_codex_control_request)
+
+    response = await async_client.post(
+        "/backend-api/codex/realtime/calls",
+        json={"sdp": "private-offer", "session": {"instructions": "private"}},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["message"] == sentinel
+    async with SessionLocal() as session:
+        log = (
+            await session.execute(
+                select(RequestLog)
+                .where(RequestLog.request_kind == "codex_control_realtime_calls")
+                .order_by(RequestLog.id.desc())
+                .limit(1)
+            )
+        ).scalar_one()
+        assert log.error_code == "invalid_sdp"
+        assert log.error_message is None
+        assert log.failure_detail is None
+
+
+@pytest.mark.asyncio
+async def test_codex_realtime_call_binds_final_failover_account(async_client, monkeypatch):
+    await _import_account(async_client, "acc_voice_failover_a", "voice-failover-a@example.com")
+    await _import_account(async_client, "acc_voice_failover_b", "voice-failover-b@example.com")
+    attempted_upstream_accounts: list[str | None] = []
+    first_account: str | None = None
+
+    async def fake_codex_control_request(*_args, account_id=None, **_kwargs):
+        nonlocal first_account
+        if first_account is None:
+            first_account = account_id
+        attempted_upstream_accounts.append(account_id)
+        if account_id == first_account:
+            raise ProxyResponseError(401, {"error": {"code": "invalid_api_key", "message": "stale token"}})
+        return core_proxy.CodexControlResponse(
+            status_code=201,
+            body=b"v=answer\r\n",
+            headers={"location": "/backend-api/codex/realtime/calls/rtc_failover"},
+        )
+
+    async def fake_ensure_fresh(self, account, *, force=False, timeout_seconds=None):
+        del self, force
+        assert timeout_seconds is not None
+        return account
+
+    monkeypatch.setattr(proxy_module, "core_codex_control_request", fake_codex_control_request)
+    monkeypatch.setattr(proxy_module.ProxyService, "_ensure_fresh_with_budget", fake_ensure_fresh)
+
+    response = await async_client.post(
+        "/backend-api/codex/realtime/calls",
+        content=b"v=offer\r\n",
+        headers={"content-type": "application/sdp"},
+    )
+
+    assert response.status_code == 201
+    assert attempted_upstream_accounts[:2] == [first_account, first_account]
+    assert attempted_upstream_accounts[2] != first_account
+    async with SessionLocal() as session:
+        binding = await session.get(RealtimeCallBinding, "rtc_failover")
+        assert binding is not None
+        bound_account = await session.get(Account, binding.account_id)
+        assert bound_account is not None
+        assert bound_account.chatgpt_account_id == attempted_upstream_accounts[2]
+
+
+@pytest.mark.asyncio
+async def test_realtime_call_binding_failure_does_not_create_a_second_upstream_call(async_client, monkeypatch):
+    await _import_account(async_client, "acc_voice_persist", "voice-persist@example.com")
+    calls = 0
+
+    async def fake_codex_control_request(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return core_proxy.CodexControlResponse(
+            status_code=201,
+            body=b"v=answer\r\n",
+            headers={"location": "/backend-api/codex/realtime/calls/rtc_persist"},
+        )
+
+    async def fail_binding(self, account, response, api_key):
+        del self, account, response, api_key
+        raise ProxyResponseError(
+            503,
+            openai_error(
+                "realtime_call_binding_unavailable",
+                "Realtime call routing could not be persisted",
+                error_type="server_error",
+            ),
+        )
+
+    monkeypatch.setattr(proxy_module, "core_codex_control_request", fake_codex_control_request)
+    monkeypatch.setattr(proxy_module.ProxyService, "bind_realtime_call_response", fail_binding)
+
+    response = await async_client.post(
+        "/backend-api/codex/realtime/calls",
+        content=b"v=offer\r\n",
+        headers={"content-type": "application/sdp"},
+    )
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "realtime_call_binding_unavailable"
+    assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_realtime_call_duplicate_id_fails_closed_without_overwriting_binding(async_client, monkeypatch):
+    expected_account_id = await _import_account(async_client, "acc_voice_collision", "voice-collision@example.com")
+    calls = 0
+
+    async def fake_codex_control_request(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return core_proxy.CodexControlResponse(
+            status_code=201,
+            body=b"v=answer\r\n",
+            headers={"location": "/backend-api/codex/rtc_collision"},
+        )
+
+    monkeypatch.setattr(proxy_module, "core_codex_control_request", fake_codex_control_request)
+
+    first = await async_client.post(
+        "/backend-api/codex/realtime/calls",
+        content=b"v=offer\r\n",
+        headers={"content-type": "application/sdp"},
+    )
+    async with SessionLocal() as session:
+        original = await session.get(RealtimeCallBinding, "rtc_collision")
+        assert original is not None
+        original_created_at = original.created_at
+
+    second = await async_client.post(
+        "/backend-api/codex/realtime/calls",
+        content=b"v=second-offer\r\n",
+        headers={"content-type": "application/sdp"},
+    )
+
+    assert first.status_code == 201
+    assert second.status_code == 502
+    assert second.json()["error"]["code"] == "realtime_call_id_conflict"
+    assert calls == 2
+    async with SessionLocal() as session:
+        retained = await session.get(RealtimeCallBinding, "rtc_collision")
+        assert retained is not None
+        assert retained.account_id == expected_account_id
+        assert retained.created_at == original_created_at
 
 
 @pytest.mark.asyncio

@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any, Mapping, NoReturn, Protocol, cast
 from urllib.parse import urlparse, urlunparse
@@ -51,6 +52,8 @@ from app.core.upstream_proxy import ResolvedUpstreamRoute
 from app.core.utils.proxy_env import resolve_websocket_proxy_from_env
 from app.core.utils.request_id import get_request_id
 
+logger = logging.getLogger(__name__)
+
 _WEBSOCKET_HOP_BY_HOP_HEADERS = _HOP_BY_HOP_HEADER_NAMES | frozenset(
     {
         "accept-encoding",
@@ -63,6 +66,71 @@ _WEBSOCKET_HOP_BY_HOP_HEADERS = _HOP_BY_HOP_HEADER_NAMES | frozenset(
 )
 _RESPONSES_WEBSOCKET_BETA_HEADER = "responses_websockets=2026-02-06"
 _RESPONSES_WEBSOCKET_INCOMPATIBLE_BETA_HEADERS = frozenset({"responses=experimental"})
+_REALTIME_VOICE_FRAMELESS_BASE_URL = "https://api.openai.com/v1/live"
+_REALTIME_VOICE_ALPHA_VALUES = frozenset({"quicksilver=v1", "quicksilver=v2"})
+_REALTIME_VOICE_LOG_ERROR_CODES = frozenset(
+    {
+        "account_stream_concurrency_exceeded",
+        "forbidden",
+        "global_admission_timeout",
+        "invalid_api_key",
+        "invalid_request_error",
+        "invalid_realtime_call_id",
+        "invalid_upstream_response",
+        "ip_forbidden",
+        "rate_limit_exceeded",
+        "realtime_call_account_scope_changed",
+        "realtime_call_account_unavailable",
+        "realtime_call_already_joined",
+        "realtime_call_binding_unavailable",
+        "realtime_call_forbidden",
+        "realtime_call_id_conflict",
+        "realtime_call_not_found",
+        "upstream_error",
+        "upstream_proxy_unavailable",
+        "upstream_request_timeout",
+        "upstream_unavailable",
+    }
+)
+_REALTIME_VOICE_HEADER_ALLOWLIST = frozenset(
+    {
+        "chatgpt-conversation-id",
+        "openai-alpha",
+        "origin",
+        "originator",
+        "request-id",
+        "session-id",
+        "session_id",
+        "thread-id",
+        "user-agent",
+        "x-chatgpt-conversation-id",
+        "x-codex-conversation-id",
+        "x-codex-session-id",
+        "x-codex-turn-metadata",
+        "x-openai-client-arch",
+        "x-openai-client-id",
+        "x-openai-client-os",
+        "x-openai-client-user-agent",
+        "x-openai-client-version",
+        "x-openai-device-attestation",
+        "x-openai-device-id",
+        "x-openai-device-os",
+        "x-openai-internal-codex-residency",
+        "x-oai-attestation",
+        "x-request-id",
+        "x-session-id",
+        "x-stainless-arch",
+        "x-stainless-async",
+        "x-stainless-lang",
+        "x-stainless-os",
+        "x-stainless-package-version",
+        "x-stainless-retry-count",
+        "x-stainless-runtime",
+        "x-stainless-runtime-version",
+        "x-stainless-timeout",
+        "x-thread-id",
+    }
+)
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +141,7 @@ class UpstreamWebSocketMessage:
     text: str | None = None
     data: bytes | None = None
     close_code: int | None = None
+    close_reason: str | None = None
     error: str | None = None
     error_code: str | None = None
 
@@ -128,6 +197,23 @@ async def _raise_websocket_send_error(
     ) from None
 
 
+@dataclass(frozen=True, slots=True)
+class RealtimeVoiceHeaderDiagnostics:
+    """Metadata-only Voice handshake shape; never contains header values."""
+
+    attestation_present: bool
+    attestation_envelope_valid: bool
+    attestation_version: int | None
+    attestation_status: int | None
+    attestation_token_present: bool
+    alpha_present: bool
+    alpha_valid: bool
+    session_header_present: bool
+    thread_header_present: bool
+    originator_header_present: bool
+    user_agent_header_present: bool
+
+
 class UpstreamResponsesWebSocket(Protocol):
     async def send_text(self, text: str) -> None: ...
 
@@ -135,7 +221,7 @@ class UpstreamResponsesWebSocket(Protocol):
 
     async def receive(self) -> UpstreamWebSocketMessage: ...
 
-    async def close(self) -> None: ...
+    async def close(self, *, code: int = 1000, reason: str = "") -> None: ...
 
     def response_header(self, name: str) -> str | None: ...
 
@@ -161,7 +247,11 @@ class WebsocketsResponsesWebSocket:
         try:
             message = await self._connection.recv()
         except ConnectionClosedOK as exc:
-            return UpstreamWebSocketMessage(kind="close", close_code=_close_code_from_exception(exc))
+            return UpstreamWebSocketMessage(
+                kind="close",
+                close_code=_close_code_from_exception(exc),
+                close_reason=_close_reason_from_exception(exc),
+            )
         except ConnectionClosedError as exc:
             error_code = _websocket_transport_error_code(exc, uses_proxy=self._uses_proxy)
             await _rotate_after_websocket_network_failure(error_code)
@@ -171,6 +261,7 @@ class WebsocketsResponsesWebSocket:
             return UpstreamWebSocketMessage(
                 kind="error",
                 close_code=_close_code_from_exception(exc),
+                close_reason=_close_reason_from_exception(exc),
                 error=str(exc),
                 error_code=_relay_receive_error_code(error_code),
             )
@@ -189,8 +280,8 @@ class WebsocketsResponsesWebSocket:
             return UpstreamWebSocketMessage(kind="binary", data=message)
         return UpstreamWebSocketMessage(kind="error", error=f"Unexpected websocket message type: {type(message)!r}")
 
-    async def close(self) -> None:
-        await self._connection.close()
+    async def close(self, *, code: int = 1000, reason: str = "") -> None:
+        await self._connection.close(code=code, reason=reason)
 
     def response_header(self, name: str) -> str | None:
         response = getattr(self._connection, "response", None)
@@ -252,6 +343,7 @@ class CodexResponsesWebSocket:
             return UpstreamWebSocketMessage(
                 kind="close",
                 close_code=_aiohttp_ws_close_code(self._websocket, msg),
+                close_reason=_aiohttp_ws_close_reason(msg),
             )
         if msg.type == aiohttp.WSMsgType.ERROR:
             exception = msg.data if isinstance(msg.data, BaseException) else None
@@ -277,9 +369,12 @@ class CodexResponsesWebSocket:
             return UpstreamWebSocketMessage(kind="binary", data=bytes(msg.data) if isinstance(msg.data, bytes) else b"")
         return UpstreamWebSocketMessage(kind="error", error=f"Unexpected ws type: {msg.type!r}")
 
-    async def close(self) -> None:
+    async def close(self, *, code: int = 1000, reason: str = "") -> None:
         try:
-            result = self._websocket.close()
+            if code == 1000 and not reason:
+                result = self._websocket.close()
+            else:
+                result = self._websocket.close(code=code, message=reason.encode("utf-8"))
             if asyncio.iscoroutine(result):
                 await result
         finally:
@@ -387,8 +482,11 @@ class ArchivingResponsesWebSocket:
                 extra={"frame_type": message.kind, "close_code": message.close_code},
             )
 
-    async def close(self) -> None:
-        await self._wrapped.close()
+    async def close(self, *, code: int = 1000, reason: str = "") -> None:
+        if code == 1000 and not reason:
+            await self._wrapped.close()
+        else:
+            await self._wrapped.close(code=code, reason=reason)
 
     def response_header(self, name: str) -> str | None:
         return self._wrapped.response_header(name)
@@ -451,6 +549,100 @@ def _build_upstream_websocket_headers(
     return headers
 
 
+def build_realtime_voice_websocket_headers(
+    inbound: Mapping[str, str],
+    access_token: str,
+    account_id: str | None,
+) -> dict[str, str]:
+    """Build the raw Voice sideband handshake without Responses mutations."""
+
+    allowlisted = {key: value for key, value in inbound.items() if key.lower() in _REALTIME_VOICE_HEADER_ALLOWLIST}
+    headers = filter_inbound_websocket_headers(allowlisted)
+    for key in tuple(headers):
+        if key.lower() == "openai-alpha" and headers[key].strip().lower() not in _REALTIME_VOICE_ALPHA_VALUES:
+            headers.pop(key)
+    headers["Authorization"] = f"Bearer {access_token}"
+    if account_id:
+        headers["chatgpt-account-id"] = account_id
+    return headers
+
+
+def realtime_voice_header_diagnostics(headers: Mapping[str, str]) -> RealtimeVoiceHeaderDiagnostics:
+    """Return only nonsecret presence and attestation-envelope metadata."""
+
+    normalized = {key.lower(): value for key, value in headers.items()}
+    attestation = normalized.get("x-oai-attestation")
+    envelope_valid = False
+    attestation_version: int | None = None
+    attestation_status: int | None = None
+    attestation_token_present = False
+    # Released Codex app-server envelopes the opaque token as compact JSON
+    # ``{"v": 1, "s": <status>, "t": <opaque>}``. Parse only bounded input
+    # and expose only the nonsecret integer version/status fields. Never retain
+    # or log the token, its value, or its length.
+    if attestation is not None and len(attestation) <= 16_384:
+        try:
+            envelope = json.loads(attestation)
+        except (ValueError, RecursionError, UnicodeError):
+            envelope = None
+        if isinstance(envelope, dict) and set(envelope).issubset({"v", "s", "t"}):
+            version = envelope.get("v")
+            status = envelope.get("s")
+            token = envelope.get("t")
+            if (
+                isinstance(version, int)
+                and not isinstance(version, bool)
+                and 0 <= version <= 255
+                and isinstance(status, int)
+                and not isinstance(status, bool)
+                and 0 <= status <= 255
+                and ("t" not in envelope or isinstance(token, str))
+            ):
+                envelope_valid = True
+                attestation_version = version
+                attestation_status = status
+                attestation_token_present = isinstance(token, str) and bool(token)
+
+    alpha = normalized.get("openai-alpha")
+    return RealtimeVoiceHeaderDiagnostics(
+        attestation_present=attestation is not None,
+        attestation_envelope_valid=envelope_valid,
+        attestation_version=attestation_version,
+        attestation_status=attestation_status,
+        attestation_token_present=attestation_token_present,
+        alpha_present=alpha is not None,
+        alpha_valid=alpha is not None and alpha.strip().lower() in _REALTIME_VOICE_ALPHA_VALUES,
+        session_header_present=any(
+            name in normalized for name in ("session-id", "session_id", "x-session-id", "x-codex-session-id")
+        ),
+        thread_header_present=any(name in normalized for name in ("thread-id", "x-thread-id")),
+        originator_header_present="originator" in normalized,
+        user_agent_header_present="user-agent" in normalized,
+    )
+
+
+def realtime_voice_safe_error_code(payload: Mapping[str, object]) -> str | None:
+    """Extract an error code only when it is an explicitly safe log token."""
+
+    error = payload.get("error")
+    if not isinstance(error, Mapping):
+        return None
+    code = error.get("code")
+    if not isinstance(code, str):
+        return None
+    return realtime_voice_safe_log_token(code)
+
+
+def realtime_voice_safe_log_token(value: str | None) -> str | None:
+    """Allow only static Voice error codes; collapse every unknown value."""
+
+    if value is None:
+        return None
+    if value in _REALTIME_VOICE_LOG_ERROR_CODES:
+        return value
+    return "unclassified_upstream_error"
+
+
 def _ensure_responses_websocket_beta_header(headers: dict[str, str]) -> None:
     header_key = next((key for key in headers if key.lower() == "openai-beta"), "openai-beta")
     current_value = headers.get(header_key, "")
@@ -480,6 +672,11 @@ def _aiohttp_ws_close_code(websocket: Any, message: aiohttp.WSMessage) -> int | 
     return close_code if isinstance(close_code, int) else None
 
 
+def _aiohttp_ws_close_reason(message: aiohttp.WSMessage) -> str | None:
+    reason = getattr(message, "extra", None)
+    return reason if isinstance(reason, str) and reason else None
+
+
 def _responses_websocket_url(base_url: str) -> str:
     parsed = urlparse(f"{base_url.rstrip('/')}/codex/responses")
     if parsed.scheme == "https":
@@ -489,6 +686,24 @@ def _responses_websocket_url(base_url: str) -> str:
     else:
         scheme = parsed.scheme
     return urlunparse(parsed._replace(scheme=scheme))
+
+
+def realtime_voice_websocket_url(base_url: str, call_id: str, query: str = "") -> str:
+    # Codex creates ChatGPT-authenticated V3 calls through the ChatGPT backend,
+    # but Frameless Bidi sideband control deliberately joins the resulting
+    # call on OpenAI's direct Live endpoint. Path-based joins are the Frameless
+    # transport regardless of whether upstream issued an ``rtc_*`` or UUID
+    # identifier. Reusing the ChatGPT call-create base reaches an unsupported
+    # path that Cloudflare rejects before the Realtime application sees it.
+    del base_url
+    parsed = urlparse(f"{_REALTIME_VOICE_FRAMELESS_BASE_URL}/{call_id}")
+    if parsed.scheme == "https":
+        scheme = "wss"
+    elif parsed.scheme == "http":
+        scheme = "ws"
+    else:
+        scheme = parsed.scheme
+    return urlunparse(parsed._replace(scheme=scheme, query=query))
 
 
 async def connect_responses_websocket(
@@ -640,11 +855,254 @@ async def connect_responses_websocket(
     )
 
 
+async def connect_realtime_voice_websocket(
+    headers: Mapping[str, str],
+    access_token: str,
+    account_id: str | None,
+    *,
+    call_id: str,
+    query: str = "",
+    base_url: str | None = None,
+    route: ResolvedUpstreamRoute | None = None,
+    codex_client: CodexClient | None = None,
+    allow_direct_egress: bool = False,
+) -> UpstreamResponsesWebSocket:
+    """Open a transparent Voice sideband websocket for an existing call."""
+
+    settings = get_settings()
+    upstream_base = (base_url or settings.upstream_base_url).rstrip("/")
+    url = realtime_voice_websocket_url(upstream_base, call_id, query)
+    upstream_headers = build_realtime_voice_websocket_headers(headers, access_token, account_id)
+    header_diagnostics = realtime_voice_header_diagnostics(upstream_headers)
+    route_mode = "configured_proxy" if route is not None else "direct"
+    logger.info(
+        "Realtime Voice upstream connect started route_mode=%s"
+        " attestation_present=%s attestation_envelope_valid=%s"
+        " attestation_version=%s attestation_status=%s attestation_token_present=%s"
+        " alpha_present=%s alpha_valid=%s session_header_present=%s"
+        " thread_header_present=%s originator_header_present=%s user_agent_header_present=%s",
+        route_mode,
+        header_diagnostics.attestation_present,
+        header_diagnostics.attestation_envelope_valid,
+        header_diagnostics.attestation_version,
+        header_diagnostics.attestation_status,
+        header_diagnostics.attestation_token_present,
+        header_diagnostics.alpha_present,
+        header_diagnostics.alpha_valid,
+        header_diagnostics.session_header_present,
+        header_diagnostics.thread_header_present,
+        header_diagnostics.originator_header_present,
+        header_diagnostics.user_agent_header_present,
+    )
+    require_route_or_direct_egress_opt_in(
+        route=route,
+        allow_direct_egress=allow_direct_egress,
+        operation="realtime Voice sideband websocket",
+    )
+    if route is not None:
+        owns_codex_client = codex_client is None
+        active_codex_client = codex_client or CodexClient(create_codex_session())
+        endpoint_id = route.endpoint_id
+        try:
+            opener = getattr(active_codex_client, "open_ws_with_route_metadata", None)
+            if callable(opener):
+                result = await opener(
+                    url,
+                    route=route,
+                    headers=upstream_headers,
+                    timeout=settings.upstream_connect_timeout_seconds,
+                    max_msg_size=settings.max_sse_event_bytes,
+                )
+                context = result.context
+                websocket = result.websocket
+                endpoint_id = result.route.endpoint_id
+            else:
+                context = await active_codex_client.ws_connect(
+                    url,
+                    route=route,
+                    headers=upstream_headers,
+                    timeout=settings.upstream_connect_timeout_seconds,
+                    max_msg_size=settings.max_sse_event_bytes,
+                )
+                websocket = await context.__aenter__() if hasattr(context, "__aenter__") else context
+                if not hasattr(context, "__aenter__"):
+                    context = None
+        except asyncio.CancelledError:
+            if owns_codex_client:
+                await active_codex_client.close()
+            raise
+        except CodexTransportError as exc:
+            if owns_codex_client:
+                await active_codex_client.close()
+            error = ProxyResponseError(
+                502,
+                openai_error("upstream_unavailable", str(exc), error_type="server_error"),
+                failure_phase="upstream_handshake",
+                failure_exception_type=type(exc).__name__,
+                upstream_status_code=exc.status_code,
+                upstream_error_code="upstream_unavailable",
+            )
+            _log_realtime_voice_connect_failure(error, route_mode=route_mode)
+            raise error from exc
+        except Exception as exc:
+            if owns_codex_client:
+                await active_codex_client.close()
+            logger.warning(
+                "Realtime Voice upstream connect failed route_mode=%s failure_phase=upstream_handshake"
+                " upstream_status=None upstream_error_code=None exception_type=%s",
+                route_mode,
+                type(exc).__name__,
+            )
+            raise
+        logger.info(
+            "Realtime Voice upstream connect succeeded route_mode=%s upstream_status=101",
+            route_mode,
+        )
+        return CodexResponsesWebSocket(
+            websocket,
+            context=context if hasattr(context, "__aenter__") else None,
+            codex_client=active_codex_client,
+            owns_codex_client=owns_codex_client,
+            endpoint_id=endpoint_id,
+            response_headers=_codex_websocket_response_headers(websocket, context),
+        )
+
+    origin = cast(Origin | None, _pop_header_case_insensitive(upstream_headers, "origin"))
+    user_agent = _pop_header_case_insensitive(upstream_headers, "user-agent")
+    proxy_env = (
+        settings.upstream_websocket_proxy_env() if hasattr(settings, "upstream_websocket_proxy_env") else os.environ
+    )
+    proxy_url = resolve_websocket_proxy_from_env(url, proxy_env) if settings.upstream_websocket_trust_env else None
+    connect_kwargs: dict[str, Any] = {
+        "origin": origin,
+        "additional_headers": upstream_headers or None,
+        "user_agent_header": user_agent,
+        "open_timeout": settings.upstream_connect_timeout_seconds,
+        "ping_timeout": None,
+        "max_size": settings.max_sse_event_bytes,
+        # Match the released Codex realtime client. tokio-tungstenite doesn't
+        # advertise permessage-deflate on this sideband handshake, while the
+        # Python websockets client does unless compression is explicitly off.
+        "compression": None,
+        "proxy": proxy_url,
+    }
+    try:
+        response = await websocket_connect(url, **connect_kwargs)
+    except asyncio.TimeoutError as exc:
+        error = ProxyResponseError(
+            502,
+            openai_error("upstream_unavailable", "Request to upstream timed out"),
+            failure_phase="upstream_connect",
+            failure_exception_type=type(exc).__name__,
+            upstream_error_code="upstream_unavailable",
+        )
+        _log_realtime_voice_connect_failure(error, route_mode=route_mode)
+        raise error from exc
+    except InvalidStatus as exc:
+        handshake_response = exc.response
+        message = handshake_response.reason_phrase or (
+            f"Upstream websocket error: HTTP {handshake_response.status_code}"
+        )
+        payload = _handshake_error_payload(
+            handshake_response.status_code,
+            message,
+            handshake_response.headers,
+            handshake_response.body,
+        )
+        error = ProxyResponseError(
+            handshake_response.status_code,
+            payload,
+            failure_phase="upstream_handshake_status",
+            failure_exception_type=type(exc).__name__,
+            upstream_status_code=handshake_response.status_code,
+            upstream_error_code=realtime_voice_safe_error_code(payload),
+        )
+        normalized_response_headers = _normalize_response_headers(handshake_response.headers)
+        parsed_error = _try_parse_handshake_error_payload(
+            handshake_response.headers,
+            handshake_response.body,
+        )
+        logger.warning(
+            "Realtime Voice upstream connect failed route_mode=%s failure_phase=%s"
+            " upstream_status=%s upstream_error_code=%s response_json_content_type=%s"
+            " response_openai_error_parsed=%s cloudflare_marker_present=%s"
+            " server_header_present=%s exception_type=%s",
+            route_mode,
+            error.failure_phase,
+            error.upstream_status_code,
+            error.upstream_error_code,
+            "json" in normalized_response_headers.get("content-type", "").lower(),
+            parsed_error is not None,
+            any(name in normalized_response_headers for name in ("cf-cache-status", "cf-mitigated", "cf-ray")),
+            "server" in normalized_response_headers,
+            error.failure_exception_type,
+        )
+        raise error from exc
+    except InvalidHandshake as exc:
+        message = str(exc) or "Invalid upstream websocket handshake"
+        error = ProxyResponseError(
+            502,
+            openai_error("upstream_unavailable", message, error_type="server_error"),
+            failure_phase="upstream_handshake",
+            failure_exception_type=type(exc).__name__,
+            upstream_error_code="upstream_unavailable",
+        )
+        _log_realtime_voice_connect_failure(error, route_mode=route_mode)
+        raise error from exc
+    except InvalidProxy as exc:
+        message = str(exc) or "Invalid upstream websocket proxy configuration"
+        error = ProxyResponseError(
+            502,
+            openai_error("upstream_unavailable", message, error_type="server_error"),
+            failure_phase="upstream_proxy_connect",
+            failure_exception_type=type(exc).__name__,
+            upstream_error_code="upstream_unavailable",
+        )
+        _log_realtime_voice_connect_failure(error, route_mode=route_mode)
+        raise error from exc
+    except OSError as exc:
+        error = ProxyResponseError(
+            502,
+            openai_error("upstream_unavailable", str(exc)),
+            failure_phase="upstream_connect",
+            failure_exception_type=type(exc).__name__,
+            upstream_error_code="upstream_unavailable",
+        )
+        _log_realtime_voice_connect_failure(error, route_mode=route_mode)
+        raise error from exc
+
+    logger.info(
+        "Realtime Voice upstream connect succeeded route_mode=%s upstream_status=101",
+        route_mode,
+    )
+    return WebsocketsResponsesWebSocket(response)
+
+
+def _log_realtime_voice_connect_failure(error: ProxyResponseError, *, route_mode: str) -> None:
+    logger.warning(
+        "Realtime Voice upstream connect failed route_mode=%s failure_phase=%s"
+        " upstream_status=%s upstream_error_code=%s exception_type=%s",
+        route_mode,
+        error.failure_phase,
+        error.upstream_status_code,
+        error.upstream_error_code,
+        error.failure_exception_type,
+    )
+
+
 def _close_code_from_exception(exc: ConnectionClosedOK | ConnectionClosedError) -> int | None:
     if exc.rcvd is not None:
         return int(exc.rcvd.code)
     if exc.sent is not None:
         return int(exc.sent.code)
+    return None
+
+
+def _close_reason_from_exception(exc: ConnectionClosedOK | ConnectionClosedError) -> str | None:
+    if exc.rcvd is not None and exc.rcvd.reason:
+        return str(exc.rcvd.reason)
+    if exc.sent is not None and exc.sent.reason:
+        return str(exc.sent.reason)
     return None
 
 
@@ -674,7 +1132,19 @@ def _response_headers_from_source(source: object | None) -> Mapping[str, str]:
 def _normalize_response_headers(headers: Mapping[str, object] | None) -> dict[str, str]:
     if headers is None:
         return {}
-    return {str(key).lower(): str(value) for key, value in headers.items()}
+    # ``websockets.Headers.items()`` performs a singular lookup for every
+    # header name and raises ``MultipleValuesError`` for common repeated
+    # response headers such as Set-Cookie. Iterate raw pairs when the mapping
+    # supports them; the normalized single-value view intentionally keeps the
+    # final occurrence, matching an ordinary dict comprehension.
+    return {str(key).lower(): str(value) for key, value in _response_header_items(headers)}
+
+
+def _response_header_items(headers: Mapping[str, object]) -> Iterable[tuple[object, object]]:
+    raw_items = getattr(headers, "raw_items", None)
+    if callable(raw_items):
+        return cast(Iterable[tuple[object, object]], raw_items())
+    return headers.items()
 
 
 def _handshake_error_payload(
@@ -706,7 +1176,11 @@ def _try_parse_handshake_error_payload(
 
     content_type = ""
     if headers is not None:
-        content_type = headers.get("Content-Type", "")
+        # Repeated Content-Type is malformed, but it must remain an upstream
+        # classification problem rather than crashing the proxy's error path.
+        content_type = ", ".join(
+            str(value) for key, value in _response_header_items(headers) if str(key).lower() == "content-type"
+        )
 
     if "json" not in content_type.lower() and not body.strip().startswith((b"{", b"[")):
         return None

@@ -144,6 +144,12 @@ _FAILED_ACCOUNT_ATTR = "_codex_lb_failed_account"
 _REQUEST_TRANSPORT_HTTP = "http"
 
 
+class _CodexControlPostSuccessError(Exception):
+    def __init__(self, error: ProxyResponseError) -> None:
+        super().__init__(str(error))
+        self.error = error
+
+
 class _CodexControlMixin:
     async def codex_control_request(
         self,
@@ -155,6 +161,7 @@ class _CodexControlMixin:
         headers: Mapping[str, str],
         codex_session_affinity: bool = True,
         api_key: ApiKeyData | None = None,
+        on_success: Callable[[Account, CodexControlResponse], Awaitable[None]] | None = None,
     ) -> CodexControlResponse:
         proxy = cast(_CodexControlServiceProtocol, self)
         filtered = filter_inbound_headers(headers)
@@ -181,6 +188,26 @@ class _CodexControlMixin:
         route_fallback_used: bool | None = None
         route_fail_closed_reason: str | None = None
         request_kind = f"codex_control_{path.strip('/').replace('/', '_')}"
+
+        async def _complete_success(
+            target: Account,
+            response: CodexControlResponse,
+            *,
+            record_account_success: bool,
+        ) -> CodexControlResponse:
+            nonlocal log_status
+            if record_account_success:
+                await proxy._load_balancer.record_success(target)
+            if on_success is not None:
+                try:
+                    await on_success(target, response)
+                except ProxyResponseError as exc:
+                    # The upstream request has already succeeded.  Keep a
+                    # post-success persistence failure out of the account
+                    # failover/retry path or a second call could be created.
+                    raise _CodexControlPostSuccessError(exc) from exc
+            log_status = "success"
+            return response
 
         try:
             selection = await proxy._select_account_with_budget_compatible(
@@ -282,9 +309,7 @@ class _CodexControlMixin:
                 )
                 account_id_value = account.id
                 response = await _call_control(account)
-                await proxy._load_balancer.record_success(account)
-                log_status = "success"
-                return response
+                return await _complete_success(account, response, record_account_success=True)
             except RefreshError as refresh_exc:
                 if refresh_exc.is_permanent:
                     failed_account = _refresh_error_failed_account(refresh_exc, account)
@@ -310,8 +335,7 @@ class _CodexControlMixin:
                     if failover is not None:
                         account, response = failover
                         account_id_value = account.id
-                        log_status = "success"
-                        return response
+                        return await _complete_success(account, response, record_account_success=False)
                 if exc.status_code == 401:
                     try:
                         remaining_budget = _remaining_budget_seconds(deadline)
@@ -341,9 +365,7 @@ class _CodexControlMixin:
                         account_id_value = account.id
                         try:
                             response = await _call_control(account)
-                            await proxy._load_balancer.record_success(account)
-                            log_status = "success"
-                            return response
+                            return await _complete_success(account, response, record_account_success=True)
                         except ProxyResponseError as retry_exc:
                             await proxy._handle_proxy_error(account, retry_exc)
                             if retry_exc.status_code == 401:
@@ -373,9 +395,11 @@ class _CodexControlMixin:
                                     )
                                     try:
                                         response = await _call_control(account)
-                                        await proxy._load_balancer.record_success(account)
-                                        log_status = "success"
-                                        return response
+                                        return await _complete_success(
+                                            account,
+                                            response,
+                                            record_account_success=True,
+                                        )
                                     except ProxyResponseError as failover_exc:
                                         await proxy._handle_proxy_error(account, failover_exc)
                                         raise
@@ -399,6 +423,16 @@ class _CodexControlMixin:
                 account_id_value = failed_account.id
                 await proxy._handle_proxy_error(failed_account, exc)
                 raise
+        except _CodexControlPostSuccessError as post_success_exc:
+            exc = post_success_exc.error
+            failure_metadata = _request_log_failure_metadata(exc)
+            error = _parse_openai_error(exc.payload)
+            log_error_code = _normalize_error_code(
+                error.code if error else None,
+                error.type if error else None,
+            )
+            log_error_message = error.message if error else None
+            raise exc
         except ProxyResponseError as exc:
             failed_account = getattr(exc, _FAILED_ACCOUNT_ATTR, None)
             if isinstance(failed_account, Account):
@@ -420,10 +454,22 @@ class _CodexControlMixin:
                 openai_error("upstream_proxy_unavailable", f"Upstream proxy route unavailable: {exc.reason}"),
             ) from exc
         finally:
+            if path.strip("/") == "realtime/calls":
+                # Realtime validation errors may echo SDP or session values.
+                # Keep only structural failure metadata in persistent logs.
+                log_error_message = None
+                failure_metadata = _RequestLogFailureMetadata(
+                    failure_phase=failure_metadata.failure_phase,
+                    failure_exception_type=failure_metadata.failure_exception_type,
+                    upstream_status_code=failure_metadata.upstream_status_code,
+                    upstream_error_code=failure_metadata.upstream_error_code,
+                    bridge_stage=failure_metadata.bridge_stage,
+                )
             await proxy._write_request_log(
                 account_id=account_id_value,
                 api_key=api_key,
                 request_id=request_id,
+                request_kind=request_kind,
                 model=None,
                 latency_ms=int((_service_time().monotonic() - start) * 1000),
                 status=log_status,

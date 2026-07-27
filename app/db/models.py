@@ -1532,6 +1532,37 @@ class AccountRefreshClaim(Base):
     claim_expires_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
 
 
+class RealtimeCallBinding(Base):
+    """Durable routing identity for a ChatGPT realtime Voice call.
+
+    Call creation may use the normal account failover policy.  Once upstream
+    returns a call id, however, the sideband websocket is credential-scoped to
+    the account that created it.  This row preserves that identity across
+    replicas and carries a short renewable claim so only one websocket joins a
+    call at a time.
+    """
+
+    __tablename__ = "realtime_call_bindings"
+
+    call_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    account_id: Mapped[str] = mapped_column(
+        String,
+        ForeignKey("accounts.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    api_key_id: Mapped[str | None] = mapped_column(
+        String,
+        ForeignKey("api_keys.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, index=True)
+    claim_holder: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    claim_expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+
+
 class BridgeRingMember(Base):
     __tablename__ = "bridge_ring_members"
 

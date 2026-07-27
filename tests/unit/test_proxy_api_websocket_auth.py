@@ -21,6 +21,7 @@ from app.core.exceptions import ProxyAuthError
 from app.core.middleware.trusted_proxy_headers import TrustedProxyHeadersMiddleware
 from app.core.openai.requests import ResponsesRequest
 from app.core.types import JsonValue
+from app.dependencies import ProxyContext
 from app.modules.api_keys.service import ApiKeyData, ApiKeyUsageReservationData
 
 pytestmark = pytest.mark.unit
@@ -94,6 +95,34 @@ async def test_validate_proxy_websocket_request_returns_firewall_denial(monkeypa
 
     assert api_key is None
     assert response is denial
+
+
+@pytest.mark.asyncio
+async def test_realtime_voice_websocket_auth_denial_precedes_binding_lookup(monkeypatch):
+    denial = JSONResponse(
+        status_code=401,
+        content=openai_error("invalid_api_key", "API key was revoked", error_type="authentication_error"),
+    )
+    websocket = SimpleNamespace(
+        send_denial_response=AsyncMock(),
+        headers={"authorization": "Bearer revoked"},
+        url=SimpleNamespace(query="intent=quicksilver"),
+    )
+    service = SimpleNamespace(proxy_realtime_voice_websocket=AsyncMock())
+
+    async def deny(_websocket):
+        return None, denial
+
+    monkeypatch.setattr(proxy_api_module, "_validate_proxy_websocket_request", deny)
+
+    await proxy_api_module._proxy_realtime_voice_websocket(
+        cast(WebSocket, websocket),
+        call_id="rtc_guarded",
+        context=cast(ProxyContext, SimpleNamespace(service=service)),
+    )
+
+    websocket.send_denial_response.assert_awaited_once_with(denial)
+    service.proxy_realtime_voice_websocket.assert_not_awaited()
 
 
 @pytest.mark.asyncio

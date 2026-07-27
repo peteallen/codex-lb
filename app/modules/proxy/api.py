@@ -10,7 +10,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from json import JSONDecodeError
 from typing import Any, Final, Literal, cast
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from fastapi import (
     APIRouter,
@@ -39,7 +39,12 @@ from app.core.auth.dependencies import (
 from app.core.auth.refresh import RefreshError
 from app.core.cache.invalidation import NAMESPACE_RESET_CREDITS, bump_cache_invalidation_local
 from app.core.clients.files import FileProxyError
-from app.core.clients.proxy import ProxyResponseError, _is_native_codex_request
+from app.core.clients.proxy import CodexControlResponse, ProxyResponseError, _is_native_codex_request
+from app.core.clients.proxy_websocket import (
+    realtime_voice_header_diagnostics,
+    realtime_voice_safe_error_code,
+    realtime_voice_safe_log_token,
+)
 from app.core.clients.rate_limit_reset_credits import (
     ConsumeResetCreditError,
     ResetCreditFetchError,
@@ -697,17 +702,20 @@ async def _codex_control_proxy(
     path: str,
     context: ProxyContext,
     api_key: ApiKeyData | None,
+    on_success: Callable[[Account, CodexControlResponse], Awaitable[None]] | None = None,
 ) -> Response:
     try:
-        response = await context.service.codex_control_request(
-            path,
-            method=request.method,
-            payload=await request.body() if request.method.upper() not in {"GET", "HEAD"} else None,
-            query_params=list(request.query_params.multi_items()),
-            headers=request.headers,
-            codex_session_affinity=True,
-            api_key=api_key,
-        )
+        request_kwargs: dict[str, Any] = {
+            "method": request.method,
+            "payload": await request.body() if request.method.upper() not in {"GET", "HEAD"} else None,
+            "query_params": list(request.query_params.multi_items()),
+            "headers": request.headers,
+            "codex_session_affinity": True,
+            "api_key": api_key,
+        }
+        if on_success is not None:
+            request_kwargs["on_success"] = on_success
+        response = await context.service.codex_control_request(path, **request_kwargs)
     except ProxyResponseError as exc:
         return _logged_error_json_response(request, exc.status_code, exc.payload)
     return Response(
@@ -769,7 +777,16 @@ async def codex_realtime_calls(
     context: ProxyContext = Depends(get_proxy_context),
     api_key: ApiKeyData | None = Security(validate_proxy_api_key),
 ) -> Response:
-    return await _codex_control_proxy(request, "realtime/calls", context, api_key)
+    async def _bind_call(account: Account, response: CodexControlResponse) -> None:
+        await context.service.bind_realtime_call_response(account, response, api_key)
+
+    return await _codex_control_proxy(
+        request,
+        "realtime/calls",
+        context,
+        api_key,
+        on_success=_bind_call,
+    )
 
 
 @router.post("/safety/arc")
@@ -938,6 +955,120 @@ async def responses_websocket(
         api_key=api_key,
         client_ip=resolve_request_client_host(websocket),
         synthesized_turn_state=turn_state if client_turn_state is None else None,
+    )
+
+
+async def _proxy_realtime_voice_websocket(
+    websocket: WebSocket,
+    *,
+    call_id: str,
+    context: ProxyContext,
+) -> None:
+    header_diagnostics = realtime_voice_header_diagnostics(websocket.headers)
+    logger.info(
+        "Realtime Voice websocket route matched call_id_kind=%s"
+        " attestation_present=%s attestation_envelope_valid=%s"
+        " attestation_version=%s attestation_status=%s attestation_token_present=%s"
+        " alpha_present=%s alpha_valid=%s session_header_present=%s"
+        " thread_header_present=%s originator_header_present=%s user_agent_header_present=%s",
+        "rtc" if call_id.startswith("rtc_") else "uuid",
+        header_diagnostics.attestation_present,
+        header_diagnostics.attestation_envelope_valid,
+        header_diagnostics.attestation_version,
+        header_diagnostics.attestation_status,
+        header_diagnostics.attestation_token_present,
+        header_diagnostics.alpha_present,
+        header_diagnostics.alpha_valid,
+        header_diagnostics.session_header_present,
+        header_diagnostics.thread_header_present,
+        header_diagnostics.originator_header_present,
+        header_diagnostics.user_agent_header_present,
+    )
+    api_key, denial = await _validate_proxy_websocket_request(websocket)
+    if denial is not None:
+        logger.warning(
+            "Realtime Voice websocket denied failure_phase=local_auth status=%s error_code=%s",
+            denial.status_code,
+            _json_response_error_code(denial),
+        )
+        await websocket.send_denial_response(denial)
+        return
+    logger.info("Realtime Voice websocket authentication passed")
+    try:
+        await context.service.proxy_realtime_voice_websocket(
+            websocket,
+            call_id=call_id,
+            headers=websocket.headers,
+            query=websocket.url.query,
+            api_key=api_key,
+        )
+    except ProxyResponseError as exc:
+        logger.warning(
+            "Realtime Voice websocket setup denied failure_phase=%s status=%s error_code=%s"
+            " upstream_status=%s upstream_error_code=%s exception_type=%s",
+            exc.failure_phase,
+            exc.status_code,
+            realtime_voice_safe_error_code(exc.payload),
+            exc.upstream_status_code,
+            realtime_voice_safe_log_token(exc.upstream_error_code),
+            exc.failure_exception_type,
+        )
+        await websocket.send_denial_response(JSONResponse(status_code=exc.status_code, content=exc.payload))
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.warning(
+            "Realtime Voice websocket setup failed failure_phase=unknown exception_type=%s",
+            type(exc).__name__,
+        )
+        await websocket.send_denial_response(
+            JSONResponse(
+                status_code=502,
+                content=openai_error(
+                    "upstream_unavailable",
+                    "Realtime Voice websocket could not be established",
+                    error_type="server_error",
+                ),
+            )
+        )
+
+
+def _json_response_error_code(response: JSONResponse) -> str | None:
+    body = response.body
+    if not isinstance(body, bytes):
+        return None
+    try:
+        payload = json.loads(body)
+    except (JSONDecodeError, UnicodeDecodeError):
+        return None
+    if not isinstance(payload, Mapping):
+        return None
+    return realtime_voice_safe_error_code(cast(Mapping[str, object], payload))
+
+
+@ws_router.websocket("/rtc_{call_suffix}")
+async def realtime_voice_rtc_websocket(
+    websocket: WebSocket,
+    call_suffix: str,
+    context: ProxyContext = Depends(get_proxy_websocket_context),
+) -> None:
+    await _proxy_realtime_voice_websocket(
+        websocket,
+        call_id=f"rtc_{call_suffix}",
+        context=context,
+    )
+
+
+@ws_router.websocket("/{call_id:uuid}")
+async def realtime_voice_uuid_websocket(
+    websocket: WebSocket,
+    call_id: UUID,
+    context: ProxyContext = Depends(get_proxy_websocket_context),
+) -> None:
+    await _proxy_realtime_voice_websocket(
+        websocket,
+        call_id=str(call_id),
+        context=context,
     )
 
 

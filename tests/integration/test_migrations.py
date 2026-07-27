@@ -1195,3 +1195,102 @@ async def test_request_log_conversation_id_migration_upgrade_and_downgrade(tmp_p
         assert "conversation_id" not in columns
     finally:
         await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_realtime_call_bindings_migration_upgrade_and_downgrade(tmp_path):
+    """The Voice binding table is reversible and remains on the single head."""
+    from alembic import command
+    from sqlalchemy import inspect as sa_inspect
+
+    from app.db.migrate import _build_alembic_config
+
+    db_url = f"sqlite+aiosqlite:///{tmp_path / 'realtime-call-bindings.sqlite'}"
+    parent_revision = "20260713_040000_add_account_refresh_claims"
+    voice_revision = "20260723_000000_add_realtime_call_bindings"
+
+    def _table_state(sync_conn):
+        inspector = sa_inspect(sync_conn)
+        if not inspector.has_table("realtime_call_bindings"):
+            return None
+        return {
+            "columns": {column["name"] for column in inspector.get_columns("realtime_call_bindings")},
+            "indexes": {index["name"] for index in inspector.get_indexes("realtime_call_bindings")},
+        }
+
+    await to_thread.run_sync(lambda: run_upgrade(db_url, parent_revision, bootstrap_legacy=False))
+    engine = create_async_engine(db_url, future=True)
+    try:
+        async with engine.connect() as conn:
+            assert await conn.run_sync(_table_state) is None
+
+        await to_thread.run_sync(lambda: run_upgrade(db_url, voice_revision, bootstrap_legacy=False))
+        async with engine.connect() as conn:
+            state = await conn.run_sync(_table_state)
+        assert state == {
+            "columns": {
+                "call_id",
+                "account_id",
+                "api_key_id",
+                "created_at",
+                "expires_at",
+                "claim_holder",
+                "claim_expires_at",
+            },
+            "indexes": {
+                "ix_realtime_call_bindings_account_id",
+                "ix_realtime_call_bindings_api_key_id",
+                "ix_realtime_call_bindings_expires_at",
+                "ix_realtime_call_bindings_claim_expires_at",
+            },
+        }
+
+        config = _build_alembic_config(db_url)
+        await to_thread.run_sync(lambda: command.downgrade(config, parent_revision))
+        async with engine.connect() as conn:
+            assert await conn.run_sync(_table_state) is None
+
+        result = await to_thread.run_sync(lambda: run_upgrade(db_url, "head", bootstrap_legacy=False))
+        assert result.current_revision == _HEAD_REVISION
+        async with engine.connect() as conn:
+            assert await conn.run_sync(_table_state) is not None
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_database_stamped_at_deployed_voice_head_converges_to_single_head(tmp_path):
+    """A database already stamped at the deployed Voice revision can catch up.
+
+    The Voice revision was authored against
+    ``20260713_040000_add_account_refresh_claims`` and deployed before the
+    upstream ``useragent_families`` backfill existed, so it is a sibling head
+    rather than a descendant. The merge revision must let such a database apply
+    every missing upstream migration and land on one head without a stamp.
+    """
+    voice_revision = "20260723_000000_add_realtime_call_bindings"
+    db_url = f"sqlite+aiosqlite:///{tmp_path / 'deployed-voice-head.sqlite'}"
+
+    stopped = await to_thread.run_sync(lambda: run_upgrade(db_url, voice_revision, bootstrap_legacy=False))
+    assert stopped.current_revision == voice_revision
+
+    state = await to_thread.run_sync(lambda: inspect_migration_state(db_url))
+    assert state.needs_upgrade is True
+    assert state.head_revision == _HEAD_REVISION
+    assert "," not in _HEAD_REVISION
+
+    caught_up = await to_thread.run_sync(lambda: run_upgrade(db_url, "head", bootstrap_legacy=False))
+    assert caught_up.current_revision == _HEAD_REVISION
+
+    engine = create_async_engine(db_url, future=True)
+    try:
+        async with engine.connect() as conn:
+            rows = (await conn.execute(text("SELECT version_num FROM alembic_version"))).scalars().all()
+        assert sorted(rows) == [_HEAD_REVISION]
+    finally:
+        await engine.dispose()
+
+    assert await to_thread.run_sync(lambda: check_schema_drift(db_url)) == ()
+    policy_check = check_migration_policy
+    if policy_check is not None:
+        assert await to_thread.run_sync(lambda: policy_check(db_url)) == ()
