@@ -16,6 +16,7 @@ import app.modules.proxy.api as proxy_api_module
 import app.modules.proxy.service as proxy_module
 from app.core.auth.refresh import RefreshError
 from app.core.utils.request_id import get_request_id
+from app.core.utils.sse import format_sse_event
 from app.modules.proxy._service.websocket import mixin as websocket_mixin_module
 from app.modules.proxy.affinity import _codex_session_selection_key
 
@@ -10099,3 +10100,170 @@ def test_backend_responses_websocket_grouped_anonymous_stale_anchor_persists_dia
         assert "surface=websocket_stream" in message
         assert "previous_response_source=client_supplied" in message or "diagnostics=" in message
         assert "resp_ws_grouped_anchor" not in message
+
+
+def test_backend_responses_websocket_falls_back_to_http_for_oversized_current_tool_output(
+    app_instance,
+    monkeypatch,
+    tmp_path,
+):
+    """An oversized *current* tool-output turn must not be rejected.
+
+    There is no historical context left to slim in an anchored tool-output delta,
+    so the upstream websocket frame budget strands a legitimate turn. Upstream
+    HTTP has no such budget, so exactly this shape is relayed over HTTP for one
+    turn while staying a websocket turn downstream.
+    """
+
+    class _FakeSettingsCache:
+        async def get(self):
+            return _websocket_settings()
+
+    async def allow_firewall(_websocket):
+        return None
+
+    async def allow_proxy_api_key(_authorization: str | None, *, request: object | None = None):
+        return None
+
+    async def fail_connect_proxy_websocket(self, *args, **kwargs):
+        del self, args, kwargs
+        raise AssertionError("oversized current tool output must not open an upstream websocket")
+
+    seen_stream_calls: list[dict[str, Any]] = []
+
+    async def fake_stream_with_retry(self, payload, headers, **kwargs):
+        del self, headers
+        seen_stream_calls.append({"payload": payload.to_payload(), "kwargs": kwargs})
+        for event_payload in (
+            {"type": "response.created", "response": {"id": "resp_http_fallback"}},
+            {
+                "type": "response.output_text.delta",
+                "response_id": "resp_http_fallback",
+                "delta": "ok",
+            },
+            {
+                "type": "response.completed",
+                "response": {"id": "resp_http_fallback", "status": "completed"},
+            },
+        ):
+            yield format_sse_event(event_payload)
+
+    monkeypatch.setattr(proxy_api_module, "_websocket_firewall_denial_response", allow_firewall)
+    monkeypatch.setattr(proxy_api_module, "validate_proxy_api_key_authorization", allow_proxy_api_key)
+    monkeypatch.setattr(proxy_module, "get_settings_cache", lambda: _FakeSettingsCache())
+    monkeypatch.setattr(proxy_module, "_UPSTREAM_RESPONSE_CREATE_WARN_BYTES", 256)
+    monkeypatch.setattr(proxy_module, "_UPSTREAM_RESPONSE_CREATE_MAX_BYTES", 512)
+    monkeypatch.setattr(proxy_module, "_OVERSIZED_RESPONSE_CREATE_DUMP_DIR", tmp_path)
+    monkeypatch.setattr(proxy_module.ProxyService, "_connect_proxy_websocket", fail_connect_proxy_websocket)
+    monkeypatch.setattr(proxy_module.ProxyService, "_stream_with_retry", fake_stream_with_retry)
+
+    request_payload = {
+        "type": "response.create",
+        "model": "gpt-5.4",
+        "instructions": "",
+        "previous_response_id": "resp_owner",
+        "input": [
+            {
+                "type": "function_call_output",
+                "call_id": "call-oversized-current-output",
+                "output": "x" * 4096,
+            }
+        ],
+        "stream": True,
+    }
+
+    with TestClient(app_instance) as client:
+        with client.websocket_connect("/backend-api/codex/responses") as websocket:
+            websocket.send_text(json.dumps(request_payload))
+            events = [json.loads(websocket.receive_text()) for _ in range(3)]
+
+    assert [event["type"] for event in events] == [
+        "response.created",
+        "response.output_text.delta",
+        "response.completed",
+    ]
+    assert len(seen_stream_calls) == 1
+    relayed_payload = seen_stream_calls[0]["payload"]
+    assert relayed_payload["previous_response_id"] == "resp_owner"
+    assert relayed_payload["input"] == request_payload["input"]
+    # The turn keeps its websocket identity downstream while its upstream leg is
+    # HTTP, and the websocket-resolved owner/session context is handed over
+    # instead of being re-derived from HTTP headers.
+    kwargs = seen_stream_calls[0]["kwargs"]
+    assert kwargs["request_transport"] == "websocket"
+    assert kwargs["upstream_stream_transport_override"] == "http"
+    assert kwargs["previous_response_owner_resolved"] is True
+    assert kwargs["request_session_id_resolved"] is True
+
+    # No oversized-payload dump is written, because the turn was not rejected.
+    assert list(tmp_path.glob("*.meta.json")) == []
+
+
+def test_backend_responses_websocket_http_fallback_cancel_settles_relay(
+    app_instance,
+    monkeypatch,
+    tmp_path,
+):
+    """`response.cancel` must settle a fallback relay, not reach the upstream ws."""
+
+    class _FakeSettingsCache:
+        async def get(self):
+            return _websocket_settings()
+
+    async def allow_firewall(_websocket):
+        return None
+
+    async def allow_proxy_api_key(_authorization: str | None, *, request: object | None = None):
+        return None
+
+    async def fail_connect_proxy_websocket(self, *args, **kwargs):
+        del self, args, kwargs
+        raise AssertionError("oversized current tool output must not open an upstream websocket")
+
+    relay_cancelled = asyncio.Event()
+    relay_started = asyncio.Event()
+
+    async def fake_stream_with_retry(self, payload, headers, **kwargs):
+        del self, payload, headers, kwargs
+        yield format_sse_event({"type": "response.created", "response": {"id": "resp_cancel_fallback"}})
+        relay_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            relay_cancelled.set()
+            raise
+        yield ""
+
+    monkeypatch.setattr(proxy_api_module, "_websocket_firewall_denial_response", allow_firewall)
+    monkeypatch.setattr(proxy_api_module, "validate_proxy_api_key_authorization", allow_proxy_api_key)
+    monkeypatch.setattr(proxy_module, "get_settings_cache", lambda: _FakeSettingsCache())
+    monkeypatch.setattr(proxy_module, "_UPSTREAM_RESPONSE_CREATE_WARN_BYTES", 256)
+    monkeypatch.setattr(proxy_module, "_UPSTREAM_RESPONSE_CREATE_MAX_BYTES", 512)
+    monkeypatch.setattr(proxy_module, "_OVERSIZED_RESPONSE_CREATE_DUMP_DIR", tmp_path)
+    monkeypatch.setattr(proxy_module.ProxyService, "_connect_proxy_websocket", fail_connect_proxy_websocket)
+    monkeypatch.setattr(proxy_module.ProxyService, "_stream_with_retry", fake_stream_with_retry)
+
+    request_payload = {
+        "type": "response.create",
+        "model": "gpt-5.4",
+        "instructions": "",
+        "previous_response_id": "resp_owner",
+        "input": [
+            {
+                "type": "function_call_output",
+                "call_id": "call-oversized-current-output",
+                "output": "x" * 4096,
+            }
+        ],
+        "stream": True,
+    }
+
+    with TestClient(app_instance) as client:
+        with client.websocket_connect("/backend-api/codex/responses") as websocket:
+            websocket.send_text(json.dumps(request_payload))
+            created = json.loads(websocket.receive_text())
+            assert created["type"] == "response.created"
+            websocket.send_text(json.dumps({"type": "response.cancel"}))
+
+    assert relay_started.is_set() is True
+    assert relay_cancelled.is_set() is True
