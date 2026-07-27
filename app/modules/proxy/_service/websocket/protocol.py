@@ -40,6 +40,7 @@ class _WebSocketServiceProtocol(Protocol):
     _refresh_websocket_api_key_policy: Any
     _revalidate_open_websocket_account: Any
     _relay_upstream_websocket_messages: Any
+    _relay_websocket_response_create_over_http: Any
     _release_websocket_request_state_reservation: Any
     _release_websocket_reservation: Any
     _release_request_state_account_response_create_lease: Any
@@ -58,6 +59,7 @@ class _WebSocketServiceProtocol(Protocol):
     _send_downstream_websocket_text: Any
     _settle_stream_api_key_usage: Any
     _start_request_state_api_key_reservation_heartbeat: Any
+    _stream_with_retry: Any
     _try_open_websocket_connect_attempt: Any
     _websocket_continuity_index: Any
     _websocket_continuity_state_for_request: Any

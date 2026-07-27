@@ -34014,6 +34014,73 @@ async def test_stream_previous_response_owner_usage_limit_fails_closed(monkeypat
 
 
 @pytest.mark.asyncio
+async def test_stream_hard_owner_surfaces_original_previsible_http_error(monkeypatch):
+    """A hard-owner continuation must not have its own error rewritten.
+
+    The turn cannot move to another account without losing its upstream
+    previous-response anchor, so penalizing and excluding the owner only turns the
+    owner's real, actionable error into a misleading
+    ``previous_response_owner_unavailable``.
+    """
+    settings = _make_proxy_settings()
+    request_logs = _RequestLogsRecorder()
+    service = proxy_service.ProxyService(_repo_factory(request_logs))
+    account_owner = _make_account("acc_prev_owner_http_error")
+    account_other = _make_account("acc_other_http_error")
+    request_logs.response_owner_by_id[("resp_prev_anchor", None, "sid-stream")] = account_owner.id
+    select_account_calls: list[dict[str, object]] = []
+
+    async def fake_select_account(**kwargs):
+        select_account_calls.append(dict(kwargs))
+        if kwargs.get("required_account_id") == account_owner.id:
+            return AccountSelection(account=account_owner, error_message=None)
+        return AccountSelection(account=account_other, error_message=None)
+
+    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False, **kwargs):
+        del payload, headers, access_token, account_id, base_url, raise_for_status, kwargs
+        error = openai_error(
+            "invalid_request_error",
+            "Unsupported parameter: previous_response_id",
+            error_type="invalid_request_error",
+        )
+        error["error"]["param"] = "previous_response_id"
+        raise proxy_module.ProxyResponseError(400, error)
+        if False:
+            yield ""
+
+    handle_stream_error = AsyncMock(return_value={"failure_class": "rate_limit"})
+    monkeypatch.setattr(proxy_service, "get_settings_cache", lambda: _SettingsCache(settings))
+    monkeypatch.setattr(proxy_service, "get_settings", lambda: settings)
+    monkeypatch.setattr(service._load_balancer, "select_account", AsyncMock(side_effect=fake_select_account))
+    monkeypatch.setattr(service._load_balancer, "record_success", AsyncMock())
+    monkeypatch.setattr(service, "_handle_stream_error", handle_stream_error)
+    monkeypatch.setattr(service, "_ensure_fresh", AsyncMock(return_value=account_owner))
+    monkeypatch.setattr(service, "_settle_stream_api_key_usage", AsyncMock(return_value=True))
+    monkeypatch.setattr(proxy_service, "core_stream_responses", fake_stream)
+
+    payload = ResponsesRequest.model_validate(
+        {
+            "model": "gpt-5.6-sol",
+            "instructions": "test hard owner error",
+            "input": [{"type": "custom_tool_call_output", "call_id": "call_1", "output": "large"}],
+            "stream": True,
+            "previous_response_id": "resp_prev_anchor",
+        }
+    )
+
+    chunks = [chunk async for chunk in service.stream_responses(payload, {"session_id": "sid-stream"})]
+
+    event = json.loads(chunks[0].split("data: ", 1)[1])
+    assert event["type"] == "response.failed"
+    assert event["response"]["error"]["code"] == "invalid_request_error"
+    assert event["response"]["error"]["message"] == "Unsupported parameter: previous_response_id"
+    assert event["response"]["error"]["param"] == "previous_response_id"
+    assert len(select_account_calls) == 1
+    assert select_account_calls[0]["required_account_id"] == account_owner.id
+    handle_stream_error.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_stream_verified_fresh_replay_moves_off_owner_after_previsible_quota(monkeypatch):
     settings = _make_proxy_settings()
     request_logs = _RequestLogsRecorder()

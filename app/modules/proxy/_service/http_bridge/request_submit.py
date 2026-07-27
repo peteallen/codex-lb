@@ -392,6 +392,7 @@ class _HTTPBridgeRequestSubmitMixin:
         request_id: str | None = None,
         request_log_id: str | None = None,
         enforce_openai_sdk_contract: bool = True,
+        enforce_size_limit: bool = True,
     ) -> tuple[_WebSocketRequestState, str]:
         deduped_replayed_input_count: int | None = None
         deduped_replayed_input_fingerprint: str | None = None
@@ -504,7 +505,10 @@ class _HTTPBridgeRequestSubmitMixin:
                     slim_summary["historical_images_slimmed"],
                 )
         request_state.request_text = text_data
-        _enforce_response_create_size_limit(request_state)
+        # The direct WebSocket path defers this so it can first decide whether an
+        # oversized turn qualifies for the upstream-HTTP fallback.
+        if enforce_size_limit:
+            _enforce_response_create_size_limit(request_state)
         return request_state, text_data
 
     def _http_bridge_text_with_account_installation_id(

@@ -22,6 +22,7 @@ from app.core.config.settings import get_settings
 from app.core.errors import OpenAIErrorEnvelope, openai_error
 from app.core.openai.model_registry import get_model_registry
 from app.core.openai.models import OpenAIEvent
+from app.core.openai.requests import ResponsesRequest
 from app.core.plan_types import account_plan_matches_allowed
 from app.core.resilience.network_recovery import PROCESS_NETWORK_UNAVAILABLE_CODE
 from app.core.resilience.overload import is_local_overload_error_code
@@ -1400,6 +1401,9 @@ class _PreparedWebSocketRequest:
     text_data: str
     request_state: _WebSocketRequestState
     affinity_policy: _AffinityPolicy
+    # Set only when the prepared turn is too large for the upstream websocket but
+    # qualifies for the per-turn upstream-HTTP fallback.
+    http_fallback_payload: ResponsesRequest | None = None
 
 
 @dataclass(frozen=True, slots=True)

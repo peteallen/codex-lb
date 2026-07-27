@@ -250,6 +250,10 @@ class _StreamingRetryMixin:
         upstream_stream_transport_override: str | None = None,
         client_ip: str | None = None,
         enforce_openai_sdk_contract: bool = True,
+        resolved_previous_response_owner_account_id: str | None = None,
+        previous_response_owner_resolved: bool = False,
+        request_session_id: str | None = None,
+        request_session_id_resolved: bool = False,
     ) -> AsyncIterator[str]:
         proxy = cast(_StreamingServiceProtocol, self)
         useragent, useragent_group, conversation_id = _request_log_client_fields(headers)
@@ -369,7 +373,11 @@ class _StreamingRetryMixin:
         hard_affinity_same_owner_retry_attempted = False
         deferred_capacity_account: Account | None = None
         deferred_capacity_lease: AccountLease | None = None
-        preferred_account_id: str | None = None
+        # A websocket-originated turn already resolved its previous-response
+        # owner against the websocket continuity index. Re-resolving here from
+        # HTTP headers alone can miss that owner and turn a valid continuation
+        # into a cross-account attempt, so the caller's resolution is authoritative.
+        preferred_account_id = resolved_previous_response_owner_account_id if previous_response_owner_resolved else None
         file_preferred_account_id: str | None = rewritten_file_account_id
         require_preferred_account = False
         last_retryable_stream_error: _RetryableStreamError | None = None
@@ -583,6 +591,8 @@ class _StreamingRetryMixin:
                         client_ip=client_ip,
                         tool_call_dedupe=tool_call_dedupe,
                         enforce_openai_sdk_contract=enforce_openai_sdk_contract,
+                        request_session_id=request_session_id,
+                        request_session_id_resolved=request_session_id_resolved,
                     ):
                         yield line
                 except ProxyResponseError as exc:
@@ -858,13 +868,18 @@ class _StreamingRetryMixin:
 
         try:
             if payload.previous_response_id is not None:
-                previous_response_lookup_session_id = _owner_lookup_session_id_from_headers(headers)
-                preferred_account_id = await proxy._resolve_websocket_previous_response_owner(
-                    previous_response_id=payload.previous_response_id,
-                    api_key=api_key,
-                    session_id=previous_response_lookup_session_id,
-                    surface="http_stream",
+                previous_response_lookup_session_id = (
+                    request_session_id
+                    if request_session_id_resolved
+                    else _owner_lookup_session_id_from_headers(headers)
                 )
+                if not previous_response_owner_resolved:
+                    preferred_account_id = await proxy._resolve_websocket_previous_response_owner(
+                        previous_response_id=payload.previous_response_id,
+                        api_key=api_key,
+                        session_id=previous_response_lookup_session_id,
+                        surface="http_stream",
+                    )
                 require_preferred_account = preferred_account_id is not None
                 # `previous_response_id` is a stored-object continuation, so it
                 # remains hard owner-bound even when the request also carries a
@@ -909,6 +924,7 @@ class _StreamingRetryMixin:
                             useragent_group=useragent_group,
                             conversation_id=conversation_id,
                             client_ip=client_ip,
+                            session_id=previous_response_lookup_session_id,
                         )
                         return
             # File and previous-response ownership are peers, not fallback
@@ -1230,6 +1246,7 @@ class _StreamingRetryMixin:
                             useragent_group=useragent_group,
                             conversation_id=conversation_id,
                             client_ip=client_ip,
+                            session_id=previous_response_lookup_session_id,
                         )
                         if propagate_http_errors:
                             raise ProxyResponseError(
@@ -1287,6 +1304,7 @@ class _StreamingRetryMixin:
                             useragent_group=useragent_group,
                             conversation_id=conversation_id,
                             client_ip=client_ip,
+                            session_id=previous_response_lookup_session_id,
                         )
                         return
                     if require_preferred_account and preferred_account_id is not None:
@@ -1799,6 +1817,8 @@ class _StreamingRetryMixin:
                                 ),
                                 tool_call_dedupe=tool_call_dedupe,
                                 enforce_openai_sdk_contract=enforce_openai_sdk_contract,
+                                request_session_id=request_session_id,
+                                request_session_id_resolved=request_session_id_resolved,
                             ):
                                 yield line
                         except (_TransientStreamError, ProxyResponseError) as tex:
@@ -1987,6 +2007,15 @@ class _StreamingRetryMixin:
                                 if recovery_decision == "exhausted":
                                     _facade()._raise_proxy_budget_exhausted()
                                 if _facade()._is_account_neutral_error_code(code):
+                                    raise
+                                if require_preferred_account and verified_fresh_replay_payload is None:
+                                    # This continuation cannot move to another
+                                    # account without losing its upstream
+                                    # previous-response anchor. Surface the
+                                    # owner's original pre-visible error instead
+                                    # of penalizing/excluding the owner and then
+                                    # rewriting the next selection miss as
+                                    # previous_response_owner_unavailable.
                                     raise
                                 if is_confirmed_pre_dispatch_transport_error(tex):
                                     # The transport proved the request never

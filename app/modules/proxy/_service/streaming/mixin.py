@@ -489,6 +489,8 @@ class _StreamingMixin(_StreamingRetryMixin):
         preferred_account_id: str | None = None,
         tool_call_dedupe: _WebSocketUpstreamControl | None = None,
         enforce_openai_sdk_contract: bool = True,
+        request_session_id: str | None = None,
+        request_session_id_resolved: bool = False,
     ) -> AsyncIterator[str]:
         proxy = cast(_StreamingServiceProtocol, self)
         account_id_value = account.id
@@ -499,7 +501,12 @@ class _StreamingMixin(_StreamingRetryMixin):
         service_tier = requested_service_tier
         actual_service_tier: str | None = None
         reasoning_effort = payload.reasoning.effort if payload.reasoning else None
-        session_id = _owner_lookup_session_id_from_headers(headers)
+        # A websocket-originated turn already resolved its owner-lookup session id
+        # from the downstream frame; header-only rederivation would lose it and
+        # detach the request log from its conversation.
+        session_id = (
+            request_session_id if request_session_id_resolved else _owner_lookup_session_id_from_headers(headers)
+        )
         start = time.monotonic()
         # Keep selection/failover waits out of latency and TTFT, record them as
         # queue time, then re-anchor after this attempt's admission wait.
