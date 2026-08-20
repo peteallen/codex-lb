@@ -27,5 +27,4 @@
 - [x] 4.2 Add frontend tests for custom range state, query serialization,
   schema compatibility, branding, localized copy, and tool-only display.
 - [x] 4.3 Run focused tests, lint/format/type checks, and a production build.
-- [ ] 4.4 Run strict change and repo-wide OpenSpec validation. The OpenSpec CLI
-  is unavailable in this worktree; validation must be rerun after integration.
+- [x] 4.4 Run strict change and repo-wide OpenSpec validation.

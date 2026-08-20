@@ -109,3 +109,16 @@ does not count as evidence that the account is healthy.
 
 - [#676 - initial bug report on `/wham/usage` vs. Settings UI divergence](https://github.com/Soju06/codex-lb/issues/676)
 - [#677 - dashboard per-account force-probe action](https://github.com/Soju06/codex-lb/issues/677)
+
+## Working-day weekly forecast
+
+The weekly pace schedule already defines which weekdays can consume quota.
+Forecast simulation applies that same calendar to burnable intervals, then
+maps the resulting burn duration back to wall-clock time. A Friday forecast
+that needs two working days to deplete therefore lands on Tuesday rather than
+Sunday when Saturday and Sunday are excluded.
+
+Non-working days do not add projected burn, but they remain part of the
+operator-visible elapsed depletion time. An empty working-day set intentionally
+preserves the earlier all-days behavior, so this fork customization adds no
+required configuration or migration.

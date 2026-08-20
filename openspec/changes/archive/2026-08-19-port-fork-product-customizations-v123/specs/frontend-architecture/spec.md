@@ -2,8 +2,8 @@
 
 ### Requirement: Fork identity
 
-The application document title, authenticated header brand, and password-login
-brand MUST identify the deployment as `Codex LB (Pete's Fork)`. The Dashboard
+The application MUST identify the deployment as `Codex LB (Pete's Fork)` in the
+document title, authenticated header brand, and password-login brand. The Dashboard
 status-bar repository link MUST target `https://github.com/peteallen/codex-lb`.
 
 #### Scenario: Fork identity is visible before authentication

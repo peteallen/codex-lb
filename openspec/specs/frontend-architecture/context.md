@@ -75,3 +75,25 @@ If overview, projections, and request-log options return successfully while the 
 ### Testing notes
 
 The product-boundary regression renders the real `/dashboard` App route with the production query retry policy and MSW handlers. It counts each request family, seeds unique values for a statistic, quota surface, projection metric, and account control, focuses and keyboard-activates native Retry, holds the recovered listing response pending long enough to assert all healthy surfaces remain mounted, and then verifies the recovered row.
+
+## Fork identity and custom Dashboard ranges
+
+Pete's fork uses one shared identity constant for the document title, login
+gate, authenticated header, and repository link so these operator-facing
+surfaces cannot drift. The identity change adds no navigation item, setting, or
+setup step.
+
+Dashboard presets remain rolling windows. A custom range is instead an
+inclusive pair of local calendar dates represented to the API as a half-open
+UTC interval ending at midnight after the selected end date. The browser time
+zone travels with the request, and backend trend boundaries are generated from
+local midnights rather than fixed UTC epoch multiples. A Denver spring day is
+therefore one 23-hour bucket, a fall day is one 25-hour bucket, and a
+non-hour-offset zone such as Kathmandu remains aligned to its own dates.
+
+Date fields keep local draft state while the operator edits. If a new start is
+temporarily after the old end, the control retains that draft and leaves the
+last valid URL/query untouched until the end date makes the pair valid. This
+avoids a surprising reset to the 7-day preset during normal start-then-end
+editing. Labels and accessibility text use the English, Korean, and Simplified
+Chinese catalogs.

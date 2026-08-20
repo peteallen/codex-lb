@@ -2,8 +2,8 @@
 
 ### Requirement: Working-day weekly forecast
 
-When Dashboard weekly pace working days are configured, the weekly forecast
-MUST consume quota only during those weekdays. Non-working-day wall-clock time
+When Dashboard weekly pace working days are configured, the forecast MUST
+consume quota only during those weekdays. Non-working-day wall-clock time
 MUST not increase projected burn or shorten projected depletion time. An empty
 working-day set MUST retain all-days behavior.
 
