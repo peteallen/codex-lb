@@ -340,7 +340,7 @@ describe("ReportsPage", () => {
 
     renderWithProviders(<ReportsPage />);
 
-    expect(screen.getByRole("heading", { name: "Cost report" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Cost Report" })).toBeInTheDocument();
     expect(screen.getByText("Usage history by time period")).toBeInTheDocument();
     expect(screen.getByText("Total cost")).toBeInTheDocument();
     expect(screen.queryByText("Relatório de Custo")).not.toBeInTheDocument();
@@ -651,7 +651,7 @@ describe("ReportsPage", () => {
 
     renderWithProviders(<ReportsPage />);
 
-    const modelCard = await screen.findByText("Model distribution");
+    const modelCard = await screen.findByText("Distribution by Model");
     const useragentCard = await screen.findByText("Distribution by UserAgent");
 
     expect(modelCard.compareDocumentPosition(useragentCard)).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
@@ -821,7 +821,7 @@ describe("ReportsPage", () => {
 
     renderWithProviders(<ReportsPage />);
 
-    const modelCard = (await screen.findByText("Model distribution")).closest("div.rounded-xl.border.bg-card.p-5");
+    const modelCard = (await screen.findByText("Distribution by Model")).closest("div.rounded-xl.border.bg-card.p-5");
     const useragentCard = (await screen.findByText("Distribution by UserAgent")).closest("div.rounded-xl.border.bg-card.p-5");
 
     expect(modelCard).not.toBeNull();

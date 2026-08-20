@@ -23,10 +23,6 @@ function formatSignedPercent(value: number): string {
   return `${Math.round(Math.abs(value))}%`;
 }
 
-function formatPaceMultiplier(value: number): string {
-  return `${value.toFixed(2)}x scheduled active pace`;
-}
-
 function formatProAccountEquivalent(value: number): string {
   if (value < 1) {
     return value >= 0.1 ? value.toFixed(2) : value.toFixed(3);
@@ -157,7 +153,6 @@ export function WeeklyCreditsPaceCard({ pace }: WeeklyCreditsPaceCardProps) {
   const throttle = throttleLine(pace, t);
   const proAccounts = proAccountsLine(pace, t);
   const breakEven = breakEvenLine(pace, t);
-  const smoothedScheduleGapCredits = pace.smoothedScheduleGapCredits ?? pace.scheduleGapCredits;
   const showRecommendations =
     pace.projectedShortfallCredits > 0 ||
     Boolean(breakEven) ||

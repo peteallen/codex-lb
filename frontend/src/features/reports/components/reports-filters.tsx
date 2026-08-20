@@ -1,5 +1,9 @@
+import { CalendarIcon, ChevronDown } from "lucide-react";
 import { useId } from "react";
+import type { DateRange } from "react-day-picker";
 import { Button } from "@/components/ui/button";
+import { Calendar } from "@/components/ui/calendar";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { useTranslation } from "react-i18next";
 import {
   MultiSelectFilter,
@@ -64,6 +68,26 @@ export function ReportsFilters({
   );
   const startDateMax =
     filters.endDate && filters.endDate < maxDate ? filters.endDate : maxDate;
+  const maxSelectableDate = parseLocalDate(maxDate);
+  const selectedRange = buildSelectedRange(filters.startDate, filters.endDate);
+
+  const updateRange = (
+    range: Partial<Pick<ReportsFiltersState, "startDate" | "endDate">>,
+  ) => {
+    onFiltersChange({ ...filters, ...clampDateRange(range, maxDate) });
+  };
+
+  const handleCalendarRangeSelect = (range: DateRange | undefined) => {
+    if (!range?.from) {
+      return;
+    }
+    const startDate = clampDateInputValue(localDateISO(range.from), maxDate);
+    const endDate = clampDateInputValue(
+      range.to ? localDateISO(range.to) : startDate,
+      maxDate,
+    );
+    onFiltersChange({ ...filters, startDate, endDate });
+  };
 
   return (
     <div className="flex flex-wrap items-center gap-2 rounded-xl border bg-card p-3">

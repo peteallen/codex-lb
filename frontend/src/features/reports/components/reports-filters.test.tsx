@@ -190,7 +190,7 @@ describe("ReportsFilters", () => {
     vi.setSystemTime(new Date("2026-06-12T12:00:00"));
     const onFiltersChange = vi.fn();
 
-    render(
+    const { container } = render(
       <ReportsFilters
         filters={FILTERS}
         selectedPresetDays={30}
