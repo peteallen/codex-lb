@@ -2,9 +2,9 @@
 
 ### Requirement: Oversized response.create payloads are slimmed or rejected fail-fast before upstream send
 
-When the service prepares a Responses `response.create` request for the
-upstream WebSocket, it MUST measure the serialized outbound request size before
-sending it upstream. If the payload exceeds the upstream WebSocket budget, the
+When the service prepares a Responses `response.create` request, it MUST measure
+the serialized outbound request size before sending it to the upstream WebSocket.
+If the payload exceeds the upstream WebSocket budget, the
 service MUST first attempt to slim only the historical portion of `input` that
 precedes the most recent user turn: historical inline images MUST be replaced
 with textual omission notices, and oversized historical tool outputs MUST be

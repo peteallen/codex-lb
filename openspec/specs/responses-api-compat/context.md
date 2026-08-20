@@ -36,6 +36,37 @@ See `openspec/specs/responses-api-compat/spec.md` for normative requirements.
 - A post-send liveness timeout is delivery-ambiguous. It remains account-neutral, is never transparently replayed, and retires the affected upstream socket so a client retry opens a fresh route without risking duplicated model work or tool side effects.
 - HTTP bridge settlement ownership is explicit: `closed` rejects new work but does not imply that a submitter owns existing siblings. Only a liveness-failed send claims whole-deque settlement under the lifecycle lock; otherwise the reader remains responsible for settling pending requests when the transport dies.
 
+## Oversized downstream WebSocket HTTP fallback
+
+The upstream Responses WebSocket has a frame budget that does not apply to the
+upstream HTTP/SSE route. After historical slimming, codex-lb can move one
+otherwise valid downstream WebSocket turn to upstream HTTP without changing the
+client-facing event stream. This is deliberately narrower than a general
+transport retry: the decision happens before upstream dispatch and admits only
+an unanchored, conversation-free complete resend or a client-anchored input made
+entirely of current tool outputs. Conversation-backed requests,
+proxy-injected anchors, and anchored non-tool requests remain fail-closed.
+
+The HTTP relay inherits the routing proof already established during WebSocket
+request preparation. Previous-response ownership, session affinity, file-owner
+pinning, admission, and API-key reservation settlement are transferred rather
+than recomputed. A turn that produces `resp_A` over upstream HTTP records that
+transport in the API-key/session-scoped owner cache and request log; an exact
+continuation of `resp_A` stays on HTTP, while an unrelated response id and
+legacy rows without transport provenance follow the ordinary WebSocket path.
+
+For example, a complete resend containing several inline screenshots can
+arrive without `previous_response_id` or `conversation`, exceed the final
+projected WebSocket frame budget, and still deliver normal `response.created`,
+delta, and terminal events to the same downstream socket through the HTTP
+relay. A second unanchored resend cannot overtake that relay, and connection
+cancellation targets the newest active turn.
+
+Operationally, monitor `payload_too_large`, `stream_incomplete`, upstream
+transport on WebSocket request logs, and reservation-settlement failures after
+deployment. A rise in HTTP-upstream WebSocket turns is expected only for these
+oversized bodies and exact continuations of their HTTP-created response ids.
+
 ## Fast Mode and Service Tiers
 
 codex-lb accepts the OpenAI/Codex `service_tier` field on Responses and Chat

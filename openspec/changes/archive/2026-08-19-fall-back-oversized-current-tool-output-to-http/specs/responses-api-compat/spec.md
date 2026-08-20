@@ -2,9 +2,9 @@
 
 ### Requirement: An oversized current tool-output turn falls back to upstream HTTP
 
-When a downstream Responses WebSocket `response.create` exceeds the upstream
-websocket frame budget, the service MUST relay that single turn over upstream
-HTTP if and only if all of the following hold: the turn carries a non-empty
+The service MUST relay an oversized downstream Responses WebSocket
+`response.create` over upstream HTTP if and only if all of the following hold:
+the turn carries a non-empty
 client-supplied `previous_response_id`, its `input` is a non-empty list whose
 every item is a current tool-output item, and the projected per-account wire
 frame still exceeds the budget. Every other oversized turn MUST keep the existing
@@ -88,9 +88,9 @@ request logs.
 
 ### Requirement: A hard owner-bound continuation surfaces its own upstream error
 
-When a continuation is hard-bound to a previous-response owner and has no verified
-fresh replay body, a pre-visible error from that owner MUST be surfaced to the
-client unchanged. The service MUST NOT penalize or exclude the owner and then
+When a continuation is hard-bound to a previous-response owner, the service MUST
+surface a pre-visible error from that owner unchanged if there is no verified fresh
+replay body. The service MUST NOT penalize or exclude the owner and then
 report the resulting selection miss as
 `previous_response_owner_unavailable`.
 
