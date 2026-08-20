@@ -18,6 +18,10 @@ const NULL_USERAGENT_METADATA = {
   useragentGroup: null,
   clientIp: null,
 };
+const NULL_LATENCY_METADATA = {
+  latencyFirstUpstreamEventMs: null,
+  latencyResponseCreatedMs: null,
+};
 
 const { toastSuccess, toastError } = vi.hoisted(() => ({
   toastSuccess: vi.fn(),
@@ -128,6 +132,7 @@ describe("RecentRequestsTable", () => {
              inputTokens: 1000,
              outputTokens: 200,
              outputTokensRaw: null,
+             ...NULL_LATENCY_METADATA,
              latencyFirstTokenMs: null,
             latencyQueueMs: null,
              cachedInputTokens: 200,
@@ -181,7 +186,7 @@ describe("RecentRequestsTable", () => {
     expect(writeText).toHaveBeenCalledWith(longError);
   });
 
-  it("shows TTFT and output-token TPS beside tokens", () => {
+  it("shows TTFT and total-output-token TPS beside tokens", () => {
     render(
       <RecentRequestsTable
         {...PAGINATION_PROPS}
@@ -217,6 +222,7 @@ describe("RecentRequestsTable", () => {
             costUsd: 0,
             costBreakdown: null,
             latencyMs: 1000,
+            ...NULL_LATENCY_METADATA,
             latencyFirstTokenMs: 200,
             latencyQueueMs: null,
           },
@@ -228,7 +234,60 @@ describe("RecentRequestsTable", () => {
 
     expect(row).not.toBeNull();
     expect(within(row as HTMLElement).getByText("200ms")).toBeInTheDocument();
-    expect(within(row as HTMLElement).getByText("200.0")).toBeInTheDocument();
+    expect(within(row as HTMLElement).getByText("250.0")).toBeInTheDocument();
+  });
+
+  it("falls back to first-output timing when a turn emits no visible token", () => {
+    render(
+      <RecentRequestsTable
+        {...PAGINATION_PROPS}
+        accounts={[]}
+        requests={[
+          {
+            requestedAt: ISO,
+            accountId: "acc-toolonly",
+            planType: "plus",
+            apiKeyName: "Key Speed",
+            apiKeyId: "key-speed",
+            requestId: "req-toolonly",
+            conversationId: null,
+            requestKind: "normal",
+            model: "gpt-5.6-sol",
+            source: null,
+            serviceTier: null,
+            requestedServiceTier: null,
+            actualServiceTier: null,
+            transport: "http",
+            ...NULL_USERAGENT_METADATA,
+            status: "ok",
+            errorCode: null,
+            errorMessage: null,
+            ...NULL_FAILURE_METADATA,
+            tokens: 1200,
+            inputTokens: 1000,
+            outputTokens: 200,
+            outputTokensRaw: 200,
+            reasoningTokens: 40,
+            cachedInputTokens: 0,
+            reasoningEffort: null,
+            costUsd: 0,
+            costBreakdown: null,
+            latencyMs: 1000,
+            ...NULL_LATENCY_METADATA,
+            latencyFirstTokenMs: null,
+            latencyFirstUpstreamEventMs: 200,
+            latencyResponseCreatedMs: null,
+            latencyQueueMs: null,
+          },
+        ]}
+      />,
+    );
+
+    const row = screen.getByText("gpt-5.6-sol").closest("tr");
+
+    expect(row).not.toBeNull();
+    expect(within(row as HTMLElement).getByText("~200ms")).toBeInTheDocument();
+    expect(within(row as HTMLElement).getByText("250.0")).toBeInTheDocument();
   });
 
   it("does not calculate TPS from fallback output tokens", () => {
@@ -266,6 +325,7 @@ describe("RecentRequestsTable", () => {
             costUsd: 0,
             costBreakdown: null,
             latencyMs: 1000,
+            ...NULL_LATENCY_METADATA,
             latencyFirstTokenMs: 200,
             latencyQueueMs: null,
           },
@@ -325,6 +385,7 @@ describe("RecentRequestsTable", () => {
             inputTokens: 100,
             outputTokens: 20,
             outputTokensRaw: 20,
+            ...NULL_LATENCY_METADATA,
             latencyFirstTokenMs: 50,
             latencyQueueMs: null,
             cachedInputTokens: 0,
@@ -379,6 +440,7 @@ describe("RecentRequestsTable", () => {
             inputTokens: 1,
             outputTokens: 0,
             outputTokensRaw: null,
+            ...NULL_LATENCY_METADATA,
             latencyFirstTokenMs: null,
             latencyQueueMs: null,
             cachedInputTokens: null,
@@ -411,6 +473,7 @@ describe("RecentRequestsTable", () => {
             inputTokens: 1,
             outputTokens: 0,
             outputTokensRaw: null,
+            ...NULL_LATENCY_METADATA,
             latencyFirstTokenMs: null,
             latencyQueueMs: null,
             cachedInputTokens: null,
@@ -457,6 +520,7 @@ describe("RecentRequestsTable", () => {
              inputTokens: 1,
              outputTokens: 0,
              outputTokensRaw: null,
+             ...NULL_LATENCY_METADATA,
              latencyFirstTokenMs: null,
             latencyQueueMs: null,
              cachedInputTokens: null,
@@ -504,6 +568,7 @@ describe("RecentRequestsTable", () => {
              inputTokens: 1,
              outputTokens: 0,
              outputTokensRaw: null,
+             ...NULL_LATENCY_METADATA,
              latencyFirstTokenMs: null,
             latencyQueueMs: null,
              cachedInputTokens: null,
@@ -552,6 +617,7 @@ describe("RecentRequestsTable", () => {
             inputTokens: 1000,
             outputTokens: 400,
             outputTokensRaw: null,
+            ...NULL_LATENCY_METADATA,
             latencyFirstTokenMs: null,
             latencyQueueMs: null,
             cachedInputTokens: 200,
@@ -611,6 +677,7 @@ describe("RecentRequestsTable", () => {
             inputTokens: 1,
             outputTokens: 0,
             outputTokensRaw: null,
+            ...NULL_LATENCY_METADATA,
             latencyFirstTokenMs: null,
             latencyQueueMs: null,
             cachedInputTokens: null,
@@ -674,6 +741,7 @@ describe("RecentRequestsTable", () => {
             inputTokens: 1,
             outputTokens: 0,
             outputTokensRaw: null,
+            ...NULL_LATENCY_METADATA,
             latencyFirstTokenMs: null,
             latencyQueueMs: null,
             cachedInputTokens: null,
@@ -729,6 +797,7 @@ describe("RecentRequestsTable", () => {
             inputTokens: 1,
             outputTokens: 0,
             outputTokensRaw: null,
+            ...NULL_LATENCY_METADATA,
             latencyFirstTokenMs: null,
             latencyQueueMs: null,
             cachedInputTokens: 0,
@@ -781,6 +850,7 @@ describe("RecentRequestsTable", () => {
             inputTokens: 700,
             outputTokens: null,
             outputTokensRaw: null,
+            ...NULL_LATENCY_METADATA,
             latencyFirstTokenMs: null,
             latencyQueueMs: null,
             cachedInputTokens: 200,
@@ -838,6 +908,7 @@ describe("RecentRequestsTable", () => {
             inputTokens: 1000,
             outputTokens: null,
             outputTokensRaw: null,
+            ...NULL_LATENCY_METADATA,
             latencyFirstTokenMs: null,
             latencyQueueMs: null,
             cachedInputTokens: 200,
@@ -897,6 +968,7 @@ describe("RecentRequestsTable", () => {
             inputTokens: 1,
             outputTokens: 0,
             outputTokensRaw: null,
+            ...NULL_LATENCY_METADATA,
             latencyFirstTokenMs: null,
             latencyQueueMs: null,
             cachedInputTokens: null,
@@ -958,6 +1030,7 @@ describe("RecentRequestsTable", () => {
             inputTokens: 1,
             outputTokens: 0,
             outputTokensRaw: null,
+            ...NULL_LATENCY_METADATA,
             latencyFirstTokenMs: null,
             latencyQueueMs: null,
             cachedInputTokens: null,
@@ -1015,6 +1088,7 @@ describe("RecentRequestsTable", () => {
             inputTokens: 1000,
             outputTokens: 500,
             outputTokensRaw: null,
+            ...NULL_LATENCY_METADATA,
             latencyFirstTokenMs: null,
             latencyQueueMs: null,
             cachedInputTokens: null,
@@ -1071,6 +1145,7 @@ describe("RecentRequestsTable", () => {
             inputTokens: 1,
             outputTokens: 0,
             outputTokensRaw: null,
+            ...NULL_LATENCY_METADATA,
             latencyFirstTokenMs: null,
             latencyQueueMs: null,
             cachedInputTokens: null,
@@ -1125,6 +1200,7 @@ describe("RecentRequestsTable", () => {
             inputTokens: 1,
             outputTokens: 0,
             outputTokensRaw: null,
+            ...NULL_LATENCY_METADATA,
             latencyFirstTokenMs: null,
             latencyQueueMs: null,
             cachedInputTokens: null,
@@ -1182,6 +1258,7 @@ describe("RecentRequestsTable", () => {
             inputTokens: 1,
             outputTokens: 0,
             outputTokensRaw: null,
+            ...NULL_LATENCY_METADATA,
             latencyFirstTokenMs: null,
             latencyQueueMs: null,
             cachedInputTokens: null,
@@ -1234,6 +1311,7 @@ describe("RecentRequestsTable", () => {
             inputTokens: 1,
             outputTokens: 0,
             outputTokensRaw: null,
+            ...NULL_LATENCY_METADATA,
             latencyFirstTokenMs: null,
             latencyQueueMs: null,
             cachedInputTokens: null,

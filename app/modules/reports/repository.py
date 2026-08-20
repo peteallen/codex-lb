@@ -459,7 +459,17 @@ def _daily_speed_medians_stmt(
             *([useragent_group_clause] if useragent_group_clause is not None else []),
         ),
     )
-    token_count = RequestLog.output_tokens - func.coalesce(RequestLog.reasoning_tokens, 0)
+    # Throughput starts when upstream first begins producing the response. TTFT
+    # covers only turns with a client-visible token, so it misses agentic turns
+    # that spend their response on hidden reasoning and tool calls. The first
+    # upstream event is available for those turns, and total output tokens keep
+    # the numerator aligned with the longer reasoning-inclusive window.
+    generation_anchor_ms = func.coalesce(
+        RequestLog.latency_first_upstream_event_ms,
+        RequestLog.latency_response_created_ms,
+        RequestLog.latency_first_token_ms,
+    )
+    generation_token_count = RequestLog.output_tokens
     ttft_values_cte = (
         select(
             day_ranges_cte.c.report_date,
@@ -472,15 +482,15 @@ def _daily_speed_medians_stmt(
     tps_values_cte = (
         select(
             day_ranges_cte.c.report_date,
-            (token_count * 1000.0 / (RequestLog.latency_ms - RequestLog.latency_first_token_ms)).label("tps"),
+            (generation_token_count * 1000.0 / (RequestLog.latency_ms - generation_anchor_ms)).label("tps"),
         )
         .select_from(traffic_join)
         .where(
-            token_count.is_not(None),
-            token_count > 0,
+            generation_token_count.is_not(None),
+            generation_token_count > 0,
             RequestLog.latency_ms.is_not(None),
-            RequestLog.latency_first_token_ms.is_not(None),
-            RequestLog.latency_ms > RequestLog.latency_first_token_ms,
+            generation_anchor_ms.is_not(None),
+            RequestLog.latency_ms > generation_anchor_ms,
         )
         .cte("daily_tps_values")
     )
