@@ -250,6 +250,7 @@ class _StreamingRetryMixin:
         upstream_stream_transport_override: str | None = None,
         client_ip: str | None = None,
         enforce_openai_sdk_contract: bool = True,
+        require_security_work_authorized: bool = False,
         resolved_previous_response_owner_account_id: str | None = None,
         previous_response_owner_resolved: bool = False,
         request_session_id: str | None = None,
@@ -387,7 +388,6 @@ class _StreamingRetryMixin:
         pending_post_refresh_transient_penalties: list[tuple[Account, UpstreamError, str, int, int]] = []
         deferred_account_error_backoffs: dict[str, Account] = {}
         post_refresh_transient_replacement_selected = False
-        require_security_work_authorized = False
         account_leases: list[AccountLease] = []
         estimated_lease_tokens = _facade()._estimated_lease_tokens_from_request_usage_budget(
             estimate_api_key_request_usage(payload)

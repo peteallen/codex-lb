@@ -15,6 +15,7 @@ from fastapi import WebSocket
 
 from app.core import shutdown as shutdown_state
 from app.core.clients.proxy_websocket import UpstreamWebSocket
+from app.core.openai.requests import ResponsesRequest
 from app.core.utils.time import utcnow
 from app.db.models import Account
 from app.modules.api_keys.service import ApiKeyData, ApiKeyUsageReservationData
@@ -566,6 +567,7 @@ async def test_drain_start_during_admission_rejects_turn_before_connect_or_send(
         *,
         pending_lock: anyio.Lock,
         upstream_control: proxy_service._WebSocketUpstreamControl | None,
+        http_fallback_tasks=None,
     ) -> bool:
         async with pending_lock:
             pending_snapshots.append([state.request_id for state in pending_requests])
@@ -573,6 +575,7 @@ async def test_drain_start_during_admission_rejects_turn_before_connect_or_send(
             pending_requests,
             pending_lock=pending_lock,
             upstream_control=upstream_control,
+            http_fallback_tasks=http_fallback_tasks,
         )
 
     monkeypatch.setattr(proxy_service, "get_settings_cache", lambda: _SettingsCache())
@@ -625,6 +628,99 @@ async def test_drain_start_during_admission_rejects_turn_before_connect_or_send(
             "Failed to release websocket account create lease during terminal cleanup request_id=request_late_drain"
             in caplog.messages
         )
+
+
+@pytest.mark.asyncio
+async def test_oversized_http_fallback_setup_cancellation_releases_reservation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    @asynccontextmanager
+    async def repo_factory() -> AsyncIterator[SimpleNamespace]:
+        yield SimpleNamespace(request_logs=_RequestLogsRecorder(), api_keys=object())
+
+    settings = SimpleNamespace(
+        prefer_earlier_reset_accounts=False,
+        sticky_threads_enabled=False,
+        openai_cache_affinity_max_age_seconds=0,
+        prohibit_fast_mode=False,
+        proxy_downstream_websocket_idle_timeout_seconds=30.0,
+        proxy_request_budget_seconds=30.0,
+        stream_idle_timeout_seconds=30.0,
+    )
+
+    class _SettingsCache:
+        async def get(self) -> SimpleNamespace:
+            return settings
+
+    request_text = json.dumps(
+        {
+            "type": "response.create",
+            "model": "gpt-5.6-sol",
+            "instructions": "",
+            "input": "cancel fallback",
+        },
+        separators=(",", ":"),
+    )
+    request_state = _request_state("request_fallback_cancel")
+    request_state.request_text = request_text
+    reservation = cast(ApiKeyUsageReservationData, object())
+    request_state.api_key_reservation = reservation
+    fallback_payload = ResponsesRequest.model_validate(json.loads(request_text))
+    release_calls: list[proxy_service._WebSocketRequestState] = []
+
+    class _Downstream(_DownstreamWebSocket):
+        def __init__(self) -> None:
+            super().__init__()
+            self._received = False
+
+        async def receive(self) -> dict[str, object]:
+            if not self._received:
+                self._received = True
+                return {"type": "websocket.receive", "text": request_text}
+            await asyncio.Event().wait()
+            return {"type": "websocket.disconnect"}
+
+    downstream = _Downstream()
+    service = proxy_service.ProxyService(cast(proxy_service.ProxyRepoFactory, repo_factory))
+
+    async def prepare_request(*_args: object, **_kwargs: object) -> proxy_service._PreparedWebSocketRequest:
+        return proxy_service._PreparedWebSocketRequest(
+            text_data=request_text,
+            request_state=request_state,
+            affinity_policy=proxy_service._AffinityPolicy(),
+            http_fallback_payload=fallback_payload,
+        )
+
+    async def cancel_admission(*_args: object, **_kwargs: object) -> None:
+        raise asyncio.CancelledError
+
+    async def release_reservation(owned_request_state: proxy_service._WebSocketRequestState) -> None:
+        release_calls.append(owned_request_state)
+        owned_request_state.api_key_reservation = None
+
+    monkeypatch.setattr(proxy_service, "get_settings_cache", lambda: _SettingsCache())
+    monkeypatch.setattr(proxy_service, "get_settings", lambda: settings)
+    monkeypatch.setattr(proxy_service, "_routing_strategy", lambda _settings: "usage_weighted")
+    monkeypatch.setattr(service, "_websocket_continuity_state_for_request", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(service, "_prepare_websocket_response_create_request", prepare_request)
+    monkeypatch.setattr(service, "_start_request_state_api_key_reservation_heartbeat", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(service, "_acquire_request_state_response_create_admission", cancel_admission)
+    monkeypatch.setattr(service, "_release_websocket_request_state_reservation", release_reservation)
+    connect_upstream = AsyncMock()
+    monkeypatch.setattr(service, "_connect_proxy_websocket", connect_upstream)
+
+    with pytest.raises(asyncio.CancelledError):
+        await service.proxy_responses_websocket(
+            cast(WebSocket, downstream),
+            {},
+            codex_session_affinity=False,
+            openai_cache_affinity=False,
+            api_key=None,
+        )
+
+    assert release_calls == [request_state]
+    assert request_state.api_key_reservation is None
+    connect_upstream.assert_not_awaited()
 
 
 @pytest.mark.asyncio

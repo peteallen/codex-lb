@@ -27061,6 +27061,23 @@ async def test_proxy_responses_websocket_closes_idle_connection_during_drain(mon
 
 
 @pytest.mark.asyncio
+async def test_websocket_drain_counts_active_http_fallback_task() -> None:
+    fallback_task = asyncio.create_task(asyncio.sleep(1))
+    request_state = cast(proxy_service._WebSocketRequestState, SimpleNamespace(request_id="fallback-drain"))
+    try:
+        assert await websocket_mixin_module._websocket_has_active_drain_work(
+            deque(),
+            pending_lock=anyio.Lock(),
+            upstream_control=None,
+            http_fallback_tasks={fallback_task: request_state},
+        )
+    finally:
+        fallback_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await fallback_task
+
+
+@pytest.mark.asyncio
 async def test_proxy_responses_websocket_rejects_response_create_observed_after_drain(monkeypatch):
     service = proxy_service.ProxyService(_repo_factory(_RequestLogsRecorder()))
     settings = _make_proxy_settings()
@@ -27455,11 +27472,13 @@ async def test_proxy_responses_websocket_replays_staged_turn_before_drain_close(
         *,
         pending_lock: anyio.Lock,
         upstream_control: proxy_service._WebSocketUpstreamControl | None,
+        http_fallback_tasks=None,
     ) -> bool:
         result = await has_active_drain_work(
             pending_requests,
             pending_lock=pending_lock,
             upstream_control=upstream_control,
+            http_fallback_tasks=http_fallback_tasks,
         )
         terminal_task = upstream_control.terminal_message_task if upstream_control is not None else None
         if (
