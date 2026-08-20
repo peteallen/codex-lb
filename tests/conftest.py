@@ -94,6 +94,7 @@ class _NoopLeaderElection:
 
 
 def _drop_test_migration_tables(sync_conn) -> None:
+    sync_conn.execute(text("DROP TABLE IF EXISTS realtime_call_bindings"))
     sync_conn.execute(text("DROP TABLE IF EXISTS alembic_version"))
     sync_conn.execute(text("DROP TABLE IF EXISTS schema_migrations"))
 

@@ -114,6 +114,7 @@ _LEGACY_EXTRA_COLUMNS = frozenset(
         ("request_logs", "slim_summary_json"),
     }
 )
+_LEGACY_EXTRA_TABLES = frozenset({"realtime_call_bindings"})
 
 
 @dataclass(frozen=True)
@@ -597,6 +598,12 @@ def _is_ignored_schema_drift(connection: Connection, diff: object) -> bool:
         column = diff[3]
         column_name = getattr(column, "name", None)
         if (str(diff[2]), str(column_name)) in _LEGACY_EXTRA_COLUMNS:
+            return True
+
+    if str(diff[0]).startswith("remove_") and len(diff) >= 2:
+        removed_object = diff[1]
+        table = removed_object if diff[0] == "remove_table" else getattr(removed_object, "table", None)
+        if str(getattr(table, "name", "")) in _LEGACY_EXTRA_TABLES:
             return True
 
     if connection.dialect.name == "sqlite" and diff[0] == "modify_type" and len(diff) >= 7:
