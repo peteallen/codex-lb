@@ -215,8 +215,8 @@ export const RequestLogSchema = z.object({
   costBreakdown: RequestLogCostBreakdownSchema.nullable().optional().default(null),
   latencyMs: z.number().nullable(),
   latencyFirstTokenMs: z.number().nullable().optional().default(null),
-  latencyFirstUpstreamEventMs: z.number().nullable().optional(),
-  latencyResponseCreatedMs: z.number().nullable().optional(),
+  latencyFirstUpstreamEventMs: z.number().nullable().optional().default(null),
+  latencyResponseCreatedMs: z.number().nullable().optional().default(null),
   latencyQueueMs: z.number().nullable().optional().default(null),
 });
 
