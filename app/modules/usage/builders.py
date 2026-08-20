@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -91,17 +92,21 @@ def build_trends_from_buckets(
     bucket_count: int = _BUCKET_COUNT,
     top_error: str | None = None,
     conversation_rows: list[BucketConversationAggregate] | None = None,
+    bucket_epochs: Sequence[int] | None = None,
 ) -> tuple[MetricsTrends, ActivityMetricsSummary, ActivityCostSummary]:
-    # Align slots so the last slot contains "now" (since + window).
-    # Use floor to snap since to a bucket boundary, then shift by 1
-    # so that recent data falls within the slot range.
-    first_bucket = align_bucket_window_start(since, bucket_seconds)
-    first_bucket_epoch = (
-        int(first_bucket.replace(tzinfo=timezone.utc).timestamp())
-        if first_bucket.tzinfo is None
-        else int(first_bucket.timestamp())
-    )
-    slots = [first_bucket_epoch + i * bucket_seconds for i in range(bucket_count)]
+    if bucket_epochs is None:
+        # Align slots so the last slot contains "now" (since + window).
+        # Use floor to snap since to a bucket boundary, then shift by 1
+        # so that recent data falls within the slot range.
+        first_bucket = align_bucket_window_start(since, bucket_seconds)
+        first_bucket_epoch = (
+            int(first_bucket.replace(tzinfo=timezone.utc).timestamp())
+            if first_bucket.tzinfo is None
+            else int(first_bucket.timestamp())
+        )
+        slots = [first_bucket_epoch + i * bucket_seconds for i in range(bucket_count)]
+    else:
+        slots = list(bucket_epochs)
     slot_set = set(slots)
 
     # Accumulate per-bucket values

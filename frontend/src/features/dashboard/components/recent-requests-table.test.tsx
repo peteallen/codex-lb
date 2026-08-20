@@ -223,6 +223,8 @@ describe("RecentRequestsTable", () => {
             costBreakdown: null,
             latencyMs: 1000,
             ...NULL_LATENCY_METADATA,
+            latencyFirstUpstreamEventMs: 50,
+            latencyResponseCreatedMs: 100,
             latencyFirstTokenMs: 200,
             latencyQueueMs: null,
           },
@@ -275,8 +277,8 @@ describe("RecentRequestsTable", () => {
             latencyMs: 1000,
             ...NULL_LATENCY_METADATA,
             latencyFirstTokenMs: null,
-            latencyFirstUpstreamEventMs: 200,
-            latencyResponseCreatedMs: null,
+            latencyFirstUpstreamEventMs: 100,
+            latencyResponseCreatedMs: 200,
             latencyQueueMs: null,
           },
         ]}
@@ -286,8 +288,63 @@ describe("RecentRequestsTable", () => {
     const row = screen.getByText("gpt-5.6-sol").closest("tr");
 
     expect(row).not.toBeNull();
-    expect(within(row as HTMLElement).getByText("~200ms")).toBeInTheDocument();
+    expect(within(row as HTMLElement).getByText("~200ms")).toHaveAttribute(
+      "title",
+      "No client-visible token in this turn; showing time to first output instead.",
+    );
     expect(within(row as HTMLElement).getByText("250.0")).toBeInTheDocument();
+  });
+
+  it("does not treat transport-level upstream activity as first output", () => {
+    render(
+      <RecentRequestsTable
+        {...PAGINATION_PROPS}
+        accounts={[]}
+        requests={[
+          {
+            requestedAt: ISO,
+            accountId: "acc-upstream-only",
+            planType: "plus",
+            apiKeyName: "Key Speed",
+            apiKeyId: "key-speed",
+            requestId: "req-upstream-only",
+            conversationId: null,
+            requestKind: "normal",
+            model: "gpt-5.6-upstream-only",
+            source: null,
+            serviceTier: null,
+            requestedServiceTier: null,
+            actualServiceTier: null,
+            transport: "http",
+            ...NULL_USERAGENT_METADATA,
+            status: "ok",
+            errorCode: null,
+            errorMessage: null,
+            ...NULL_FAILURE_METADATA,
+            tokens: 1200,
+            inputTokens: 1000,
+            outputTokens: 200,
+            outputTokensRaw: 200,
+            reasoningTokens: 40,
+            cachedInputTokens: 0,
+            reasoningEffort: null,
+            costUsd: 0,
+            costBreakdown: null,
+            latencyMs: 1000,
+            ...NULL_LATENCY_METADATA,
+            latencyFirstTokenMs: null,
+            latencyFirstUpstreamEventMs: 100,
+            latencyQueueMs: null,
+          },
+        ]}
+      />,
+    );
+
+    const row = screen.getByText("gpt-5.6-upstream-only").closest("tr");
+
+    expect(row).not.toBeNull();
+    expect(within(row as HTMLElement).queryByText("~100ms")).not.toBeInTheDocument();
+    expect(within(row as HTMLElement).queryByText("222.2")).not.toBeInTheDocument();
   });
 
   it("does not calculate TPS from fallback output tokens", () => {

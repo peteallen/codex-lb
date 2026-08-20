@@ -42,6 +42,7 @@ from app.modules.accounts.usage_time_rollup import (
 )
 from app.modules.accounts.usage_time_rollup_read import (
     RawWindow,
+    conversation_labeled_presence_union,
     conversation_presence_union,
     earliest_hourly_bucket_at,
     raw_windows_clause,
@@ -481,14 +482,19 @@ class RequestLogsRepository:
             ],
         )
 
-    def _bucket_epoch_expr(self, bucket_seconds: int) -> ColumnElement:
+    def _bucket_epoch_expr(self, bucket_seconds: int, bucket_origin_epoch: int = 0) -> ColumnElement:
         bind = self._session.get_bind()
         dialect = bind.dialect.name if bind else "sqlite"
         if dialect == "postgresql":
-            return func.floor(func.extract("epoch", RequestLog.requested_at) / bucket_seconds) * bucket_seconds
-        # Use explicit integer division for SQLite: CAST(epoch / N AS INTEGER) * N
+            return (
+                func.floor((func.extract("epoch", RequestLog.requested_at) - bucket_origin_epoch) / bucket_seconds)
+                * bucket_seconds
+                + bucket_origin_epoch
+            )
+        # Use explicit integer division for SQLite and preserve the caller's
+        # bucket origin so non-hour-offset local calendars align correctly.
         epoch_col = cast(func.strftime("%s", RequestLog.requested_at), Integer)
-        return cast(epoch_col / bucket_seconds, Integer) * bucket_seconds
+        return cast((epoch_col - bucket_origin_epoch) / bucket_seconds, Integer) * bucket_seconds + bucket_origin_epoch
 
     async def list_since(self, since: datetime) -> list[RequestLog]:
         result = await self._session.execute(
@@ -585,6 +591,8 @@ class RequestLogsRepository:
         since: datetime,
         bucket_seconds: int = 21600,
         until: datetime | None = None,
+        *,
+        bucket_origin_epoch: int = 0,
     ) -> list[BucketModelAggregate]:
         # Folded history comes from the hourly rollups; only the un-folded
         # complement scans raw request_logs. Every display bucket the
@@ -609,7 +617,8 @@ class RequestLogsRepository:
             for rollup in rollup_rows:
                 _add(
                     (
-                        rollup.bucket_epoch // bucket_seconds * bucket_seconds,
+                        (rollup.bucket_epoch - bucket_origin_epoch) // bucket_seconds * bucket_seconds
+                        + bucket_origin_epoch,
                         rollup.model,
                         from_dimension(rollup.service_tier),
                     ),
@@ -624,7 +633,7 @@ class RequestLogsRepository:
                     ),
                 )
         if raw_windows:
-            bucket_col = self._bucket_epoch_expr(bucket_seconds).label("bucket_epoch")
+            bucket_col = self._bucket_epoch_expr(bucket_seconds, bucket_origin_epoch).label("bucket_epoch")
             stmt = (
                 select(
                     bucket_col,
@@ -717,6 +726,35 @@ class RequestLogsRepository:
         return [
             BucketConversationAggregate(
                 bucket_epoch=int(row.bucket_epoch),
+                conversation_count=int(row.conversation_count),
+            )
+            for row in result.all()
+        ]
+
+    async def aggregate_conversations_by_ranges(
+        self,
+        ranges: list[tuple[int, datetime, datetime]],
+    ) -> list[BucketConversationAggregate]:
+        if not ranges:
+            return []
+        labeled_ranges = [(str(bucket_epoch), start, end) for bucket_epoch, start, end in ranges]
+        union = conversation_labeled_presence_union(
+            self._session,
+            labeled_ranges,
+            include_deleted=False,
+            raw_conditions=tuple(self._eligible_conversation_row_conditions()),
+        ).subquery()
+        result = await self._session.execute(
+            select(
+                union.c.label,
+                func.count(func.distinct(union.c.cid)).label("conversation_count"),
+            )
+            .group_by(union.c.label)
+            .order_by(union.c.label)
+        )
+        return [
+            BucketConversationAggregate(
+                bucket_epoch=int(row.label),
                 conversation_count=int(row.conversation_count),
             )
             for row in result.all()

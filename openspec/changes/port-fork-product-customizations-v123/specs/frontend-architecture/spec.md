@@ -1,4 +1,4 @@
-## MODIFIED Requirements
+## ADDED Requirements
 
 ### Requirement: Fork identity
 
@@ -22,7 +22,12 @@ The Dashboard MUST retain `1d`, `7d`, and `30d` presets and MUST provide a
 Custom range control with local calendar start and end dates. Future dates MUST
 be disabled. A custom selection MUST refetch the overview with
 `start_date`, `end_date`, and the browser `timezone`; selecting a preset MUST
-remove the custom URL dates and request the preset timeframe.
+remove the custom URL dates and request the preset timeframe. Custom-range
+labels and accessibility text MUST use the application's supported locale
+catalogs. A temporarily incomplete or inverted date-input draft MUST remain
+editable without replacing the last valid range or collapsing the control to a
+preset. Daily and weekly trend buckets MUST align to local calendar boundaries,
+including daylight-saving transitions.
 
 #### Scenario: Default overview remains a preset
 
@@ -39,3 +44,16 @@ remove the custom URL dates and request the preset timeframe.
 
 - **WHEN** an operator opens the custom range picker
 - **THEN** dates later than the browser's current local day cannot be selected
+
+#### Scenario: Operator edits the start date before the end date
+
+- **GIVEN** a valid custom range whose current end precedes the intended new start
+- **WHEN** the operator enters the new start and then a later valid end
+- **THEN** the start draft remains visible between the two edits
+- **AND** the Dashboard requests the completed new range only after it is valid
+
+#### Scenario: Local days remain single trend buckets across DST
+
+- **GIVEN** a custom range in a non-UTC time zone that crosses a daylight-saving transition
+- **WHEN** the Dashboard renders daily trends
+- **THEN** each selected local calendar date produces exactly one trend bucket

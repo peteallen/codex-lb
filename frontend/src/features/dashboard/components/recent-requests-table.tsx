@@ -141,9 +141,8 @@ function formatRequestCostSummary(request: RequestLog | null, t: ReturnType<type
 
 function generationAnchorMs(request: RequestLog): number | null {
   return (
-    request.latencyFirstUpstreamEventMs ??
-    request.latencyResponseCreatedMs ??
     request.latencyFirstTokenMs ??
+    request.latencyResponseCreatedMs ??
     null
   );
 }
@@ -348,10 +347,7 @@ export function RecentRequestsTable({
                     ) : firstToken.approximate ? (
                       <span
                         className="text-muted-foreground"
-                        title={t("dashboard.requests.firstOutputApproxHint", {
-                          defaultValue:
-                            "No client-visible token in this turn; showing time to first output instead.",
-                        })}
+                        title={t("dashboard.requests.firstOutputApproxHint")}
                       >
                         ~{firstToken.text}
                       </span>

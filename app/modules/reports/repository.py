@@ -459,15 +459,13 @@ def _daily_speed_medians_stmt(
             *([useragent_group_clause] if useragent_group_clause is not None else []),
         ),
     )
-    # Throughput starts when upstream first begins producing the response. TTFT
-    # covers only turns with a client-visible token, so it misses agentic turns
-    # that spend their response on hidden reasoning and tool calls. The first
-    # upstream event is available for those turns, and total output tokens keep
-    # the numerator aligned with the longer reasoning-inclusive window.
+    # TTFT remains the canonical generation anchor whenever a client-visible
+    # token exists. Tool-only turns have no TTFT, so response.created is their
+    # closest persisted output boundary. Transport-level upstream activity can
+    # precede response creation and must not shorten the generation interval.
     generation_anchor_ms = func.coalesce(
-        RequestLog.latency_first_upstream_event_ms,
-        RequestLog.latency_response_created_ms,
         RequestLog.latency_first_token_ms,
+        RequestLog.latency_response_created_ms,
     )
     generation_token_count = RequestLog.output_tokens
     ttft_values_cte = (

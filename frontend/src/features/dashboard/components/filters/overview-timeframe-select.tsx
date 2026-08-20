@@ -1,3 +1,5 @@
+import { useState } from "react";
+import { useTranslation } from "react-i18next";
 import { CalendarIcon, ChevronDown } from "lucide-react";
 import type { DateRange } from "react-day-picker";
 
@@ -29,22 +31,27 @@ export function OverviewTimeframeSelect({
   onPresetSelect,
   onCustomRangeChange,
 }: OverviewTimeframeSelectProps) {
+  const { t } = useTranslation();
   const maxDate = localDateISO();
   const maxSelectableDate = parseLocalDate(maxDate);
-  const customRange =
-    value.mode === "custom"
-      ? value
-      : {
-          startDate: daysAgoLocalISO(6),
-          endDate: maxDate,
-        };
+  const committedStartDate = value.mode === "custom" ? value.startDate : daysAgoLocalISO(6);
+  const committedEndDate = value.mode === "custom" ? value.endDate : maxDate;
+  const [rangeDraft, setRangeDraft] = useState<{ startDate: string; endDate: string } | null>(null);
+  const customRange = rangeDraft ?? {
+    startDate: committedStartDate,
+    endDate: committedEndDate,
+  };
   const selectedRange = buildSelectedRange(customRange.startDate, customRange.endDate);
 
   const updateRange = (range: Partial<Pick<typeof customRange, "startDate" | "endDate">>) => {
-    onCustomRangeChange({
+    const nextRange = {
       startDate: clampDateInputValue(range.startDate ?? customRange.startDate, maxDate),
       endDate: clampDateInputValue(range.endDate ?? customRange.endDate, maxDate),
-    });
+    };
+    setRangeDraft(nextRange);
+    if (isCompleteDateRange(nextRange)) {
+      onCustomRangeChange(nextRange);
+    }
   };
 
   const handleCalendarRangeSelect = (range: DateRange | undefined) => {
@@ -53,7 +60,9 @@ export function OverviewTimeframeSelect({
     }
     const startDate = clampDateInputValue(localDateISO(range.from), maxDate);
     const endDate = clampDateInputValue(range.to ? localDateISO(range.to) : startDate, maxDate);
-    onCustomRangeChange({ startDate, endDate });
+    const nextRange = { startDate, endDate };
+    setRangeDraft(nextRange);
+    onCustomRangeChange(nextRange);
   };
 
   return (
@@ -68,25 +77,37 @@ export function OverviewTimeframeSelect({
             variant={isSelected ? "default" : "outline"}
             size="sm"
             aria-pressed={isSelected}
-            onClick={() => onPresetSelect(preset.timeframe)}
+            onClick={() => {
+              setRangeDraft(null);
+              onPresetSelect(preset.timeframe);
+            }}
           >
             {preset.label}
           </Button>
         );
       })}
 
-      <Popover>
+      <Popover
+        onOpenChange={(open) => {
+          if (!open) {
+            setRangeDraft(null);
+          }
+        }}
+      >
         <PopoverTrigger asChild>
           <Button
             type="button"
             variant={value.mode === "custom" ? "default" : "outline"}
             size="sm"
             aria-pressed={value.mode === "custom"}
-            aria-label={`Custom range ${customRange.startDate} to ${customRange.endDate}`}
+            aria-label={t("dashboard.filters.customRangeAria", {
+              start: customRange.startDate,
+              end: customRange.endDate,
+            })}
             className="gap-1.5"
           >
             <CalendarIcon className="h-3.5 w-3.5" aria-hidden="true" />
-            <span>Custom</span>
+            <span>{t("dashboard.filters.customRange")}</span>
             <span className="hidden text-xs font-normal opacity-80 sm:inline">
               {customRange.startDate} - {customRange.endDate}
             </span>
@@ -97,10 +118,10 @@ export function OverviewTimeframeSelect({
           <div className="grid gap-3">
             <div className="grid grid-cols-2 gap-2">
               <label className="grid gap-1 text-xs font-medium text-muted-foreground">
-                Start
+                {t("dashboard.filters.customRangeStart")}
                 <input
                   type="date"
-                  aria-label="Dashboard overview start date"
+                  aria-label={t("dashboard.filters.customRangeStartAria")}
                   max={maxDate}
                   value={customRange.startDate}
                   onChange={(event) => updateRange({ startDate: event.target.value })}
@@ -108,10 +129,10 @@ export function OverviewTimeframeSelect({
                 />
               </label>
               <label className="grid gap-1 text-xs font-medium text-muted-foreground">
-                End
+                {t("dashboard.filters.customRangeEnd")}
                 <input
                   type="date"
-                  aria-label="Dashboard overview end date"
+                  aria-label={t("dashboard.filters.customRangeEndAria")}
                   max={maxDate}
                   value={customRange.endDate}
                   onChange={(event) => updateRange({ endDate: event.target.value })}
@@ -148,6 +169,14 @@ function clampDateInputValue(value: string, maxDate: string): string {
     return value;
   }
   return value > maxDate ? maxDate : value;
+}
+
+function isCompleteDateRange(range: { startDate: string; endDate: string }): boolean {
+  return (
+    parseLocalDate(range.startDate) !== undefined &&
+    parseLocalDate(range.endDate) !== undefined &&
+    range.startDate <= range.endDate
+  );
 }
 
 function daysAgoLocalISO(days: number, date: Date = new Date()): string {

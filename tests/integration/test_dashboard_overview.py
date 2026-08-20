@@ -1173,6 +1173,144 @@ async def test_dashboard_overview_supports_custom_date_range(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("start_date", "end_date", "expected_starts"),
+    [
+        (
+            "2026-06-01",
+            "2026-06-07",
+            [f"2026-06-{day:02d}T06:00:00Z" for day in range(1, 8)],
+        ),
+        (
+            "2026-03-07",
+            "2026-03-09",
+            [
+                "2026-03-07T07:00:00Z",
+                "2026-03-08T07:00:00Z",
+                "2026-03-09T06:00:00Z",
+            ],
+        ),
+        (
+            "2025-11-01",
+            "2025-11-03",
+            [
+                "2025-11-01T06:00:00Z",
+                "2025-11-02T06:00:00Z",
+                "2025-11-03T07:00:00Z",
+            ],
+        ),
+    ],
+)
+async def test_dashboard_custom_range_uses_denver_calendar_day_buckets(
+    async_client,
+    db_setup,
+    monkeypatch: pytest.MonkeyPatch,
+    start_date: str,
+    end_date: str,
+    expected_starts: list[str],
+):
+    monkeypatch.setattr("app.modules.dashboard.service.utcnow", lambda: datetime(2026, 12, 1, 12, 0, 0))
+
+    response = await async_client.get(
+        "/api/dashboard/overview",
+        params={
+            "start_date": start_date,
+            "end_date": end_date,
+            "timezone": "America/Denver",
+        },
+    )
+    assert response.status_code == 200
+
+    payload = response.json()
+    assert payload["timeframe"]["bucketSeconds"] == 86400
+    assert payload["timeframe"]["bucketCount"] == len(expected_starts)
+    assert [point["t"] for point in payload["trends"]["requests"]] == expected_starts
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("calendar_date", "expected_bucket_count"),
+    [
+        ("2026-03-08", 23),
+        ("2025-11-02", 25),
+    ],
+)
+async def test_dashboard_single_day_range_tracks_denver_dst_hour_count(
+    async_client,
+    db_setup,
+    monkeypatch: pytest.MonkeyPatch,
+    calendar_date: str,
+    expected_bucket_count: int,
+):
+    monkeypatch.setattr("app.modules.dashboard.service.utcnow", lambda: datetime(2026, 12, 1, 12, 0, 0))
+
+    response = await async_client.get(
+        "/api/dashboard/overview",
+        params={
+            "start_date": calendar_date,
+            "end_date": calendar_date,
+            "timezone": "America/Denver",
+        },
+    )
+    assert response.status_code == 200
+
+    payload = response.json()
+    assert payload["timeframe"]["bucketSeconds"] == 3600
+    assert payload["timeframe"]["bucketCount"] == expected_bucket_count
+    assert len(payload["trends"]["requests"]) == expected_bucket_count
+
+
+@pytest.mark.asyncio
+async def test_dashboard_custom_range_separates_non_hour_offset_local_days(
+    async_client,
+    db_setup,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr("app.modules.dashboard.service.utcnow", lambda: datetime(2026, 12, 1, 12, 0, 0))
+
+    async with SessionLocal() as session:
+        logs_repo = RequestLogsRepository(session)
+        await logs_repo.add_log(
+            account_id=None,
+            request_id="req_kathmandu_before_midnight",
+            model="gpt-5.1",
+            input_tokens=10,
+            output_tokens=5,
+            latency_ms=50,
+            status="success",
+            error_code=None,
+            conversation_id="conv-kathmandu-before",
+            requested_at=datetime(2026, 6, 1, 18, 10, 0),
+        )
+        await logs_repo.add_log(
+            account_id=None,
+            request_id="req_kathmandu_after_midnight",
+            model="gpt-5.1",
+            input_tokens=20,
+            output_tokens=10,
+            latency_ms=50,
+            status="success",
+            error_code=None,
+            conversation_id="conv-kathmandu-after",
+            requested_at=datetime(2026, 6, 1, 18, 20, 0),
+        )
+
+    response = await async_client.get(
+        "/api/dashboard/overview",
+        params={
+            "start_date": "2026-06-01",
+            "end_date": "2026-06-02",
+            "timezone": "Asia/Kathmandu",
+        },
+    )
+    assert response.status_code == 200
+
+    payload = response.json()
+    assert [point["v"] for point in payload["trends"]["requests"]] == [1.0, 1.0]
+    assert [point["v"] for point in payload["trends"]["conversations"]] == [1.0, 1.0]
+
+
+@pytest.mark.asyncio
 async def test_dashboard_overview_rejects_invalid_custom_date_range(async_client):
     response = await async_client.get("/api/dashboard/overview?start_date=2026-04-03&end_date=2026-04-01")
     assert response.status_code == 400

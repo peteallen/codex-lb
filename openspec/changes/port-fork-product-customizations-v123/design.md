@@ -19,7 +19,12 @@ ranges return a dashboard validation error; the maximum range is 730 days.
 The response keeps the existing timeframe metadata shape and reports
 `key="custom"` with a bucket size selected for the range. The frontend stores
 custom dates in the dashboard URL and sends the browser time zone so local
-midnight remains stable across daylight-saving transitions.
+midnight remains stable across daylight-saving transitions. Daily and weekly
+trend points are aligned to explicit local-calendar boundaries rather than UTC
+epoch multiples, so a selected day is represented once even when its elapsed
+duration is 23 or 25 hours. Date inputs retain an incomplete or temporarily
+inverted local draft and update the URL only after both dates form a valid
+range.
 
 ### Weekly forecast semantics
 
@@ -30,12 +35,18 @@ existing all-days behavior.
 
 ### Throughput semantics
 
-TTFT remains the client-visible-token metric. Throughput uses the earliest
-available upstream anchor (`first_upstream_event`, then `response_created`, then
-TTFT) and counts persisted output tokens, including reasoning time covered by
-the generation interval. A tool-only row may therefore contribute TPS without
-inventing TTFT; its recent-request TTFT cell is shown as an approximate first
-output time.
+TTFT remains both the client-visible-token metric and the throughput anchor for
+normal responses. When a tool-only turn has no TTFT, throughput falls back to
+`response_created`; `first_upstream_event` remains transport diagnostics and is
+not an output anchor because it may precede response creation. TPS counts
+persisted output tokens, including reasoning time covered by the generation
+interval. A tool-only row may therefore contribute TPS without inventing TTFT;
+its recent-request TTFT cell is shown as an approximate first-output time.
+
+### Localization
+
+Custom-range labels and accessibility text, plus the approximate first-output
+tooltip, use the existing English, Korean, and Simplified Chinese catalogs.
 
 ### Branding
 

@@ -432,9 +432,10 @@ async def test_aggregate_daily_rows_calculates_sql_medians_for_odd_even_and_inva
     async_session.add(_make_account(account_id, "reports-speed-medians@example.com"))
     async_session.add_all(
         [
-            # Day one ignores missing TTFT and invalid TPS samples: TTFT [100, 200, 300],
-            # TPS [11.67, 30]. TPS counts total output tokens (14, reasoning included)
-            # over the generation window, because reasoning time sits inside that window.
+            # Day one ignores missing TTFT/response-created and invalid TPS samples:
+            # TTFT [100, 200, 300], TPS [11.67, 30]. TPS counts total output tokens
+            # (14, reasoning included) over the generation window, because reasoning
+            # time sits inside that window.
             RequestLog(
                 account_id=account_id,
                 request_id="report-speed-even-1",
@@ -456,6 +457,8 @@ async def test_aggregate_daily_rows_calculates_sql_medians_for_odd_even_and_inva
                 output_tokens=14,
                 reasoning_tokens=2,
                 latency_ms=1500,
+                latency_first_upstream_event_ms=50,
+                latency_response_created_ms=100,
                 latency_first_token_ms=300,
                 latency_queue_ms=60,
             ),
@@ -465,10 +468,11 @@ async def test_aggregate_daily_rows_calculates_sql_medians_for_odd_even_and_inva
                 requested_at=datetime(2026, 6, 1, 11, 0),
                 model="gpt-5.1",
                 status="success",
-                output_tokens=None,
+                output_tokens=100,
                 reasoning_tokens=None,
                 latency_ms=1500,
                 latency_first_token_ms=None,
+                latency_first_upstream_event_ms=100,
             ),
             RequestLog(
                 account_id=account_id,
@@ -480,7 +484,9 @@ async def test_aggregate_daily_rows_calculates_sql_medians_for_odd_even_and_inva
                 latency_ms=200,
                 latency_first_token_ms=200,
             ),
-            # A tool-only turn: no client-visible token, but a first upstream event.
+            # A tool-only turn: no client-visible token, but response.created marks
+            # the first meaningful output boundary. Earlier transport activity is
+            # intentionally not used as the TPS anchor.
             RequestLog(
                 account_id=account_id,
                 request_id="report-speed-even-tool-only",
@@ -490,7 +496,8 @@ async def test_aggregate_daily_rows_calculates_sql_medians_for_odd_even_and_inva
                 output_tokens=30,
                 latency_ms=1200,
                 latency_first_token_ms=None,
-                latency_first_upstream_event_ms=200,
+                latency_first_upstream_event_ms=100,
+                latency_response_created_ms=200,
                 latency_queue_ms=50,
             ),
             # Day two ignores reasoning-only and zero-output rows for TPS: TTFT [100, 200, 300, 400], TPS [4, 20].

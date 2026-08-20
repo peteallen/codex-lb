@@ -65,8 +65,15 @@ class DashboardRepository:
         since: datetime,
         bucket_seconds: int = 21600,
         until: datetime | None = None,
+        *,
+        bucket_origin_epoch: int = 0,
     ) -> list[BucketModelAggregate]:
-        return await self._logs_repo.aggregate_by_bucket(since, bucket_seconds, until)
+        return await self._logs_repo.aggregate_by_bucket(
+            since,
+            bucket_seconds,
+            until,
+            bucket_origin_epoch=bucket_origin_epoch,
+        )
 
     async def aggregate_conversations_by_bucket(
         self,
@@ -75,6 +82,12 @@ class DashboardRepository:
         until: datetime | None = None,
     ) -> list[BucketConversationAggregate]:
         return await self._logs_repo.aggregate_conversations_by_bucket(since, bucket_seconds, until)
+
+    async def aggregate_conversations_by_ranges(
+        self,
+        ranges: list[tuple[int, datetime, datetime]],
+    ) -> list[BucketConversationAggregate]:
+        return await self._logs_repo.aggregate_conversations_by_ranges(ranges)
 
     async def aggregate_activity_since(self, since: datetime) -> RequestActivityAggregate:
         return await self._logs_repo.aggregate_activity_since(since)

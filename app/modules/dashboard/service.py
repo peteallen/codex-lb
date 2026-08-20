@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from bisect import bisect_right
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from math import ceil
@@ -8,7 +9,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from app.core import usage as usage_core
 from app.core.config.settings import get_settings
 from app.core.crypto import TokenEncryptor
-from app.core.usage.types import UsageWindowRow
+from app.core.usage.types import BucketModelAggregate, UsageWindowRow
 from app.core.utils.time import utcnow
 from app.db.models import UsageHistory
 from app.modules.accounts.mappers import build_account_summaries
@@ -34,7 +35,6 @@ from app.modules.usage.builders import (
     build_activity_summaries,
     build_trends_from_buckets,
     build_usage_window_response,
-    floor_bucket_window_start,
 )
 from app.modules.usage.depletion_service import (
     compute_aggregate_depletion,
@@ -65,6 +65,16 @@ class DashboardOverviewRangeError(ValueError):
 
 
 @dataclass(frozen=True)
+class _TrendBucketRange:
+    start: datetime
+    end: datetime
+
+    @property
+    def epoch(self) -> int:
+        return int(self.start.replace(tzinfo=timezone.utc).timestamp())
+
+
+@dataclass(frozen=True)
 class _OverviewWindow:
     timeframe: DashboardOverviewTimeframeConfig
     activity_since: datetime
@@ -73,6 +83,9 @@ class _OverviewWindow:
     trend_since: datetime
     previous_since: datetime
     previous_until: datetime
+    aggregation_bucket_seconds: int
+    aggregation_bucket_origin_epoch: int = 0
+    trend_bucket_ranges: tuple[_TrendBucketRange, ...] = ()
 
 
 class DashboardService:
@@ -127,20 +140,35 @@ class DashboardService:
 
         bucket_rows = await self._repo.aggregate_logs_by_bucket(
             overview_window.bucket_query_since,
-            overview_timeframe.bucket_seconds,
+            overview_window.aggregation_bucket_seconds,
             overview_window.activity_until,
+            bucket_origin_epoch=overview_window.aggregation_bucket_origin_epoch,
         )
-        conversation_bucket_rows = await self._repo.aggregate_conversations_by_bucket(
-            overview_window.bucket_query_since,
-            overview_timeframe.bucket_seconds,
-            overview_window.activity_until,
-        )
+        if overview_window.trend_bucket_ranges:
+            bucket_rows = _rebin_model_rows(bucket_rows, overview_window.trend_bucket_ranges)
+            conversation_bucket_rows = await self._repo.aggregate_conversations_by_ranges(
+                [
+                    (bucket_range.epoch, bucket_range.start, bucket_range.end)
+                    for bucket_range in overview_window.trend_bucket_ranges
+                ]
+            )
+            trend_bucket_epochs: list[int] | None = [
+                bucket_range.epoch for bucket_range in overview_window.trend_bucket_ranges
+            ]
+        else:
+            conversation_bucket_rows = await self._repo.aggregate_conversations_by_bucket(
+                overview_window.bucket_query_since,
+                overview_timeframe.bucket_seconds,
+                overview_window.activity_until,
+            )
+            trend_bucket_epochs = None
         trends, _, _ = build_trends_from_buckets(
             bucket_rows,
             overview_window.trend_since,
             overview_timeframe.bucket_seconds,
             bucket_count=overview_timeframe.bucket_count,
             conversation_rows=conversation_bucket_rows,
+            bucket_epochs=trend_bucket_epochs,
         )
         activity_aggregate = await self._repo.aggregate_activity_between(
             overview_window.activity_since,
@@ -272,6 +300,7 @@ def _resolve_overview_window(
         trend_since=activity_since,
         previous_since=activity_since - window_delta,
         previous_until=activity_since,
+        aggregation_bucket_seconds=timeframe.bucket_seconds,
     )
 
 
@@ -301,32 +330,118 @@ def _resolve_custom_overview_window(
         raise DashboardOverviewRangeError("dashboard overview date range must cover at least one minute")
 
     duration_seconds = int(window_delta.total_seconds())
-    bucket_seconds = _custom_bucket_seconds(window_days, duration_seconds)
-    trend_since = floor_bucket_window_start(activity_since, bucket_seconds)
-    bucket_count = max(1, ceil((activity_until - trend_since).total_seconds() / bucket_seconds))
+    bucket_seconds = _custom_bucket_seconds(window_days)
+    trend_bucket_ranges = tuple(
+        _custom_trend_bucket_ranges(
+            start_date=resolved_start_date,
+            end_date=resolved_end_date,
+            timezone_info=timezone_info,
+            bucket_seconds=bucket_seconds,
+        )
+    )
     timeframe = DashboardOverviewTimeframeConfig(
         key="custom",
         window_minutes=max(1, ceil(duration_seconds / 60)),
         bucket_seconds=bucket_seconds,
-        bucket_count=bucket_count,
+        bucket_count=len(trend_bucket_ranges),
     )
     return _OverviewWindow(
         timeframe=timeframe,
         activity_since=activity_since,
         activity_until=activity_until,
         bucket_query_since=activity_since,
-        trend_since=trend_since,
+        trend_since=activity_since,
         previous_since=activity_since - window_delta,
         previous_until=activity_since,
+        aggregation_bucket_seconds=60 * 60,
+        aggregation_bucket_origin_epoch=trend_bucket_ranges[0].epoch,
+        trend_bucket_ranges=trend_bucket_ranges,
     )
 
 
-def _custom_bucket_seconds(window_days: int, duration_seconds: int) -> int:
-    if duration_seconds <= 24 * 60 * 60:
+def _custom_bucket_seconds(window_days: int) -> int:
+    if window_days == 1:
         return 60 * 60
     if window_days <= 90:
         return 24 * 60 * 60
     return 7 * 24 * 60 * 60
+
+
+def _custom_trend_bucket_ranges(
+    *,
+    start_date: date,
+    end_date: date,
+    timezone_info: ZoneInfo | timezone,
+    bucket_seconds: int,
+) -> list[_TrendBucketRange]:
+    if bucket_seconds == 60 * 60:
+        activity_start = _local_midnight_to_utc_naive(start_date, timezone_info)
+        activity_end = _local_midnight_to_utc_naive(end_date + timedelta(days=1), timezone_info)
+        ranges: list[_TrendBucketRange] = []
+        current = activity_start
+        while current < activity_end:
+            next_boundary = min(current + timedelta(hours=1), activity_end)
+            ranges.append(_TrendBucketRange(start=current, end=next_boundary))
+            current = next_boundary
+        return ranges
+
+    step_days = 1 if bucket_seconds == 24 * 60 * 60 else 7
+    ranges = []
+    current_date = start_date
+    final_date = end_date + timedelta(days=1)
+    while current_date < final_date:
+        next_date = min(current_date + timedelta(days=step_days), final_date)
+        ranges.append(
+            _TrendBucketRange(
+                start=_local_midnight_to_utc_naive(current_date, timezone_info),
+                end=_local_midnight_to_utc_naive(next_date, timezone_info),
+            )
+        )
+        current_date = next_date
+    return ranges
+
+
+def _rebin_model_rows(
+    rows: list[BucketModelAggregate],
+    ranges: tuple[_TrendBucketRange, ...],
+) -> list[BucketModelAggregate]:
+    if not ranges:
+        return []
+    starts = [bucket_range.epoch for bucket_range in ranges]
+    final_end = int(ranges[-1].end.replace(tzinfo=timezone.utc).timestamp())
+    merged: dict[tuple[int, str, str | None], list[float]] = {}
+
+    for row in rows:
+        source_epoch = max(row.bucket_epoch, starts[0])
+        range_index = bisect_right(starts, source_epoch) - 1
+        if range_index < 0 or source_epoch >= final_end:
+            continue
+        bucket_epoch = starts[range_index]
+        key = (bucket_epoch, row.model, row.service_tier)
+        entry = merged.setdefault(key, [0, 0, 0, 0, 0, 0, 0.0])
+        entry[0] += row.request_count
+        entry[1] += row.error_count
+        entry[2] += row.input_tokens
+        entry[3] += row.output_tokens
+        entry[4] += row.cached_input_tokens
+        entry[5] += row.reasoning_tokens
+        entry[6] += row.cost_usd
+
+    return [
+        BucketModelAggregate(
+            bucket_epoch=key[0],
+            model=key[1],
+            service_tier=key[2],
+            request_count=int(values[0]),
+            error_count=int(values[1]),
+            input_tokens=int(values[2]),
+            output_tokens=int(values[3]),
+            cached_input_tokens=int(values[4]),
+            reasoning_tokens=int(values[5]),
+            cost_usd=float(values[6]),
+        )
+        for key, values in sorted(merged.items(), key=lambda item: (item[0][0], item[0][1], item[0][2] or ""))
+    ]
 
 
 def _resolve_timezone(value: str | None) -> ZoneInfo | timezone:

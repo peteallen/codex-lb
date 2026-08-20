@@ -363,15 +363,16 @@ def conversation_labeled_presence_union(
     session: AsyncSession,
     windows: Sequence[tuple[str, datetime, datetime]],
     *,
+    include_deleted: bool = True,
     raw_conditions: Sequence[ColumnElement[bool]] = (),
 ) -> CompoundSelect:
     """``(label, cid)`` UNION ALL rows over labeled half-open windows (the
     reports per-local-day ranges, whose bounds need not be hour-aligned).
 
-    Soft-deleted rows are included on both sides — the reports conversation
-    reads carry no ``deleted_at`` filter. Callers group by label and count
-    ``DISTINCT cid``; windows are expected pre-batched below the SQLite
-    compound-select limit (the reports repository already batches at 500).
+    Soft-deleted rows are included by default because Reports carries no
+    ``deleted_at`` filter; Dashboard passes ``include_deleted=False``. Callers
+    group by label and count ``DISTINCT cid``; windows are expected pre-batched
+    below the SQLite compound-select limit (Reports batches at 500).
     """
     window_rows = [
         select(
@@ -387,14 +388,17 @@ def conversation_labeled_presence_union(
     ]
     windows_cte = (window_rows[0] if len(window_rows) == 1 else union_all(*window_rows)).cte("conversation_windows")
     rollup = RequestConversationHourlyRollup
+    folded_conditions = [
+        rollup.bucket_epoch >= windows_cte.c.fold_lo_epoch,
+        rollup.bucket_epoch < windows_cte.c.fold_hi_epoch,
+        rollup.bucket_epoch < _conversation_watermark_epoch_expr(session),
+    ]
+    if not include_deleted:
+        folded_conditions.append(rollup.is_deleted.is_(False))
     folded = select(windows_cte.c.label, rollup.conversation_id.label("cid")).select_from(
         windows_cte.join(AccountUsageRollupState, AccountUsageRollupState.id == _STATE_ROW_ID).join(
             rollup,
-            and_(
-                rollup.bucket_epoch >= windows_cte.c.fold_lo_epoch,
-                rollup.bucket_epoch < windows_cte.c.fold_hi_epoch,
-                rollup.bucket_epoch < _conversation_watermark_epoch_expr(session),
-            ),
+            and_(*folded_conditions),
         )
     )
     watermark = AccountUsageRollupState.conversation_folded_through
