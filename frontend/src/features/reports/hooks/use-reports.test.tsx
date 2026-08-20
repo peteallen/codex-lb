@@ -74,6 +74,7 @@ describe("useReports", () => {
             startDate: "2030-01-09",
             endDate: "2030-01-15",
             accountId: ["acct_123"],
+            apiKeyId: ["key_123", "key_456"],
             model: "gpt-5.1",
             useragent: "claude-code",
           },
@@ -91,6 +92,7 @@ describe("useReports", () => {
     expect(searchParams.get("model")).toBe("gpt-5.1");
     expect(searchParams.get("useragent_group")).toBe("claude-code");
     expect(searchParams.getAll("account_id")).toEqual(["acct_123"]);
+    expect(searchParams.getAll("api_key_id")).toEqual(["key_123", "key_456"]);
     expect(searchParams.get("timezone")).toBe("America/Los_Angeles");
   });
 
@@ -100,6 +102,7 @@ describe("useReports", () => {
       startDate: "2030-01-09",
       endDate: "2030-01-15",
       accountId: ["acct_123"],
+      apiKeyId: ["key_123"],
       model: "gpt-5.1",
       useragent: "claude-code",
     };
@@ -139,6 +142,7 @@ describe("useReports", () => {
       startDate: "2030-01-09",
       endDate: "2030-01-15",
       accountId: ["acct_123"],
+      apiKeyId: ["key_123"],
       model: "gpt-5.1",
       useragent: "claude-code",
     };
@@ -178,6 +182,7 @@ describe("useReports", () => {
             startDate: "2030-01-09",
             endDate: "2030-01-15",
             accountId: ["acct_123"],
+            apiKeyId: [],
             model: "gpt-5.1",
             useragent: "claude-code",
           },
@@ -195,6 +200,7 @@ describe("useReports", () => {
     expect(searchParams.get("model")).toBe("gpt-5.1");
     expect(searchParams.get("useragent_group")).toBe("claude-code");
     expect(searchParams.getAll("account_id")).toEqual(["acct_123"]);
+    expect(searchParams.has("api_key_id")).toBe(false);
     expect(searchParams.has("timezone")).toBe(false);
   });
 
@@ -208,6 +214,7 @@ describe("useReports", () => {
             startDate: "2030-01-09",
             endDate: "2030-01-15",
             accountId: ["acct_123"],
+            apiKeyId: ["key_123"],
             model: "gpt-5.1",
             useragent,
           },
@@ -237,5 +244,42 @@ describe("useReports", () => {
         "useragent_group",
       ),
     ).toBe("chatgpt-app");
+  });
+
+  it("refetches with repeated API-key filters when the selection changes", async () => {
+    const queryClient = createTestQueryClient();
+
+    const { result, rerender } = renderHook(
+      ({ apiKeyId }) =>
+        useReports(
+          {
+            startDate: "2030-01-09",
+            endDate: "2030-01-15",
+            accountId: [],
+            apiKeyId,
+            model: "",
+            useragent: "",
+          },
+          "America/Los_Angeles",
+        ),
+      {
+        wrapper: createWrapper(queryClient),
+        initialProps: { apiKeyId: ["key_123"] },
+      },
+    );
+
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    rerender({ apiKeyId: ["key_123", "key_456"] });
+
+    await waitFor(() => expect(getMock).toHaveBeenCalledTimes(2));
+
+    const [firstUrl] = getMock.mock.calls[0] ?? [];
+    const [secondUrl] = getMock.mock.calls[1] ?? [];
+    expect(
+      new URL(String(firstUrl), "http://localhost").searchParams.getAll("api_key_id"),
+    ).toEqual(["key_123"]);
+    expect(
+      new URL(String(secondUrl), "http://localhost").searchParams.getAll("api_key_id"),
+    ).toEqual(["key_123", "key_456"]);
   });
 });

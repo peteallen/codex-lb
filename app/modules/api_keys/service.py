@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import secrets
+import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -23,6 +24,7 @@ from app.core.usage.types import UsageWindowRow
 from app.core.utils.time import to_utc_naive, utcnow
 from app.db.models import Account, AccountStatus, ApiKey, ApiKeyLimit, LimitType, LimitWindow, ModelSource, UsageHistory
 from app.db.session import sqlite_writer_section
+from app.modules.api_keys.last_used_coalescer import ApiKeyLastUsedCoalescer, get_api_key_last_used_coalescer
 from app.modules.api_keys.limit_windows import advance_limit_reset, limit_window_delta, next_limit_reset
 from app.modules.api_keys.repository import (
     _UNSET,
@@ -97,8 +99,6 @@ class ApiKeysRepositoryProtocol(Protocol):
     ) -> ApiKey | None: ...
 
     async def delete(self, key_id: str) -> bool: ...
-
-    async def update_last_used(self, key_id: str, *, commit: bool = True) -> None: ...
 
     async def commit(self) -> None: ...
 
@@ -397,6 +397,15 @@ def _compute_pooled_credits(
         primary_rows_raw,
         secondary_rows_raw,
     )
+    now_epoch = int(time.time())
+    # A live primary sample is one whose reset has not elapsed; when none
+    # exists (upstream stopped reporting the short window), the pooled
+    # primary bar must read absent rather than frozen or optimistic.
+    has_live_primary = any(row.reset_at is None or row.reset_at > now_epoch for row in primary_rows)
+    primary_rows = usage_core.expire_elapsed_window_rows(primary_rows, now_epoch=now_epoch)
+    # Secondary (weekly) rows pool raw: upstream still reports long windows,
+    # so an elapsed sample is transient staleness the next refresh rewrites —
+    # zeroing it would briefly report an exhausted weekly pool as 100% free.
     primary_rows = _seed_missing_usage_rows(primary_rows, account_ids)
     secondary_rows = _seed_missing_usage_rows(secondary_rows, account_ids)
 
@@ -406,7 +415,7 @@ def _compute_pooled_credits(
     primary_remaining = usage_core.remaining_percent_from_used(primary_summary.used_percent)
     secondary_remaining = usage_core.remaining_percent_from_used(secondary_summary.used_percent)
 
-    if primary_summary.capacity_credits == 0.0:
+    if primary_summary.capacity_credits == 0.0 or not has_live_primary:
         primary_remaining = None
 
     return PooledCreditData(
@@ -438,11 +447,19 @@ class ApiKeyUsageReservationData:
 
 
 class ApiKeysService:
-    def __init__(self, repository: ApiKeysRepositoryProtocol, usage_repository: UsageRepository | None = None) -> None:
+    def __init__(
+        self,
+        repository: ApiKeysRepositoryProtocol,
+        usage_repository: UsageRepository | None = None,
+        *,
+        last_used_coalescer: ApiKeyLastUsedCoalescer | None = None,
+    ) -> None:
         self._repository = repository
         self._usage_repository = usage_repository
+        self._last_used_coalescer = last_used_coalescer or get_api_key_last_used_coalescer()
 
     async def create_key(self, payload: ApiKeyCreateData) -> ApiKeyCreatedData:
+        _validate_unique_limit_rule_identities(payload.limits)
         now = utcnow()
         expires_at = _normalize_expires_at(payload.expires_at)
         plain_key = _generate_plain_key()
@@ -1000,11 +1017,16 @@ class ApiKeysService:
                     cached_input_tokens=cached_input_tokens,
                     cost_microdollars=cost_microdollars,
                 )
-                await self._repository.update_last_used(reservation.api_key_id, commit=False)
                 await self._repository.commit()
             except Exception:
                 await self._repository.rollback()
                 raise
+
+        # Write-behind: the periodic flusher persists last_used_at (coalesced,
+        # greatest-wins) instead of this settlement commit. Recorded outside
+        # sqlite_writer_section(): during shutdown write-through the record
+        # flushes immediately, and that flush takes the writer section itself.
+        await self._last_used_coalescer.record(reservation.api_key_id, utcnow())
 
     async def touch_usage_reservation(self, reservation_id: str) -> bool:
         for attempt in range(_SQLITE_BUSY_RETRY_ATTEMPTS):
@@ -1098,6 +1120,7 @@ class ApiKeysService:
             output_tokens=output_tokens,
             cost_microdollars=cost_microdollars,
         )
+        await self._last_used_coalescer.record(key_id, utcnow())
 
     async def get_key_trends(self, key_id: str) -> ApiKeyTrendsData | None:
         row = await self._repository.get_by_id(key_id)
@@ -1714,9 +1737,7 @@ async def _build_limit_rows_for_update(
     repository: ApiKeysRepositoryProtocol | None = None,
 ) -> list[ApiKeyLimit]:
     existing_by_key = {_limit_identity_from_row(limit): limit for limit in existing_limits}
-    submitted_by_key = {_limit_identity_from_input(limit): limit for limit in submitted_limits}
-    if len(submitted_by_key) != len(submitted_limits):
-        raise ApiKeyValidationError("Duplicate limit rules are not allowed")
+    _validate_unique_limit_rule_identities(submitted_limits)
 
     rows: list[ApiKeyLimit] = []
     for submitted in submitted_limits:
@@ -1792,6 +1813,15 @@ def _build_reset_limit_rows(
 
 def _limit_identity_from_input(limit: LimitRuleInput) -> tuple[str, str, str | None]:
     return (limit.limit_type, limit.limit_window, limit.model_filter)
+
+
+def _validate_unique_limit_rule_identities(limits: list[LimitRuleInput]) -> None:
+    identities: set[tuple[str, str, str | None]] = set()
+    for limit in limits:
+        identity = _limit_identity_from_input(limit)
+        if identity in identities:
+            raise ApiKeyValidationError(f"Duplicate limit rules are not allowed: {identity!r}")
+        identities.add(identity)
 
 
 def _limit_identity_from_row(limit: ApiKeyLimit) -> tuple[str, str, str | None]:

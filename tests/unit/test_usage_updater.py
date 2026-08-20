@@ -5,7 +5,7 @@ import time
 from collections.abc import Collection
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from unittest.mock import AsyncMock
 
@@ -16,9 +16,12 @@ from app.core.crypto import TokenEncryptor
 from app.core.upstream_proxy import ResolvedProxyEndpoint, ResolvedUpstreamRoute
 from app.core.usage import refresh_scheduler as refresh_scheduler_module
 from app.core.usage.models import UsagePayload
+from app.core.usage.refresh_scheduler import _select_long_window_entries
+from app.core.utils.time import utcnow
 from app.db.models import Account, AccountStatus, UsageHistory
 from app.modules.usage import updater as usage_updater_module
 from app.modules.usage.additional_quota_keys import canonicalize_additional_quota_key
+from app.modules.usage.repository import UsageWindowWrite
 from app.modules.usage.updater import UsageUpdater
 
 pytestmark = pytest.mark.unit
@@ -112,6 +115,15 @@ async def test_refresh_accounts_owned_singleflight_session_outlives_caller_cance
             credits_balance: float | None = None,
         ) -> UsageHistory | None:
             return None
+
+        async def add_account_snapshot(
+            self,
+            account_id: str,
+            windows: Collection[UsageWindowWrite],
+            *,
+            recorded_at: datetime | None = None,
+        ) -> list[UsageHistory]:
+            return []
 
     class InnerUsageRepository(OuterUsageRepository):
         def __init__(self, session) -> None:
@@ -230,6 +242,15 @@ async def test_owned_singleflight_reload_skips_account_that_became_ineligible(
             credits_balance: float | None = None,
         ) -> UsageHistory | None:
             return None
+
+        async def add_account_snapshot(
+            self,
+            account_id: str,
+            windows: Collection[UsageWindowWrite],
+            *,
+            recorded_at: datetime | None = None,
+        ) -> list[UsageHistory]:
+            return []
 
     class InnerUsageRepository(OuterUsageRepository):
         def __init__(self, session) -> None:
@@ -350,6 +371,46 @@ def test_usage_refresh_scheduler_splits_interval_across_accounts() -> None:
     assert refresh_scheduler_module._usage_refresh_slice_seconds(120, 0) == 120.0
 
 
+def test_usage_refresh_scheduler_selects_monthly_long_window_for_free_accounts() -> None:
+    free_account = _make_account("acc_free", "workspace_free")
+    free_account.plan_type = "free"
+    plus_account = _make_account("acc_plus", "workspace_plus")
+
+    monthly = UsageHistory(
+        account_id=free_account.id,
+        used_percent=100,
+        reset_at=2000,
+        window="monthly",
+        window_minutes=43_200,
+        recorded_at=datetime.now(tz=timezone.utc),
+    )
+    free_secondary = UsageHistory(
+        account_id=free_account.id,
+        used_percent=25,
+        reset_at=1500,
+        window="secondary",
+        window_minutes=10_080,
+        recorded_at=datetime.now(tz=timezone.utc),
+    )
+    plus_secondary = UsageHistory(
+        account_id=plus_account.id,
+        used_percent=50,
+        reset_at=1600,
+        window="secondary",
+        window_minutes=10_080,
+        recorded_at=datetime.now(tz=timezone.utc),
+    )
+
+    selected = _select_long_window_entries(
+        accounts=[free_account, plus_account],
+        monthly_entries={free_account.id: monthly},
+        secondary_entries={free_account.id: free_secondary, plus_account.id: plus_secondary},
+    )
+
+    assert selected.get(free_account.id) is monthly
+    assert selected.get(plus_account.id) is plus_secondary
+
+
 def test_usage_refresh_scheduler_rotates_one_account_per_slice() -> None:
     scheduler = refresh_scheduler_module.UsageRefreshScheduler(interval_seconds=120, enabled=True)
     accounts = [_make_account("acc_a", "workspace_a"), _make_account("acc_b", "workspace_b")]
@@ -381,9 +442,17 @@ class UsageEntry:
     credits_balance: float | None
 
 
+@dataclass(frozen=True, slots=True)
+class UsageSnapshotCall:
+    account_id: str
+    windows: tuple[UsageWindowWrite, ...]
+    recorded_at: datetime
+
+
 class StubUsageRepository:
     def __init__(self, *, return_rows: bool = False) -> None:
         self.entries: list[UsageEntry] = []
+        self.snapshot_calls: list[UsageSnapshotCall] = []
         self._return_rows = return_rows
         self._next_id = 1
 
@@ -403,7 +472,12 @@ class StubUsageRepository:
                     used_percent=entry.used_percent,
                     input_tokens=entry.input_tokens,
                     output_tokens=entry.output_tokens,
-                    recorded_at=entry.recorded_at or datetime.now(tz=timezone.utc),
+                    # Production stores UTC-naive timestamps (``utcnow()``), and
+                    # the freshness check subtracts this value from one. A
+                    # tz-aware fallback here would raise TypeError as soon as a
+                    # test writes a row and then refreshes the same account
+                    # again, so keep the stub on the production contract.
+                    recorded_at=entry.recorded_at or utcnow(),
                     window=entry.window,
                     reset_at=entry.reset_at,
                     window_minutes=entry.window_minutes,
@@ -450,7 +524,7 @@ class StubUsageRepository:
             used_percent=used_percent,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
-            recorded_at=recorded_at or datetime.now(tz=timezone.utc),
+            recorded_at=recorded_at or utcnow(),
             window=window,
             reset_at=reset_at,
             window_minutes=window_minutes,
@@ -460,6 +534,39 @@ class StubUsageRepository:
         )
         self._next_id += 1
         return entry
+
+    async def add_account_snapshot(
+        self,
+        account_id: str,
+        windows: Collection[UsageWindowWrite],
+        *,
+        recorded_at: datetime | None = None,
+    ) -> list[UsageHistory]:
+        captured_at = recorded_at or utcnow()
+        snapshot_windows = tuple(windows)
+        self.snapshot_calls.append(
+            UsageSnapshotCall(
+                account_id=account_id,
+                windows=snapshot_windows,
+                recorded_at=captured_at,
+            )
+        )
+        rows: list[UsageHistory] = []
+        for window in snapshot_windows:
+            entry = await self.add_entry(
+                account_id,
+                window.used_percent,
+                recorded_at=captured_at,
+                window=window.window,
+                reset_at=window.reset_at,
+                window_minutes=window.window_minutes,
+                credits_has=window.credits_has,
+                credits_unlimited=window.credits_unlimited,
+                credits_balance=window.credits_balance,
+            )
+            if entry is not None:
+                rows.append(entry)
+        return rows
 
 
 @dataclass(frozen=True, slots=True)
@@ -708,6 +815,167 @@ async def test_force_refresh_usage_keeps_rate_limited_account_without_primary_or
     assert accounts_repo.status_updates == []
     assert account.status == AccountStatus.RATE_LIMITED
     assert account.reset_at == 12345
+
+
+@pytest.mark.asyncio
+async def test_recover_keeps_rate_limited_account_during_persisted_retry_after_cooldown() -> None:
+    accounts_repo = StubAccountsRepository()
+    updater = UsageUpdater(StubUsageRepository(), accounts_repo)
+    account = _make_account("acc_retry_after_cooldown", "workspace_retry_after_cooldown")
+    account.status = AccountStatus.RATE_LIMITED
+    account.deactivation_reason = None
+    now = int(time.time())
+    # A 429 with a 20-minute Retry-After persisted blocked_at + reset_at.
+    account.blocked_at = now - 60
+    account.reset_at = now + 1140
+    accounts_repo.accounts_by_id[account.id] = account
+
+    await updater._recover_quota_status_from_usage(
+        account,
+        primary=usage_updater_module.UsageWindow(used_percent=0.0),
+        secondary=usage_updater_module.UsageWindow(used_percent=10.0),
+    )
+
+    assert accounts_repo.status_updates == []
+    assert account.status == AccountStatus.RATE_LIMITED
+    assert account.reset_at == now + 1140
+    assert account.blocked_at == now - 60
+
+
+@pytest.mark.asyncio
+async def test_recover_restores_rate_limited_account_with_implausible_deadline() -> None:
+    accounts_repo = StubAccountsRepository()
+    updater = UsageUpdater(StubUsageRepository(), accounts_repo)
+    account = _make_account("acc_implausible_deadline", "workspace_implausible_deadline")
+    account.status = AccountStatus.RATE_LIMITED
+    account.deactivation_reason = None
+    now = int(time.time())
+    account.blocked_at = now - 60
+    account.reset_at = 15_023_672_358
+    accounts_repo.accounts_by_id[account.id] = account
+
+    await updater._recover_quota_status_from_usage(
+        account,
+        primary=usage_updater_module.UsageWindow(used_percent=0.0),
+        secondary=usage_updater_module.UsageWindow(used_percent=10.0),
+    )
+
+    assert accounts_repo.status_updates == [
+        {
+            "account_id": account.id,
+            "status": AccountStatus.ACTIVE,
+            "deactivation_reason": None,
+            "reset_at": None,
+            "blocked_at": None,
+        },
+    ]
+    assert account.status == AccountStatus.ACTIVE
+    assert account.reset_at is None
+    assert account.blocked_at is None
+
+
+@pytest.mark.asyncio
+async def test_recover_keeps_rate_limited_account_during_legacy_blocked_at_floor() -> None:
+    accounts_repo = StubAccountsRepository()
+    updater = UsageUpdater(StubUsageRepository(), accounts_repo)
+    account = _make_account("acc_legacy_floor", "workspace_legacy_floor")
+    account.status = AccountStatus.RATE_LIMITED
+    account.deactivation_reason = None
+    now = int(time.time())
+    # Legacy 429 row written before cooldown persistence: blocked_at only.
+    account.blocked_at = now - 5
+    account.reset_at = None
+    accounts_repo.accounts_by_id[account.id] = account
+
+    await updater._recover_quota_status_from_usage(
+        account,
+        primary=usage_updater_module.UsageWindow(used_percent=0.0),
+        secondary=usage_updater_module.UsageWindow(used_percent=10.0),
+    )
+
+    assert accounts_repo.status_updates == []
+    assert account.status == AccountStatus.RATE_LIMITED
+    assert account.blocked_at == now - 5
+
+
+@pytest.mark.asyncio
+async def test_recover_restores_rate_limited_account_after_persisted_cooldown_elapses() -> None:
+    accounts_repo = StubAccountsRepository()
+    updater = UsageUpdater(StubUsageRepository(), accounts_repo)
+    account = _make_account("acc_cooldown_elapsed", "workspace_cooldown_elapsed")
+    account.status = AccountStatus.RATE_LIMITED
+    account.deactivation_reason = None
+    now = int(time.time())
+    account.blocked_at = now - 1300
+    account.reset_at = now - 10
+    accounts_repo.accounts_by_id[account.id] = account
+
+    await updater._recover_quota_status_from_usage(
+        account,
+        primary=usage_updater_module.UsageWindow(used_percent=0.0),
+        secondary=usage_updater_module.UsageWindow(used_percent=10.0),
+    )
+
+    assert accounts_repo.status_updates == [
+        {
+            "account_id": account.id,
+            "status": AccountStatus.ACTIVE,
+            "deactivation_reason": None,
+            "reset_at": None,
+            "blocked_at": None,
+        },
+    ]
+    assert account.status == AccountStatus.ACTIVE
+    assert account.reset_at is None
+    assert account.blocked_at is None
+
+
+@pytest.mark.asyncio
+async def test_usage_refresh_keeps_rate_limited_retry_after_cooldown(monkeypatch) -> None:
+    monkeypatch.setenv("CODEX_LB_USAGE_REFRESH_ENABLED", "true")
+    from app.core.config.settings import get_settings
+
+    get_settings.cache_clear()
+
+    async def stub_fetch_usage(*, access_token: str, account_id: str | None, **_: Any) -> UsagePayload:
+        del access_token, account_id
+        return UsagePayload.model_validate(
+            {
+                "rate_limit": {
+                    "primary_window": {
+                        "used_percent": 0.0,
+                        "reset_at": 1735689600,
+                        "limit_window_seconds": 60,
+                    },
+                    "secondary_window": {
+                        "used_percent": 10.0,
+                        "reset_at": 1736208000,
+                        "limit_window_seconds": 7 * 24 * 60 * 60,
+                    },
+                }
+            }
+        )
+
+    monkeypatch.setattr("app.modules.usage.updater.fetch_usage", stub_fetch_usage)
+    # 60s after the 429, well before the 20-minute Retry-After deadline.
+    monkeypatch.setattr("app.modules.usage.updater.time.time", lambda: 1735600060.0)
+
+    usage_repo = StubUsageRepository(return_rows=True)
+    accounts_repo = StubAccountsRepository()
+    updater = UsageUpdater(usage_repo, accounts_repo=accounts_repo)
+    account = _make_account("acc_rate_limited_retry_after", "workspace_shared")
+    account.status = AccountStatus.RATE_LIMITED
+    account.reset_at = 1735601200
+    account.blocked_at = 1735600000
+    accounts_repo.accounts_by_id[account.id] = account
+
+    await updater.refresh_accounts([account], latest_usage={})
+
+    assert usage_repo.entries, "expected the refresh to fetch and store fresh usage"
+    assert account.status == AccountStatus.RATE_LIMITED
+    assert account.reset_at == 1735601200
+    assert account.blocked_at == 1735600000
+    assert accounts_repo.status_updates == []
 
 
 @pytest.mark.asyncio
@@ -1525,7 +1793,7 @@ async def test_usage_refresh_uses_fresh_monthly_row_for_quota_freshness(monkeypa
         account.id,
         100.0,
         window="monthly",
-        recorded_at=datetime.now(),
+        recorded_at=usage_updater_module.utcnow(),
         reset_at=int(time.time()) + 3600,
         window_minutes=43_200,
     )
@@ -1577,7 +1845,7 @@ async def test_usage_refresh_skips_mismatched_workspace_payload(monkeypatch) -> 
     assert usage_repo.entries == []
     assert additional_repo.deleted_account_ids == []
     assert accounts_repo.status_updates == []
-    assert accounts_repo.token_updates == []
+    assert accounts_repo.metadata_updates == []
     assert account.status == AccountStatus.ACTIVE
     assert account.plan_type == "business"
     assert account.workspace_id == "ws_team"
@@ -1632,7 +1900,7 @@ async def test_usage_refresh_skips_taken_workspace_slot_payload(monkeypatch) -> 
     assert account.workspace_label is None
     assert account.seat_type is None
     assert account.plan_type == original_plan_type
-    assert accounts_repo.token_updates == []
+    assert accounts_repo.metadata_updates == []
 
 
 @pytest.mark.asyncio
@@ -1711,7 +1979,7 @@ async def test_usage_refresh_skips_workspace_account_when_payload_omits_workspac
 
     assert usage_repo.entries == []
     assert accounts_repo.status_updates == []
-    assert accounts_repo.token_updates == []
+    assert accounts_repo.metadata_updates == []
     assert account.workspace_id == "ws_team"
     assert account.plan_type == "business"
 
@@ -1754,7 +2022,7 @@ async def test_usage_refresh_skips_workspace_account_when_payload_omits_workspac
 
     assert usage_repo.entries == []
     assert accounts_repo.status_updates == []
-    assert accounts_repo.token_updates == []
+    assert accounts_repo.metadata_updates == []
     assert account.workspace_id == "ws_team"
     assert account.plan_type == "business"
 
@@ -1878,19 +2146,703 @@ async def test_usage_refresh_skips_unknown_plan_degrade_without_workspace(
     await updater.refresh_accounts([account], latest_usage={})
 
     assert usage_repo.entries == []
-    assert accounts_repo.token_updates == []
+    assert accounts_repo.metadata_updates == []
     assert account.plan_type == "unknown"
     assert account.workspace_id is None
+
+
+async def _pending_observations(account_id: str) -> int | None:
+    """Pending workspace-less downgrade observations for ``account_id``.
+
+    Reads through the observation-store abstraction the guard itself uses, so the
+    assertions stay valid whether the active store is the in-memory one installed
+    for unit tests or the database-backed default.
+    """
+    store = usage_updater_module._plan_downgrade_observation_store()
+    record = await store.get(account_id)
+    return None if record is None else record.observations
+
+
+def _free_downgrade_payload_factory(plan_types: list[str]):
+    """Return a stub fetch_usage that walks ``plan_types`` one call at a time."""
+    calls = {"index": 0}
+
+    async def stub_fetch_usage(*, access_token: str, account_id: str | None, **_: Any) -> UsagePayload:
+        del access_token, account_id
+        index = min(calls["index"], len(plan_types) - 1)
+        calls["index"] += 1
+        return UsagePayload.model_validate(
+            {
+                "plan_type": plan_types[index],
+                "rate_limit": {
+                    "primary_window": {
+                        "used_percent": 10.0,
+                        "reset_at": 1736208000,
+                        "limit_window_seconds": 5 * 60 * 60,
+                    },
+                },
+            }
+        )
+
+    return stub_fetch_usage
+
+
+@pytest.mark.asyncio
+async def test_usage_refresh_confirms_free_downgrade_without_workspace_on_second_observation(
+    monkeypatch,
+) -> None:
+    """Regression for #1456: an expired paid subscription on a workspace-less
+    account must converge to ``free`` once a second consecutive refresh agrees,
+    instead of being discarded forever as an identity mismatch."""
+    monkeypatch.setenv("CODEX_LB_USAGE_REFRESH_ENABLED", "true")
+    from app.core.config.settings import get_settings
+
+    get_settings.cache_clear()
+
+    monkeypatch.setattr(
+        "app.modules.usage.updater.fetch_usage",
+        _free_downgrade_payload_factory(["free", "free"]),
+    )
+
+    usage_repo = StubUsageRepository(return_rows=True)
+    accounts_repo = StubAccountsRepository()
+    updater = UsageUpdater(usage_repo, accounts_repo=accounts_repo)
+    account = _make_account("acc_personal_expired", "upstream_user", email="same@example.com")
+    account.workspace_id = None
+    account.plan_type = "plus"
+    accounts_repo.accounts_by_id[account.id] = account
+
+    await updater.refresh_accounts([account], latest_usage={})
+
+    # First observation is recorded but never mutates the stored entitlement.
+    assert usage_repo.entries == []
+    assert account.plan_type == "plus"
+
+    await updater.refresh_accounts([account], latest_usage={})
+
+    # The confirming observation persists the downgrade and writes the sample.
+    assert usage_repo.entries != []
+    assert account.plan_type == "free"
+    assert account.workspace_id is None
+
+
+@pytest.mark.asyncio
+async def test_usage_refresh_paid_payload_clears_pending_free_downgrade(monkeypatch) -> None:
+    """A transient ``free`` blip must not accumulate toward a downgrade once the
+    account reports a recognized paid plan again."""
+    monkeypatch.setenv("CODEX_LB_USAGE_REFRESH_ENABLED", "true")
+    from app.core.config.settings import get_settings
+
+    get_settings.cache_clear()
+
+    fetch = _free_downgrade_payload_factory(["free", "plus", "free"])
+    monkeypatch.setattr("app.modules.usage.updater.fetch_usage", fetch)
+
+    usage_repo = StubUsageRepository(return_rows=True)
+    accounts_repo = StubAccountsRepository()
+    updater = UsageUpdater(usage_repo, accounts_repo=accounts_repo)
+    account = _make_account("acc_personal_blip", "upstream_user", email="same@example.com")
+    account.workspace_id = None
+    account.plan_type = "plus"
+    accounts_repo.accounts_by_id[account.id] = account
+
+    # Force refresh, not the scheduled path: a scheduled refresh skips accounts
+    # whose usage is still fresh, so the third payload would never be fetched and
+    # the trailing observation would go unexercised.
+    await updater.force_refresh(account)
+    assert await _pending_observations(account.id) == 1
+    assert account.plan_type == "plus"
+
+    await updater.force_refresh(account)
+    # The recognized paid payload must discard the pending downgrade outright.
+    assert await _pending_observations(account.id) is None
+    assert account.plan_type == "plus"
+
+    await updater.force_refresh(account)
+    # Back to a single unconfirmed observation, so no downgrade is applied.
+    assert await _pending_observations(account.id) == 1
+    assert account.plan_type == "plus"
+
+
+@pytest.mark.asyncio
+async def test_usage_refresh_never_confirms_unrecognized_plan_without_workspace(monkeypatch) -> None:
+    """Confirmation applies to ``free`` only: an unrecognized plan value stays
+    rejected no matter how many times it repeats."""
+    monkeypatch.setenv("CODEX_LB_USAGE_REFRESH_ENABLED", "true")
+    from app.core.config.settings import get_settings
+
+    get_settings.cache_clear()
+
+    monkeypatch.setattr(
+        "app.modules.usage.updater.fetch_usage",
+        _free_downgrade_payload_factory(["mystery", "mystery", "mystery"]),
+    )
+
+    usage_repo = StubUsageRepository(return_rows=True)
+    accounts_repo = StubAccountsRepository()
+    updater = UsageUpdater(usage_repo, accounts_repo=accounts_repo)
+    account = _make_account("acc_personal_mystery", "upstream_user", email="same@example.com")
+    account.workspace_id = None
+    account.plan_type = "business"
+    accounts_repo.accounts_by_id[account.id] = account
+
+    for _ in range(3):
+        await updater.refresh_accounts([account], latest_usage={})
+
+    assert usage_repo.entries == []
+    assert accounts_repo.metadata_updates == []
+    assert account.plan_type == "business"
+
+
+@pytest.mark.asyncio
+async def test_usage_refresh_free_downgrade_confirmation_is_per_account(monkeypatch) -> None:
+    """One ``free`` observation on two different accounts must not combine into
+    a confirmation for either of them."""
+    monkeypatch.setenv("CODEX_LB_USAGE_REFRESH_ENABLED", "true")
+    from app.core.config.settings import get_settings
+
+    get_settings.cache_clear()
+
+    monkeypatch.setattr(
+        "app.modules.usage.updater.fetch_usage",
+        _free_downgrade_payload_factory(["free"]),
+    )
+
+    usage_repo = StubUsageRepository(return_rows=True)
+    accounts_repo = StubAccountsRepository()
+    updater = UsageUpdater(usage_repo, accounts_repo=accounts_repo)
+    first = _make_account("acc_personal_first", "upstream_user", email="first@example.com")
+    first.workspace_id = None
+    first.plan_type = "plus"
+    second = _make_account("acc_personal_second", "upstream_other", email="second@example.com")
+    second.workspace_id = None
+    second.plan_type = "plus"
+    accounts_repo.accounts_by_id[first.id] = first
+    accounts_repo.accounts_by_id[second.id] = second
+
+    await updater.refresh_accounts([first, second], latest_usage={})
+
+    assert first.plan_type == "plus"
+    assert second.plan_type == "plus"
+
+
+@pytest.mark.asyncio
+async def test_shared_test_isolation_clears_pending_downgrade_state() -> None:
+    """The shared `_reset_global_state` helper must clear pending-downgrade state.
+
+    The fallback store is process-global, so without this a suite that leaves an
+    observation behind would hand the next test a head start toward a downgrade.
+    Only this module's own autouse fixture used to clear it, which left every
+    other suite (notably the Force probe integration tests) exposed. Asserting it
+    here keeps the shared reset from being silently dropped.
+    """
+    from tests.conftest import _reset_global_state
+
+    fallback = usage_updater_module._FALLBACK_PLAN_DOWNGRADE_OBSERVATIONS
+    await fallback.record(
+        "leaked_account",
+        observations=1,
+        credential_fingerprint="deadbeef",
+        observed_plan_type="free",
+    )
+    try:
+        _reset_global_state()
+        assert await fallback.get("leaked_account") is None
+    finally:
+        fallback.clear_all()
+
+
+@pytest.mark.asyncio
+async def test_free_downgrade_reset_only_clears_the_reporting_account(monkeypatch) -> None:
+    """Clearing one account's pending downgrade must not discard another's.
+
+    Two accounts each hold a pending observation; only the one that reports a
+    recognized paid plan may be reset, so the other still confirms on its own
+    next ``free`` observation."""
+    monkeypatch.setenv("CODEX_LB_USAGE_REFRESH_ENABLED", "true")
+    from app.core.config.settings import get_settings
+
+    get_settings.cache_clear()
+
+    plans_by_account: dict[str, list[str]] = {
+        "acc_reset_self": ["free", "plus"],
+        "acc_reset_other": ["free", "free"],
+    }
+    calls: dict[str, int] = {}
+
+    async def stub_fetch_usage(*, access_token: str, account_id: str | None, **_: Any) -> UsagePayload:
+        del access_token
+        key = str(account_id)
+        index = min(calls.get(key, 0), len(plans_by_account[key]) - 1)
+        calls[key] = index + 1
+        return UsagePayload.model_validate(
+            {
+                "plan_type": plans_by_account[key][index],
+                "rate_limit": {
+                    "primary_window": {
+                        "used_percent": 10.0,
+                        "reset_at": 1736208000,
+                        "limit_window_seconds": 5 * 60 * 60,
+                    },
+                },
+            }
+        )
+
+    monkeypatch.setattr("app.modules.usage.updater.fetch_usage", stub_fetch_usage)
+
+    usage_repo = StubUsageRepository(return_rows=True)
+    accounts_repo = StubAccountsRepository()
+    updater = UsageUpdater(usage_repo, accounts_repo=accounts_repo)
+    resetting = _make_account("acc_reset_self", "acc_reset_self", email="self@example.com")
+    resetting.workspace_id = None
+    resetting.plan_type = "plus"
+    other = _make_account("acc_reset_other", "acc_reset_other", email="other@example.com")
+    other.workspace_id = None
+    other.plan_type = "plus"
+    accounts_repo.accounts_by_id[resetting.id] = resetting
+    accounts_repo.accounts_by_id[other.id] = other
+
+    # Both accounts record one pending free observation.
+    await updater.force_refresh(resetting)
+    await updater.force_refresh(other)
+    assert await _pending_observations(resetting.id) == 1
+    assert await _pending_observations(other.id) == 1
+
+    # A paid payload for the first account must clear only its own entry.
+    await updater.force_refresh(resetting)
+    assert await _pending_observations(resetting.id) is None
+    assert await _pending_observations(other.id) == 1
+
+    # The untouched account therefore still confirms on its own second sighting.
+    await updater.force_refresh(other)
+    assert other.plan_type == "free"
+    assert resetting.plan_type == "plus"
+
+
+@pytest.mark.asyncio
+async def test_force_refresh_confirms_free_downgrade_on_second_probe(monkeypatch) -> None:
+    """Force probe shares the confirmation path: two probes reporting ``free``
+    persist the downgrade without reauthentication."""
+    monkeypatch.setenv("CODEX_LB_USAGE_REFRESH_ENABLED", "true")
+    from app.core.config.settings import get_settings
+
+    get_settings.cache_clear()
+
+    monkeypatch.setattr(
+        "app.modules.usage.updater.fetch_usage",
+        _free_downgrade_payload_factory(["free", "free"]),
+    )
+
+    usage_repo = StubUsageRepository(return_rows=True)
+    accounts_repo = StubAccountsRepository()
+    updater = UsageUpdater(usage_repo, accounts_repo=accounts_repo)
+    account = _make_account("acc_personal_force_probe", "upstream_user", email="same@example.com")
+    account.workspace_id = None
+    account.plan_type = "pro"
+    accounts_repo.accounts_by_id[account.id] = account
+
+    await updater.force_refresh(account)
+    assert account.plan_type == "pro"
+
+    await updater.force_refresh(account)
+    assert account.plan_type == "free"
+    # The counter must not leak after a confirmed downgrade, or a later
+    # unrelated observation would inherit a head start toward another mutation.
+    assert await _pending_observations(account.id) is None
+
+
+@pytest.mark.asyncio
+async def test_force_refresh_confirms_free_downgrade_with_access_token_override(monkeypatch) -> None:
+    """The Codex usage-identity path refreshes with an explicit access token
+    override. Confirmation must apply there too, otherwise that caller can never
+    converge an expired account."""
+    monkeypatch.setenv("CODEX_LB_USAGE_REFRESH_ENABLED", "true")
+    from app.core.config.settings import get_settings
+
+    get_settings.cache_clear()
+
+    monkeypatch.setattr(
+        "app.modules.usage.updater.fetch_usage",
+        _free_downgrade_payload_factory(["free", "free"]),
+    )
+
+    usage_repo = StubUsageRepository(return_rows=True)
+    accounts_repo = StubAccountsRepository()
+    updater = UsageUpdater(usage_repo, accounts_repo=accounts_repo)
+    account = _make_account("acc_personal_token_override", "upstream_user", email="same@example.com")
+    account.workspace_id = None
+    account.plan_type = "plus"
+    accounts_repo.accounts_by_id[account.id] = account
+
+    await updater.force_refresh(account, access_token_override="override-token")
+    assert account.plan_type == "plus"
+
+    await updater.force_refresh(account, access_token_override="override-token")
+    assert account.plan_type == "free"
+
+
+@pytest.mark.asyncio
+async def test_free_downgrade_confirms_across_an_intervening_degraded_payload(monkeypatch) -> None:
+    """An unrecognized plan value is *absence* of evidence, not evidence that the
+    account is still paid, so it must not discard a pending downgrade. Otherwise a
+    flapping upstream could block a real expiry from ever converging. Only a
+    recognized paid plan resets the pending state."""
+    monkeypatch.setenv("CODEX_LB_USAGE_REFRESH_ENABLED", "true")
+    from app.core.config.settings import get_settings
+
+    get_settings.cache_clear()
+
+    monkeypatch.setattr(
+        "app.modules.usage.updater.fetch_usage",
+        _free_downgrade_payload_factory(["free", "mystery", "free"]),
+    )
+
+    usage_repo = StubUsageRepository(return_rows=True)
+    accounts_repo = StubAccountsRepository()
+    updater = UsageUpdater(usage_repo, accounts_repo=accounts_repo)
+    account = _make_account("acc_degraded_between", "upstream_user", email="same@example.com")
+    account.workspace_id = None
+    account.plan_type = "plus"
+    accounts_repo.accounts_by_id[account.id] = account
+
+    await updater.force_refresh(account)
+    assert await _pending_observations(account.id) == 1
+
+    # The degraded payload neither confirms nor clears the pending observation.
+    await updater.force_refresh(account)
+    assert account.plan_type == "plus"
+    assert await _pending_observations(account.id) == 1
+
+    # The second real free observation therefore still confirms.
+    await updater.force_refresh(account)
+    assert account.plan_type == "free"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("payload_plan_type", ["free", " free ", "FREE", "  FrEe\t"])
+async def test_free_downgrade_confirmation_normalizes_plan_casing_and_whitespace(
+    monkeypatch,
+    payload_plan_type: str,
+) -> None:
+    """Upstream casing/whitespace must not change the outcome: each variant needs
+    the same two observations, and none of them may confirm on the first."""
+    monkeypatch.setenv("CODEX_LB_USAGE_REFRESH_ENABLED", "true")
+    from app.core.config.settings import get_settings
+
+    get_settings.cache_clear()
+
+    monkeypatch.setattr(
+        "app.modules.usage.updater.fetch_usage",
+        _free_downgrade_payload_factory([payload_plan_type, payload_plan_type]),
+    )
+
+    usage_repo = StubUsageRepository(return_rows=True)
+    accounts_repo = StubAccountsRepository()
+    updater = UsageUpdater(usage_repo, accounts_repo=accounts_repo)
+    account = _make_account("acc_case_variant", "upstream_user", email="same@example.com")
+    account.workspace_id = None
+    account.plan_type = "plus"
+    accounts_repo.accounts_by_id[account.id] = account
+
+    await updater.force_refresh(account)
+    assert account.plan_type == "plus"
+
+    await updater.force_refresh(account)
+    assert account.plan_type == "free"
+
+
+@pytest.mark.asyncio
+async def test_usage_refresh_never_confirms_free_downgrade_for_workspace_bound_account(monkeypatch) -> None:
+    """Confirmation is scoped to workspace-less accounts. A workspace-bound seat
+    must not be demoted to free by a payload that never names its workspace,
+    however many times that payload repeats: the payload cannot establish that it
+    describes this account's slot."""
+    monkeypatch.setenv("CODEX_LB_USAGE_REFRESH_ENABLED", "true")
+    from app.core.config.settings import get_settings
+
+    get_settings.cache_clear()
+
+    monkeypatch.setattr(
+        "app.modules.usage.updater.fetch_usage",
+        _free_downgrade_payload_factory(["free", "free", "free"]),
+    )
+
+    usage_repo = StubUsageRepository(return_rows=True)
+    accounts_repo = StubAccountsRepository()
+    updater = UsageUpdater(usage_repo, accounts_repo=accounts_repo)
+    account = _make_account("acc_workspace_bound_free", "upstream_user", email="same@example.com")
+    account.workspace_id = "ws_team"
+    account.plan_type = "business"
+    accounts_repo.accounts_by_id[account.id] = account
+
+    for _ in range(3):
+        await updater.force_refresh(account)
+
+    assert account.plan_type == "business"
+    assert account.workspace_id == "ws_team"
+    assert usage_repo.entries == []
+    assert accounts_repo.metadata_updates == []
+
+
+@pytest.mark.asyncio
+async def test_usage_refresh_never_confirms_conflicting_workspace_identity(monkeypatch) -> None:
+    """A payload reporting another workspace's slot stays rejected regardless of
+    repetition; confirmation must not weaken the workspace-conflict guard."""
+    monkeypatch.setenv("CODEX_LB_USAGE_REFRESH_ENABLED", "true")
+    from app.core.config.settings import get_settings
+
+    get_settings.cache_clear()
+
+    async def stub_fetch_usage(*, access_token: str, account_id: str | None, **_: Any) -> UsagePayload:
+        del access_token, account_id
+        return UsagePayload.model_validate(
+            {
+                "plan_type": "free",
+                "workspace_id": "ws_other",
+                "rate_limit": {
+                    "primary_window": {
+                        "used_percent": 10.0,
+                        "reset_at": 1736208000,
+                        "limit_window_seconds": 5 * 60 * 60,
+                    },
+                },
+            }
+        )
+
+    monkeypatch.setattr("app.modules.usage.updater.fetch_usage", stub_fetch_usage)
+
+    usage_repo = StubUsageRepository(return_rows=True)
+    accounts_repo = StubAccountsRepository()
+    updater = UsageUpdater(usage_repo, accounts_repo=accounts_repo)
+    account = _make_account("acc_workspace_conflict_repeat", "upstream_user", email="same@example.com")
+    account.workspace_id = "ws_team"
+    account.plan_type = "business"
+    accounts_repo.accounts_by_id[account.id] = account
+
+    for _ in range(3):
+        await updater.refresh_accounts([account], latest_usage={})
+
+    assert usage_repo.entries == []
+    assert accounts_repo.metadata_updates == []
+    assert account.plan_type == "business"
+    assert account.workspace_id == "ws_team"
+
+
+def _replica_module() -> Any:
+    """Import the updater a second time to stand in for another replica.
+
+    A separate module instance gives the guard its own module globals, so any
+    coherence these tests observe comes from the shared observation store rather
+    than from either module's memory. Be precise about what that proves: in the
+    unit harness the shared store is a single in-process
+    ``InMemoryPlanDowngradeObservationStore`` (installed by the autouse conftest
+    fixture), so these tests demonstrate that the guard reads and advances one
+    shared sequence — the observation-ordering logic — not that the state is
+    durable across processes. The durable, database-backed half of the claim is
+    exercised in ``tests/integration/test_plan_downgrade_observation_store.py``
+    and asserted through the product path in
+    ``tests/integration/test_accounts_api_probe.py``.
+    """
+    import importlib.util
+
+    spec = importlib.util.find_spec("app.modules.usage.updater")
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.mark.asyncio
+async def test_free_downgrade_evidence_is_shared_across_replicas(monkeypatch) -> None:
+    """Two `free` observations split across replicas must still converge.
+
+    Regression for the cross-replica half of the review on #1456: while the
+    pending count lived in process memory, each replica stalled at one
+    observation and a genuinely expired account never downgraded.
+    """
+    monkeypatch.setenv("CODEX_LB_USAGE_REFRESH_ENABLED", "true")
+    from app.core.config.settings import get_settings
+
+    get_settings.cache_clear()
+
+    monkeypatch.setattr(
+        "app.modules.usage.updater.fetch_usage",
+        _free_downgrade_payload_factory(["free"]),
+    )
+
+    usage_repo = StubUsageRepository(return_rows=True)
+    accounts_repo = StubAccountsRepository()
+    first_replica = UsageUpdater(usage_repo, accounts_repo=accounts_repo)
+    peer_module = _replica_module()
+    monkeypatch.setattr(peer_module, "fetch_usage", _free_downgrade_payload_factory(["free"]))
+    second_replica = peer_module.UsageUpdater(usage_repo, accounts_repo=accounts_repo)
+
+    account = _make_account("acc_multi_replica", "upstream_user", email="same@example.com")
+    account.workspace_id = None
+    account.plan_type = "plus"
+    accounts_repo.accounts_by_id[account.id] = account
+
+    await first_replica.force_refresh(account)
+    assert account.plan_type == "plus"
+    assert await _pending_observations(account.id) == 1
+
+    # The confirming observation lands on the OTHER replica.
+    await second_replica.force_refresh(account)
+    assert account.plan_type == "free"
+    assert await _pending_observations(account.id) is None
+
+
+@pytest.mark.asyncio
+async def test_paid_payload_on_another_replica_clears_pending_downgrade(monkeypatch) -> None:
+    """Paid evidence seen by any replica must discard the pending downgrade.
+
+    Regression for the other cross-replica failure mode: with process-local
+    state, replica A could confirm a downgrade even though replica B had already
+    observed the account reporting a paid plan in between.
+    """
+    monkeypatch.setenv("CODEX_LB_USAGE_REFRESH_ENABLED", "true")
+    from app.core.config.settings import get_settings
+
+    get_settings.cache_clear()
+
+    usage_repo = StubUsageRepository(return_rows=True)
+    accounts_repo = StubAccountsRepository()
+    first_replica = UsageUpdater(usage_repo, accounts_repo=accounts_repo)
+    peer_module = _replica_module()
+    second_replica = peer_module.UsageUpdater(usage_repo, accounts_repo=accounts_repo)
+
+    account = _make_account("acc_replica_reset", "upstream_user", email="same@example.com")
+    account.workspace_id = None
+    account.plan_type = "plus"
+    accounts_repo.accounts_by_id[account.id] = account
+
+    monkeypatch.setattr(
+        "app.modules.usage.updater.fetch_usage",
+        _free_downgrade_payload_factory(["free"]),
+    )
+    await first_replica.force_refresh(account)
+    assert await _pending_observations(account.id) == 1
+
+    # The peer replica observes a recognized paid plan, which is positive
+    # evidence the account is still paid.
+    monkeypatch.setattr(peer_module, "fetch_usage", _free_downgrade_payload_factory(["plus"]))
+    await second_replica.force_refresh(account)
+    assert await _pending_observations(account.id) is None
+
+    # The first replica's next `free` sighting is therefore observation one
+    # again, not a confirmation.
+    monkeypatch.setattr(
+        "app.modules.usage.updater.fetch_usage",
+        _free_downgrade_payload_factory(["free"]),
+    )
+    await first_replica.force_refresh(account)
+    assert account.plan_type == "plus"
+    assert await _pending_observations(account.id) == 1
+
+
+@pytest.mark.asyncio
+async def test_token_rotation_between_observations_still_confirms_downgrade(monkeypatch) -> None:
+    """Routine token rotation must not restart the confirmation count.
+
+    Refresh tokens rotate on every successful token refresh, so an account whose
+    token-refresh cadence interleaves with usage refresh rotates between the two
+    required `free` observations as a matter of course. If rotation read as a
+    credential replacement, such an account would restart at one forever and the
+    #1456 downgrade would be postponed indefinitely. Rotation extends the same
+    credential lineage; the second observation must confirm.
+    """
+    monkeypatch.setenv("CODEX_LB_USAGE_REFRESH_ENABLED", "true")
+    from app.core.config.settings import get_settings
+
+    get_settings.cache_clear()
+
+    monkeypatch.setattr(
+        "app.modules.usage.updater.fetch_usage",
+        _free_downgrade_payload_factory(["free", "free"]),
+    )
+
+    usage_repo = StubUsageRepository(return_rows=True)
+    accounts_repo = StubAccountsRepository()
+    updater = UsageUpdater(usage_repo, accounts_repo=accounts_repo)
+
+    account = _make_account("acc_rotated", "upstream_user", email="same@example.com")
+    account.workspace_id = None
+    account.plan_type = "plus"
+    accounts_repo.accounts_by_id[account.id] = account
+
+    await updater.force_refresh(account)
+    assert await _pending_observations(account.id) == 1
+    assert account.plan_type == "plus"
+
+    # Same seat, routinely rotated material: every token ciphertext changes.
+    encryptor = TokenEncryptor()
+    account.access_token_encrypted = encryptor.encrypt("access-rotated")
+    account.refresh_token_encrypted = encryptor.encrypt("refresh-rotated")
+    account.id_token_encrypted = encryptor.encrypt("id-rotated")
+
+    await updater.force_refresh(account)
+    assert account.plan_type == "free", "rotation must not restart the confirmation count"
+
+
+@pytest.mark.asyncio
+async def test_rebound_seat_identity_restarts_free_downgrade_confirmation(monkeypatch) -> None:
+    """Evidence must not carry across a change of the account's seat identity.
+
+    The fingerprint digests the seat identity, so this is the store-level
+    defense in depth for any path that rebinds a row to a different upstream
+    seat without deleting it. The ordinary replacement events reset pending
+    evidence at their own seams and are covered where they live: re-import and
+    in-place reauthentication discard evidence in the accounts repository
+    transaction (`tests/integration/test_repositories.py`,
+    `tests/integration/test_accounts_api_probe.py`), and account deletion drops
+    the row through `ondelete="CASCADE"`.
+    """
+    monkeypatch.setenv("CODEX_LB_USAGE_REFRESH_ENABLED", "true")
+    from app.core.config.settings import get_settings
+
+    get_settings.cache_clear()
+
+    monkeypatch.setattr(
+        "app.modules.usage.updater.fetch_usage",
+        _free_downgrade_payload_factory(["free", "free", "free"]),
+    )
+
+    usage_repo = StubUsageRepository(return_rows=True)
+    accounts_repo = StubAccountsRepository()
+    updater = UsageUpdater(usage_repo, accounts_repo=accounts_repo)
+
+    account = _make_account("acc_rebound", "upstream_user", email="same@example.com")
+    account.workspace_id = None
+    account.plan_type = "plus"
+    accounts_repo.accounts_by_id[account.id] = account
+
+    await updater.force_refresh(account)
+    assert await _pending_observations(account.id) == 1
+    assert account.plan_type == "plus"
+
+    # The same row now reports a different upstream seat.
+    account.chatgpt_account_id = "another_upstream_seat"
+
+    await updater.force_refresh(account)
+    assert account.plan_type == "plus", "a rebound seat must not inherit pending evidence"
+    assert await _pending_observations(account.id) == 1
+
+    # The rebound seat converges on its own second observation.
+    await updater.force_refresh(account)
+    assert account.plan_type == "free"
 
 
 class StubAccountsRepository:
     def __init__(self) -> None:
         self.status_updates: list[dict[str, Any]] = []
-        self.token_updates: list[dict[str, Any]] = []
+        self.metadata_updates: list[dict[str, Any]] = []
         self.accounts_by_id: dict[str, Account] = {}
         self.taken_workspace_slots: set[tuple[str, str | None, str]] = set()
 
     async def get_by_id(self, account_id: str) -> Account | None:
+        return self.accounts_by_id.get(account_id)
+
+    async def get_by_id_fresh(self, account_id: str) -> Account | None:
         return self.accounts_by_id.get(account_id)
 
     async def update_status(
@@ -1930,6 +2882,7 @@ class StubAccountsRepository:
         expected_deactivation_reason: str | None = None,
         expected_reset_at: int | None = None,
         expected_blocked_at: int | None = None,
+        expected_refresh_token_encrypted: bytes | None = None,
     ) -> bool:
         account = self.accounts_by_id.get(account_id)
         if (
@@ -1942,16 +2895,34 @@ class StubAccountsRepository:
             return False
         return await self.update_status(account_id, status, deactivation_reason, reset_at, blocked_at)
 
-    async def update_tokens(self, *args: Any, **kwargs: Any) -> bool:
+    async def rotate_tokens(
+        self,
+        account_id: str,
+        access_token_encrypted: bytes,
+        refresh_token_encrypted: bytes,
+        id_token_encrypted: bytes,
+        last_refresh: datetime,
+        *,
+        expected_refresh_token_encrypted: bytes,
+        plan_type: str | None = None,
+        email: str | None = None,
+        chatgpt_account_id: str | None = None,
+        chatgpt_user_id: str | None = None,
+        workspace_id: str | None = None,
+        workspace_label: str | None = None,
+        seat_type: str | None = None,
+    ) -> bool:
+        # The usage updater never rotates token material through its accounts
+        # repo (that path lives in AuthManager). Present only to satisfy the
+        # AccountsRepositoryPort protocol.
+        return True
+
+    async def update_account_metadata(self, *args: Any, **kwargs: Any) -> bool:
         account_id = args[0] if args else kwargs.get("account_id")
         if not isinstance(account_id, str):
             return True
         account = self.accounts_by_id.get(account_id)
         if account is not None:
-            account.access_token_encrypted = kwargs["access_token_encrypted"]
-            account.refresh_token_encrypted = kwargs["refresh_token_encrypted"]
-            account.id_token_encrypted = kwargs["id_token_encrypted"]
-            account.last_refresh = kwargs["last_refresh"]
             plan_type = kwargs.get("plan_type")
             email = kwargs.get("email")
             chatgpt_account_id = kwargs.get("chatgpt_account_id")
@@ -1970,7 +2941,7 @@ class StubAccountsRepository:
                 account.workspace_label = workspace_label
             if isinstance(seat_type, str):
                 account.seat_type = seat_type
-        self.token_updates.append({"account_id": account_id, **kwargs})
+        self.metadata_updates.append({"account_id": account_id, **kwargs})
         return True
 
     async def workspace_slot_taken(
@@ -2344,7 +3315,12 @@ async def test_usage_updater_persists_primary_and_secondary_usage(monkeypatch) -
 
     await updater.refresh_accounts([acc], latest_usage={})
 
+    assert len(usage_repo.snapshot_calls) == 1
+    snapshot_call = usage_repo.snapshot_calls[0]
+    assert snapshot_call.account_id == "acc_test"
+    assert [window.window for window in snapshot_call.windows] == ["primary", "secondary"]
     assert len(usage_repo.entries) == 2
+    assert {entry.recorded_at for entry in usage_repo.entries} == {snapshot_call.recorded_at}
     by_window = {entry.window: entry for entry in usage_repo.entries}
 
     primary = by_window["primary"]
@@ -2367,7 +3343,7 @@ async def test_usage_updater_persists_primary_and_secondary_usage(monkeypatch) -
 
 
 @pytest.mark.asyncio
-async def test_usage_updater_does_not_sync_conflicting_plan_without_workspace_identity(monkeypatch) -> None:
+async def test_forced_usage_refresh_syncs_free_to_plus_upgrade_without_workspace(monkeypatch) -> None:
     monkeypatch.setenv("CODEX_LB_USAGE_REFRESH_ENABLED", "true")
     from app.core.config.settings import get_settings
 
@@ -2385,10 +3361,11 @@ async def test_usage_updater_does_not_sync_conflicting_plan_without_workspace_id
     accounts_repo.accounts_by_id[acc.id] = acc
     acc.plan_type = "free"
 
-    await updater.refresh_accounts([acc], latest_usage={})
+    usage_written = await updater.force_refresh(acc, ignore_refresh_disabled=True)
 
-    assert acc.plan_type == "free"
-    assert accounts_repo.token_updates == []
+    assert usage_written is False
+    assert acc.plan_type == "plus"
+    assert accounts_repo.metadata_updates[0]["plan_type"] == "plus"
     assert usage_repo.entries == []
 
 
@@ -3366,6 +4343,344 @@ def test_latest_usage_is_fresh_returns_false_when_reset_at_has_passed() -> None:
     )
 
     assert usage_updater_module._latest_usage_is_fresh(entry, now=now, interval_seconds=60) is False
+
+
+@pytest.mark.asyncio
+async def test_refresh_accounts_fetches_when_additional_usage_ages_despite_fresh_main_rows(monkeypatch) -> None:
+    monkeypatch.setenv("CODEX_LB_USAGE_REFRESH_ENABLED", "true")
+    from app.core.config.settings import get_settings
+    from app.core.utils.time import utcnow
+
+    get_settings.cache_clear()
+    now = utcnow()
+    now_epoch = int(now.replace(tzinfo=timezone.utc).timestamp())
+
+    fetch_calls = 0
+
+    async def stub_fetch_usage(**_: Any) -> UsagePayload:
+        nonlocal fetch_calls
+        fetch_calls += 1
+        return UsagePayload.model_validate({"rate_limit": {}})
+
+    monkeypatch.setattr("app.modules.usage.updater.fetch_usage", stub_fetch_usage)
+
+    usage_repo = StubUsageRepository()
+    # Live traffic keeps the main rows fresh...
+    await usage_repo.add_entry(
+        "acc_gated",
+        30.0,
+        recorded_at=now - timedelta(seconds=5),
+        window="primary",
+        reset_at=now_epoch + 300,
+        window_minutes=300,
+    )
+    latest = await usage_repo.latest_entry_for_account("acc_gated", window="primary")
+    assert latest is not None
+
+    # ...but the additional (per-model) rows have aged past the interval:
+    # only the upstream fetch syncs them, so the fetch must still happen.
+    additional_repo = StubAdditionalUsageRepository()
+    await additional_repo.add_entry(
+        "acc_gated",
+        limit_name="codex_other",
+        metered_feature="gpt-gated",
+        window="primary",
+        used_percent=10.0,
+        recorded_at=now - timedelta(minutes=10),
+    )
+    stale_recorded_at = now - timedelta(minutes=10)
+
+    async def aged_latest_recorded_at(account_id: str):
+        return stale_recorded_at if account_id == "acc_gated" else None
+
+    monkeypatch.setattr(additional_repo, "latest_recorded_at_for_account", aged_latest_recorded_at)
+
+    acc = _make_account("acc_gated", "workspace_gated", email="gated@example.com")
+
+    updater = UsageUpdater(usage_repo, accounts_repo=None, additional_usage_repo=additional_repo)
+    await updater.refresh_accounts([acc], latest_usage={"acc_gated": latest})
+
+    assert fetch_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_refresh_accounts_fetches_when_no_additional_rows_were_ever_synced(monkeypatch) -> None:
+    monkeypatch.setenv("CODEX_LB_USAGE_REFRESH_ENABLED", "true")
+    from app.core.config.settings import get_settings
+    from app.core.utils.time import utcnow
+
+    get_settings.cache_clear()
+    now = utcnow()
+    now_epoch = int(now.replace(tzinfo=timezone.utc).timestamp())
+
+    fetch_calls = 0
+
+    async def stub_fetch_usage(**_: Any) -> UsagePayload:
+        nonlocal fetch_calls
+        fetch_calls += 1
+        return UsagePayload.model_validate({"rate_limit": {}})
+
+    monkeypatch.setattr("app.modules.usage.updater.fetch_usage", stub_fetch_usage)
+
+    usage_repo = StubUsageRepository()
+    await usage_repo.add_entry(
+        "acc_undiscovered",
+        30.0,
+        recorded_at=now - timedelta(seconds=5),
+        window="primary",
+        reset_at=now_epoch + 300,
+        window_minutes=300,
+    )
+    latest = await usage_repo.latest_entry_for_account("acc_undiscovered", window="primary")
+    assert latest is not None
+
+    # An additional-usage repo is configured but no rows were ever synced:
+    # live rows alone must not suppress the discovery fetch.
+    additional_repo = StubAdditionalUsageRepository()
+
+    acc = _make_account("acc_undiscovered", "workspace_undiscovered", email="undiscovered@example.com")
+
+    updater = UsageUpdater(usage_repo, accounts_repo=None, additional_usage_repo=additional_repo)
+    await updater.refresh_accounts([acc], latest_usage={"acc_undiscovered": latest})
+
+    assert fetch_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_refresh_accounts_skips_fetch_when_additional_usage_is_fresh(monkeypatch) -> None:
+    monkeypatch.setenv("CODEX_LB_USAGE_REFRESH_ENABLED", "true")
+    from app.core.config.settings import get_settings
+    from app.core.utils.time import utcnow
+
+    get_settings.cache_clear()
+    now = utcnow()
+    now_epoch = int(now.replace(tzinfo=timezone.utc).timestamp())
+
+    fetch_calls = 0
+
+    async def stub_fetch_usage(**_: Any) -> UsagePayload:
+        nonlocal fetch_calls
+        fetch_calls += 1
+        return UsagePayload.model_validate({"rate_limit": {}})
+
+    monkeypatch.setattr("app.modules.usage.updater.fetch_usage", stub_fetch_usage)
+
+    usage_repo = StubUsageRepository()
+    await usage_repo.add_entry(
+        "acc_gated_fresh",
+        30.0,
+        recorded_at=now - timedelta(seconds=5),
+        window="primary",
+        reset_at=now_epoch + 300,
+        window_minutes=300,
+    )
+    latest = await usage_repo.latest_entry_for_account("acc_gated_fresh", window="primary")
+    assert latest is not None
+
+    additional_repo = StubAdditionalUsageRepository()
+    await additional_repo.add_entry(
+        "acc_gated_fresh",
+        limit_name="codex_other",
+        metered_feature="gpt-gated",
+        window="primary",
+        used_percent=10.0,
+        recorded_at=now - timedelta(seconds=5),
+    )
+
+    acc = _make_account("acc_gated_fresh", "workspace_gated_fresh", email="gated-fresh@example.com")
+
+    updater = UsageUpdater(usage_repo, accounts_repo=None, additional_usage_repo=additional_repo)
+    await updater.refresh_accounts([acc], latest_usage={"acc_gated_fresh": latest})
+
+    assert fetch_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_refresh_accounts_skips_fetch_when_newer_sibling_row_supersedes_elapsed_primary(monkeypatch) -> None:
+    monkeypatch.setenv("CODEX_LB_USAGE_REFRESH_ENABLED", "true")
+    from app.core.config.settings import get_settings
+    from app.core.utils.time import utcnow
+
+    get_settings.cache_clear()
+    now = utcnow()
+    now_epoch = int(now.replace(tzinfo=timezone.utc).timestamp())
+
+    fetch_calls = 0
+
+    async def stub_fetch_usage(**_: Any) -> UsagePayload:
+        nonlocal fetch_calls
+        fetch_calls += 1
+        return UsagePayload.model_validate({"rate_limit": {}})
+
+    monkeypatch.setattr("app.modules.usage.updater.fetch_usage", stub_fetch_usage)
+
+    usage_repo = StubUsageRepository()
+    # Upstream stopped reporting the primary window: the primary row keeps
+    # its elapsed reset while a later fetch wrote only a secondary row.
+    await usage_repo.add_entry(
+        "acc_sibling",
+        87.0,
+        recorded_at=now - timedelta(hours=3),
+        window="primary",
+        reset_at=now_epoch - 7200,
+        window_minutes=300,
+    )
+    await usage_repo.add_entry(
+        "acc_sibling",
+        40.0,
+        recorded_at=now - timedelta(seconds=10),
+        window="secondary",
+        reset_at=now_epoch + 5 * 24 * 3600,
+        window_minutes=10080,
+    )
+    latest = await usage_repo.latest_entry_for_account("acc_sibling", window="primary")
+    assert latest is not None
+
+    acc = _make_account("acc_sibling", "workspace_sibling", email="sibling@example.com")
+
+    updater = UsageUpdater(usage_repo, accounts_repo=None)
+    await updater.refresh_accounts([acc], latest_usage={"acc_sibling": latest})
+
+    assert fetch_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_refresh_accounts_skips_fetch_when_only_fresh_secondary_row_exists(monkeypatch) -> None:
+    monkeypatch.setenv("CODEX_LB_USAGE_REFRESH_ENABLED", "true")
+    from app.core.config.settings import get_settings
+    from app.core.utils.time import utcnow
+
+    get_settings.cache_clear()
+    now = utcnow()
+    now_epoch = int(now.replace(tzinfo=timezone.utc).timestamp())
+
+    fetch_calls = 0
+
+    async def stub_fetch_usage(**_: Any) -> UsagePayload:
+        nonlocal fetch_calls
+        fetch_calls += 1
+        return UsagePayload.model_validate({"rate_limit": {}})
+
+    monkeypatch.setattr("app.modules.usage.updater.fetch_usage", stub_fetch_usage)
+
+    usage_repo = StubUsageRepository()
+    # Upstream omitted the short window from the very first fetch: the
+    # account has only a fresh secondary row and no primary row at all.
+    await usage_repo.add_entry(
+        "acc_secondary_only",
+        40.0,
+        recorded_at=now - timedelta(seconds=10),
+        window="secondary",
+        reset_at=now_epoch + 5 * 24 * 3600,
+        window_minutes=10080,
+    )
+
+    acc = _make_account("acc_secondary_only", "workspace_secondary_only", email="secondary-only@example.com")
+
+    updater = UsageUpdater(usage_repo, accounts_repo=None)
+    await updater.refresh_accounts([acc], latest_usage={})
+
+    assert fetch_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_refresh_accounts_ignores_lingering_monthly_rows_for_paid_plans(monkeypatch) -> None:
+    monkeypatch.setenv("CODEX_LB_USAGE_REFRESH_ENABLED", "true")
+    from app.core.config.settings import get_settings
+    from app.core.utils.time import utcnow
+
+    get_settings.cache_clear()
+    now = utcnow()
+    now_epoch = int(now.replace(tzinfo=timezone.utc).timestamp())
+
+    fetch_calls = 0
+
+    async def stub_fetch_usage(**_: Any) -> UsagePayload:
+        nonlocal fetch_calls
+        fetch_calls += 1
+        return UsagePayload.model_validate({"rate_limit": {}})
+
+    monkeypatch.setattr("app.modules.usage.updater.fetch_usage", stub_fetch_usage)
+
+    usage_repo = StubUsageRepository()
+    # A stale primary row plus a lingering monthly row from a former free
+    # plan: the monthly row is not applicable to a plus account and must
+    # not suppress the refresh.
+    await usage_repo.add_entry(
+        "acc_upgraded",
+        87.0,
+        recorded_at=now - timedelta(hours=3),
+        window="primary",
+        reset_at=now_epoch - 7200,
+        window_minutes=300,
+    )
+    await usage_repo.add_entry(
+        "acc_upgraded",
+        40.0,
+        recorded_at=now - timedelta(seconds=10),
+        window="monthly",
+        reset_at=now_epoch + 30 * 24 * 3600,
+        window_minutes=43200,
+    )
+    latest = await usage_repo.latest_entry_for_account("acc_upgraded", window="primary")
+    assert latest is not None
+
+    acc = _make_account("acc_upgraded", "workspace_upgraded", email="upgraded@example.com")
+    acc.plan_type = "plus"
+
+    updater = UsageUpdater(usage_repo, accounts_repo=None)
+    await updater.refresh_accounts([acc], latest_usage={"acc_upgraded": latest})
+
+    assert fetch_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_refresh_accounts_still_fetches_when_elapsed_primary_has_no_newer_sibling(monkeypatch) -> None:
+    monkeypatch.setenv("CODEX_LB_USAGE_REFRESH_ENABLED", "true")
+    from app.core.config.settings import get_settings
+    from app.core.utils.time import utcnow
+
+    get_settings.cache_clear()
+    now = utcnow()
+    now_epoch = int(now.replace(tzinfo=timezone.utc).timestamp())
+
+    fetch_calls = 0
+
+    async def stub_fetch_usage(**_: Any) -> UsagePayload:
+        nonlocal fetch_calls
+        fetch_calls += 1
+        return UsagePayload.model_validate({"rate_limit": {}})
+
+    monkeypatch.setattr("app.modules.usage.updater.fetch_usage", stub_fetch_usage)
+
+    usage_repo = StubUsageRepository()
+    # Both rows came from the same fetch (sub-second apart): the elapsed
+    # primary reset must still force an upstream fetch.
+    await usage_repo.add_entry(
+        "acc_same_fetch",
+        87.0,
+        recorded_at=now - timedelta(seconds=10),
+        window="primary",
+        reset_at=now_epoch - 5,
+        window_minutes=300,
+    )
+    await usage_repo.add_entry(
+        "acc_same_fetch",
+        40.0,
+        recorded_at=now - timedelta(seconds=9),
+        window="secondary",
+        reset_at=now_epoch + 5 * 24 * 3600,
+        window_minutes=10080,
+    )
+    latest = await usage_repo.latest_entry_for_account("acc_same_fetch", window="primary")
+    assert latest is not None
+
+    acc = _make_account("acc_same_fetch", "workspace_same_fetch", email="same-fetch@example.com")
+
+    updater = UsageUpdater(usage_repo, accounts_repo=None)
+    await updater.refresh_accounts([acc], latest_usage={"acc_same_fetch": latest})
+
+    assert fetch_calls == 1
 
 
 @pytest.mark.asyncio

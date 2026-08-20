@@ -240,6 +240,37 @@ Before a PR is squash-merged into `main`:
 5. **`Fixes #N` / `Closes #N` in the PR body** for anything that
    resolves an issue, so the issue close stays automatic and the merge
    stays traceable. Use `Refs #N` / `Related to #N` for partial cover.
+6. **Simplicity gates must pass** (see
+   [Simplicity gates](#simplicity-gates)): the five simplicity rules
+   (PRINCIPLES.md P1-P5). Budget exceptions need the
+   maintainer-applied `simplicity-budget-approved` label.
+
+### Simplicity gates
+
+These implement [PRINCIPLES.md](../PRINCIPLES.md); the normative spec is
+`openspec/specs/contribution-simplicity/spec.md` (created when the
+codify-simplicity-principles change is archived). Reviewers apply them to
+every PR (budget checks are enforced by CI as of the
+`ci-simplicity-budgets` change; reviewer-enforced before that):
+
+1. **New features default to off or zero-config.** No new required
+   setup step (env var, migration action, external account, manual
+   file edit) on the base install path without maintainer approval via
+   the `simplicity-budget-approved` label.
+2. **Every new `CODEX_LB_*` setting justifies not being a default.**
+   The PR body answers "why can't this be a hardcoded default?" for
+   each new setting; internals-only knobs stay out of `.env.example`.
+3. **README, `.env.example`, and dashboard nav are budgeted.** The
+   caps live in `.github/simplicity-budgets.toml` (introduced by the
+   `ci-simplicity-budgets` change; until that manifest exists on
+   `main`, reviewers judge growth of these surfaces directionally
+   rather than against numeric caps). Exceeding a cap requires the
+   maintainer-applied `simplicity-budget-approved` label before merge.
+4. **Feature docs go to `docs/` + OpenSpec, never new README
+   sections.** Each spec-governed docs page links back to its
+   `openspec/specs/<capability>/` entry.
+5. **Dashboard-visible PRs include before/after screenshots** (or a
+   short recording) in the PR body.
 
 ### Collaborator rules
 
@@ -313,6 +344,40 @@ Releases are automated via [release-please](https://github.com/googleapis/releas
 
 Contributors **never** need to edit `CHANGELOG.md`, version strings, or tag
 manually.
+
+### Release channels: beta first
+
+Stable releases are promoted from the beta channel, not cut directly:
+
+1. A `vX.Y.Z-beta.N` release ships first (the beta release PR).
+2. The beta soaks on at least one production-scale deployment for **at least
+   48 hours** with no new regressions attributable to the release.
+3. Only then is the stable `vX.Y.Z` release PR merged.
+
+Rationale: migrations and proxy-path changes routinely behave differently at
+production data volumes than in CI. The beta soak is where migration duration,
+memory pressure, and upstream-protocol regressions surface without burning a
+stable version number.
+
+Exceptions — a maintainer may promote directly to stable, noting the reason in
+the release PR, when the **entire** unsoaked delta consists of (any
+combination of):
+
+- documentation, CI, or release-tooling changes, or
+- a security or outage hotfix where waiting out the soak is the greater risk.
+
+A train that also carries unrelated unsoaked changes must either soak as a
+beta or ship the hotfix separately.
+
+Before merging a release PR whose train includes migrations, inspect the
+Alembic revisions directly (`git diff vPREV..HEAD -- app/db/alembic/versions`)
+for data backfills and estimate their duration against a production-sized
+dataset — they run at startup and block serving until they finish. Changelog
+titles do not reveal backfills.
+
+The normative requirements live in
+[`openspec/specs/release-management/`](../openspec/specs/release-management/)
+(delta: `openspec/changes/require-beta-soak-before-stable/`).
 
 ## Security issues
 

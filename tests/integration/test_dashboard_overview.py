@@ -8,10 +8,11 @@ import pytest
 
 from app.core.crypto import TokenEncryptor
 from app.core.utils.time import naive_utc_to_epoch, utcnow
-from app.db.models import Account, AccountStatus
+from app.db.models import Account, AccountStatus, RequestLog
 from app.db.session import SessionLocal
 from app.modules.accounts.repository import AccountsRepository
 from app.modules.accounts.schemas import AccountSummary
+from app.modules.accounts.usage_time_rollup import run_hourly_fold_pass
 from app.modules.dashboard.weekly_pace import _weekly_timing
 from app.modules.request_logs.repository import RequestLogsRepository
 from app.modules.usage.repository import UsageRepository
@@ -108,6 +109,7 @@ async def test_dashboard_overview_combines_data(async_client, db_setup):
             latency_ms=50,
             status="success",
             error_code=None,
+            conversation_id="conv-dash",
             requested_at=now - timedelta(minutes=1),
         )
 
@@ -143,10 +145,199 @@ async def test_dashboard_overview_combines_data(async_client, db_setup):
     assert len(trends["tokens"]) == 28
     assert len(trends["cost"]) == 28
     assert len(trends["errorRate"]) == 28
+    assert len(trends["conversations"]) == 28
 
     # At least one trend point should have non-zero request count
     request_values = [p["v"] for p in trends["requests"]]
     assert any(v > 0 for v in request_values)
+    conversation_values = [p["v"] for p in trends["conversations"]]
+    assert any(v > 0 for v in conversation_values)
+
+
+@pytest.mark.asyncio
+async def test_dashboard_overview_counts_distinct_nonblank_conversations_in_timeframe(
+    async_client,
+    db_setup,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    now = datetime(2026, 4, 3, 10, 37, 0)
+    monkeypatch.setattr("app.modules.dashboard.service.utcnow", lambda: now)
+
+    async with SessionLocal() as session:
+        accounts_repo = AccountsRepository(session)
+        await accounts_repo.upsert(_make_account("acc_dash_conversations", "dash-conversations@example.com"))
+        session.add_all(
+            [
+                RequestLog(
+                    account_id="acc_dash_conversations",
+                    request_id="dash-conversation-1",
+                    requested_at=now - timedelta(minutes=5),
+                    model="gpt-5.1",
+                    status="success",
+                    conversation_id="conv-a",
+                ),
+                RequestLog(
+                    account_id="acc_dash_conversations",
+                    request_id="dash-conversation-2",
+                    requested_at=now - timedelta(minutes=4),
+                    model="gpt-5.1",
+                    status="success",
+                    conversation_id="conv-a",
+                ),
+                RequestLog(
+                    account_id="acc_dash_conversations",
+                    request_id="dash-conversation-3",
+                    requested_at=now - timedelta(minutes=3),
+                    model="gpt-5.1",
+                    status="success",
+                    conversation_id="conv-b",
+                ),
+                RequestLog(
+                    account_id="acc_dash_conversations",
+                    request_id="dash-conversation-repeat-other-bucket",
+                    requested_at=now - timedelta(hours=1, minutes=5),
+                    model="gpt-5.1",
+                    status="success",
+                    conversation_id="conv-a",
+                ),
+                RequestLog(
+                    account_id="acc_dash_conversations",
+                    request_id="dash-conversation-null",
+                    requested_at=now - timedelta(minutes=2),
+                    model="gpt-5.1",
+                    status="success",
+                    conversation_id=None,
+                ),
+                RequestLog(
+                    account_id="acc_dash_conversations",
+                    request_id="dash-conversation-empty",
+                    requested_at=now - timedelta(minutes=1),
+                    model="gpt-5.1",
+                    status="success",
+                    conversation_id="",
+                ),
+                RequestLog(
+                    account_id="acc_dash_conversations",
+                    request_id="dash-conversation-whitespace",
+                    requested_at=now,
+                    model="gpt-5.1",
+                    status="success",
+                    conversation_id="   ",
+                ),
+                RequestLog(
+                    account_id="acc_dash_conversations",
+                    request_id="dash-conversation-tab",
+                    requested_at=now,
+                    model="gpt-5.1",
+                    status="success",
+                    conversation_id="\t",
+                ),
+                RequestLog(
+                    account_id="acc_dash_conversations",
+                    request_id="dash-conversation-newline",
+                    requested_at=now,
+                    model="gpt-5.1",
+                    status="success",
+                    conversation_id="\n",
+                ),
+                RequestLog(
+                    account_id="acc_dash_conversations",
+                    request_id="dash-conversation-warmup",
+                    requested_at=now - timedelta(minutes=1),
+                    model="gpt-5.1",
+                    status="success",
+                    request_kind="warmup",
+                    conversation_id="conv-warmup",
+                ),
+                RequestLog(
+                    account_id="acc_dash_conversations",
+                    request_id="dash-conversation-old",
+                    requested_at=now - timedelta(days=2),
+                    model="gpt-5.1",
+                    status="success",
+                    conversation_id="conv-old",
+                ),
+            ]
+        )
+        await session.commit()
+
+    response = await async_client.get("/api/dashboard/overview?timeframe=1d")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["summary"]["metrics"]["conversations"] == 2
+    assert payload["summary"]["metrics"]["conversationRequests"] == 4
+
+    populated_conversation_values = [point["v"] for point in payload["trends"]["conversations"] if point["v"] > 0]
+    assert populated_conversation_values == [1.0, 2.0]
+    assert max(populated_conversation_values) == 2.0
+    assert sum(point["v"] for point in payload["trends"]["conversations"]) == 3.0
+
+
+@pytest.mark.asyncio
+async def test_conversation_list_agrees_with_dashboard_activity_window(
+    async_client,
+    db_setup,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    now = utcnow().replace(microsecond=0)
+    monkeypatch.setattr("app.modules.dashboard.service.utcnow", lambda: now)
+    since = now - timedelta(days=1)
+
+    async with SessionLocal() as session:
+        accounts_repo = AccountsRepository(session)
+        await accounts_repo.upsert(_make_account("acc_conversation_window", "conversation-window@example.com"))
+        session.add_all(
+            [
+                RequestLog(
+                    account_id="acc_conversation_window",
+                    request_id="conversation-window-old",
+                    requested_at=now - timedelta(days=2),
+                    model="gpt-5.1",
+                    status="success",
+                    conversation_id="conv-a",
+                ),
+                RequestLog(
+                    account_id="acc_conversation_window",
+                    request_id="conversation-window-active",
+                    requested_at=now - timedelta(hours=1),
+                    model="gpt-5.1",
+                    status="success",
+                    conversation_id="conv-a",
+                ),
+                RequestLog(
+                    account_id="acc_conversation_window",
+                    request_id="conversation-window-outside",
+                    requested_at=now - timedelta(days=2),
+                    model="gpt-5.1",
+                    status="success",
+                    conversation_id="conv-b",
+                ),
+                RequestLog(
+                    account_id="acc_conversation_window",
+                    request_id="conversation-window-deleted",
+                    requested_at=now - timedelta(hours=2),
+                    model="gpt-5.1",
+                    status="success",
+                    conversation_id="conv-deleted",
+                    deleted_at=now - timedelta(hours=1),
+                ),
+            ]
+        )
+        await session.commit()
+
+    conversations_response = await async_client.get("/api/conversations", params={"since": since.isoformat()})
+    dashboard_response = await async_client.get("/api/dashboard/overview?timeframe=1d")
+
+    assert conversations_response.status_code == 200
+    assert dashboard_response.status_code == 200
+    conversations = conversations_response.json()
+    dashboard = dashboard_response.json()
+    assert [row["conversationId"] for row in conversations["conversations"]] == ["conv-a"]
+    assert conversations["total"] == 1
+    assert dashboard["summary"]["metrics"]["conversations"] == 1
+    assert dashboard["summary"]["metrics"]["conversationRequests"] == 1
+    assert sum(point["v"] for point in dashboard["trends"]["conversations"]) == 1.0
 
 
 @pytest.mark.asyncio
@@ -228,6 +419,55 @@ async def test_dashboard_overview_maps_weekly_only_primary_to_secondary(async_cl
     assert accounts["acc_free"]["windowMinutesPrimary"] is None
     assert accounts["acc_free"]["windowMinutesSecondary"] == 10080
     assert accounts["acc_free"]["usage"]["secondaryRemainingPercent"] == pytest.approx(80.0)
+
+
+@pytest.mark.asyncio
+async def test_dashboard_overview_weekly_primary_beats_no_data_secondary_placeholder(async_client, db_setup):
+    # Regression: upstream reports the weekly window in the primary slot and an
+    # empty no-data secondary placeholder (used_percent=0, no window duration, no
+    # reset). Both rows are written milliseconds apart in the same fetch. Before
+    # the data-aware tiebreak, the sub-second younger placeholder won and the
+    # dashboard weekly remaining jumped to 100%. The real weekly used_percent
+    # must drive the secondary remaining percent instead.
+    now = utcnow().replace(microsecond=0)
+    reset_at = int(naive_utc_to_epoch(now + timedelta(days=2)))
+
+    async with SessionLocal() as session:
+        accounts_repo = AccountsRepository(session)
+        usage_repo = UsageRepository(session)
+
+        await accounts_repo.upsert(_make_account("acc_weekly_placeholder", "weekly-placeholder@example.com"))
+
+        # Real weekly window reported in the primary slot.
+        await usage_repo.add_entry(
+            "acc_weekly_placeholder",
+            74.0,
+            window="primary",
+            window_minutes=10080,
+            reset_at=reset_at,
+            recorded_at=now - timedelta(milliseconds=13),
+        )
+        # Empty secondary placeholder written ~13ms later in the same fetch.
+        await usage_repo.add_entry(
+            "acc_weekly_placeholder",
+            0.0,
+            window="secondary",
+            window_minutes=0,
+            reset_at=None,
+            recorded_at=now,
+        )
+
+    response = await async_client.get("/api/dashboard/overview")
+    assert response.status_code == 200
+    payload = response.json()
+
+    account = payload["accounts"][0]
+    # The weekly primary row (74% used) must be remapped onto the secondary
+    # slot, not the no-data placeholder (0% used -> 100% remaining).
+    assert account["windowMinutesPrimary"] is None
+    assert account["windowMinutesSecondary"] == 10080
+    assert account["usage"]["secondaryRemainingPercent"] == pytest.approx(26.0)
+    assert account["remainingCreditsSecondary"] == pytest.approx(7560.0 * 0.26)
 
 
 @pytest.mark.asyncio
@@ -803,6 +1043,7 @@ async def test_dashboard_overview_respects_selected_timeframe(
             latency_ms=50,
             status="success",
             error_code=None,
+            conversation_id="conv-timeframe-recent",
             requested_at=now - timedelta(hours=3),
         )
         await logs_repo.add_log(
@@ -814,6 +1055,7 @@ async def test_dashboard_overview_respects_selected_timeframe(
             latency_ms=50,
             status="error",
             error_code="rate_limit_exceeded",
+            conversation_id="conv-timeframe-old",
             requested_at=now - timedelta(days=2),
         )
 
@@ -823,8 +1065,10 @@ async def test_dashboard_overview_respects_selected_timeframe(
 
     assert payload["timeframe"]["key"] == timeframe
     assert payload["timeframe"]["bucketCount"] == expected_bucket_count
-    assert len(payload["trends"]["requests"]) == expected_bucket_count
+    assert all(len(series) == expected_bucket_count for series in payload["trends"].values())
+    assert any(point["v"] > 0 for point in payload["trends"]["conversations"])
     assert payload["summary"]["metrics"]["requests"] == expected_requests
+    assert payload["summary"]["metrics"]["conversations"] == expected_requests
     if timeframe == "1d":
         assert payload["summary"]["metrics"]["errorCount"] == 0
         assert payload["summary"]["metrics"]["topError"] is None
@@ -869,6 +1113,7 @@ async def test_dashboard_overview_supports_custom_date_range(
             latency_ms=50,
             status="success",
             error_code=None,
+            conversation_id="conv-custom-previous",
             requested_at=datetime(2026, 3, 31, 12, 0, 0),
         )
         await logs_repo.add_log(
@@ -880,6 +1125,7 @@ async def test_dashboard_overview_supports_custom_date_range(
             latency_ms=50,
             status="success",
             error_code=None,
+            conversation_id="conv-custom-one",
             requested_at=datetime(2026, 4, 1, 12, 0, 0),
         )
         await logs_repo.add_log(
@@ -891,6 +1137,7 @@ async def test_dashboard_overview_supports_custom_date_range(
             latency_ms=50,
             status="error",
             error_code="rate_limit_exceeded",
+            conversation_id="conv-custom-two",
             requested_at=datetime(2026, 4, 3, 12, 0, 0),
         )
         await logs_repo.add_log(
@@ -902,12 +1149,11 @@ async def test_dashboard_overview_supports_custom_date_range(
             latency_ms=50,
             status="success",
             error_code=None,
+            conversation_id="conv-custom-after",
             requested_at=datetime(2026, 4, 4, 12, 0, 0),
         )
 
-    response = await async_client.get(
-        "/api/dashboard/overview?start_date=2026-04-01&end_date=2026-04-03&timezone=UTC"
-    )
+    response = await async_client.get("/api/dashboard/overview?start_date=2026-04-01&end_date=2026-04-03&timezone=UTC")
     assert response.status_code == 200
 
     payload = response.json()
@@ -921,8 +1167,152 @@ async def test_dashboard_overview_supports_custom_date_range(
     assert payload["summary"]["metrics"]["tokens"] == 450
     assert payload["summary"]["metrics"]["errorCount"] == 1
     assert payload["summary"]["metrics"]["topError"] == "rate_limit_exceeded"
+    assert payload["summary"]["metrics"]["conversations"] == 2
+    assert sum(point["v"] for point in payload["trends"]["conversations"]) == 2
     assert payload["summary"]["comparison"]["previous"]["requests"] == 1
     assert len(payload["trends"]["requests"]) == 3
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("start_date", "end_date", "expected_starts"),
+    [
+        (
+            "2026-06-01",
+            "2026-06-07",
+            [f"2026-06-{day:02d}T06:00:00Z" for day in range(1, 8)],
+        ),
+        (
+            "2026-03-07",
+            "2026-03-09",
+            [
+                "2026-03-07T07:00:00Z",
+                "2026-03-08T07:00:00Z",
+                "2026-03-09T06:00:00Z",
+            ],
+        ),
+        (
+            "2025-11-01",
+            "2025-11-03",
+            [
+                "2025-11-01T06:00:00Z",
+                "2025-11-02T06:00:00Z",
+                "2025-11-03T07:00:00Z",
+            ],
+        ),
+    ],
+)
+async def test_dashboard_custom_range_uses_denver_calendar_day_buckets(
+    async_client,
+    db_setup,
+    monkeypatch: pytest.MonkeyPatch,
+    start_date: str,
+    end_date: str,
+    expected_starts: list[str],
+):
+    monkeypatch.setattr("app.modules.dashboard.service.utcnow", lambda: datetime(2026, 12, 1, 12, 0, 0))
+
+    response = await async_client.get(
+        "/api/dashboard/overview",
+        params={
+            "start_date": start_date,
+            "end_date": end_date,
+            "timezone": "America/Denver",
+        },
+    )
+    assert response.status_code == 200
+
+    payload = response.json()
+    assert payload["timeframe"]["bucketSeconds"] == 86400
+    assert payload["timeframe"]["bucketCount"] == len(expected_starts)
+    assert [point["t"] for point in payload["trends"]["requests"]] == expected_starts
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("calendar_date", "expected_bucket_count"),
+    [
+        ("2026-03-08", 23),
+        ("2025-11-02", 25),
+    ],
+)
+async def test_dashboard_single_day_range_tracks_denver_dst_hour_count(
+    async_client,
+    db_setup,
+    monkeypatch: pytest.MonkeyPatch,
+    calendar_date: str,
+    expected_bucket_count: int,
+):
+    monkeypatch.setattr("app.modules.dashboard.service.utcnow", lambda: datetime(2026, 12, 1, 12, 0, 0))
+
+    response = await async_client.get(
+        "/api/dashboard/overview",
+        params={
+            "start_date": calendar_date,
+            "end_date": calendar_date,
+            "timezone": "America/Denver",
+        },
+    )
+    assert response.status_code == 200
+
+    payload = response.json()
+    assert payload["timeframe"]["bucketSeconds"] == 3600
+    assert payload["timeframe"]["bucketCount"] == expected_bucket_count
+    assert len(payload["trends"]["requests"]) == expected_bucket_count
+
+
+@pytest.mark.asyncio
+async def test_dashboard_custom_range_separates_non_hour_offset_local_days(
+    async_client,
+    db_setup,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr("app.modules.dashboard.service.utcnow", lambda: datetime(2026, 12, 1, 12, 0, 0))
+
+    async with SessionLocal() as session:
+        logs_repo = RequestLogsRepository(session)
+        await logs_repo.add_log(
+            account_id=None,
+            request_id="req_kathmandu_before_midnight",
+            model="gpt-5.1",
+            input_tokens=10,
+            output_tokens=5,
+            latency_ms=50,
+            status="success",
+            error_code=None,
+            conversation_id="conv-kathmandu-before",
+            requested_at=datetime(2026, 6, 1, 18, 10, 0),
+        )
+        await logs_repo.add_log(
+            account_id=None,
+            request_id="req_kathmandu_after_midnight",
+            model="gpt-5.1",
+            input_tokens=20,
+            output_tokens=10,
+            latency_ms=50,
+            status="success",
+            error_code=None,
+            conversation_id="conv-kathmandu-after",
+            requested_at=datetime(2026, 6, 1, 18, 20, 0),
+        )
+
+    # Both rows share one folded UTC-hour row even though the local midnight
+    # between them requires separate Dashboard days.
+    await run_hourly_fold_pass(now=datetime(2026, 6, 3, 12, 0, 0))
+
+    response = await async_client.get(
+        "/api/dashboard/overview",
+        params={
+            "start_date": "2026-06-01",
+            "end_date": "2026-06-02",
+            "timezone": "Asia/Kathmandu",
+        },
+    )
+    assert response.status_code == 200
+
+    payload = response.json()
+    assert [point["v"] for point in payload["trends"]["requests"]] == [1.0, 1.0]
+    assert [point["v"] for point in payload["trends"]["conversations"]] == [1.0, 1.0]
 
 
 @pytest.mark.asyncio

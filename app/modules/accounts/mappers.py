@@ -121,6 +121,7 @@ def _account_to_summary(
 
     if monthly_usage is not None and usage_core.capacity_for_plan(plan_type, "monthly") is None:
         monthly_usage = None
+    usage_refreshed_at = _latest_usage_recorded_at(primary_usage, secondary_usage, monthly_usage)
     monthly_used_percent = _normalize_used_percent(monthly_usage)
     monthly_remaining_percent = usage_core.remaining_percent_from_used(monthly_used_percent)
     if monthly_usage is not None:
@@ -139,11 +140,17 @@ def _account_to_summary(
     primary_remaining_percent = usage_core.remaining_percent_from_used(primary_used_percent)
     secondary_remaining_percent = usage_core.remaining_percent_from_used(secondary_used_percent)
 
-    if primary_remaining_percent is None and not weekly_only_usage:
-        primary_remaining_percent = 100.0
-
     status_primary_usage = effective_primary_usage
     status_primary_used_percent = primary_used_percent
+    now_epoch = int(datetime.now(timezone.utc).timestamp())
+    if _display_window_expired(status_primary_usage, now_epoch):
+        # Mirror routing (`_state_from_account`): an elapsed primary sample
+        # describes a reset window, not exhaustion evidence. Zero the used
+        # percentage (not None, so usage-derived recovery still evaluates)
+        # and drop the stale reset so a frozen >=100% sample cannot infer a
+        # rate-limited badge the selector would never apply.
+        status_primary_usage = None
+        status_primary_used_percent = 0.0
     status_runtime_reset = float(account.reset_at) if account.reset_at else None
     status_seed = account.status
     allow_missing_runtime_reset_recovery = False
@@ -232,6 +239,20 @@ def _account_to_summary(
         credits_balance=credits_balance,
         allow_missing_runtime_reset_recovery=allow_missing_runtime_reset_recovery,
     )
+    # Display-only expiry for the SHORT window: a primary sample whose reset
+    # elapsed is not an active window — show it as absent instead of
+    # freezing the stale sample (upstream may have stopped reporting the
+    # window entirely). Long windows stay raw: weekly/monthly consumers
+    # (e.g. the weekly credit pace) advance elapsed resets by design, and
+    # upstream still reports them so staleness is transient. Status
+    # derivation above expired the sample the same way routing does, so the
+    # badge stays aligned with the selector.
+    if _display_window_expired(effective_primary_usage, now_epoch):
+        primary_remaining_percent = None
+        remaining_credits_primary = None
+        reset_at_primary = None
+        window_minutes_primary = None
+
     return AccountSummary(
         account_id=account.id,
         chatgpt_account_id=account.chatgpt_account_id,
@@ -257,6 +278,7 @@ def _account_to_summary(
         window_minutes_secondary=window_minutes_secondary,
         window_minutes_monthly=window_minutes_monthly,
         last_refresh_at=account.last_refresh,
+        usage_refreshed_at=usage_refreshed_at,
         capacity_credits_primary=capacity_primary,
         remaining_credits_primary=remaining_credits_primary,
         capacity_credits_secondary=capacity_secondary,
@@ -282,6 +304,13 @@ def _normalize_account_routing_policy(value: str | None) -> str:
     if value in _ACCOUNT_ROUTING_POLICIES:
         return value
     return "normal"
+
+
+def _latest_usage_recorded_at(*entries: UsageHistory | None) -> datetime | None:
+    recorded_at = [entry.recorded_at for entry in entries if entry is not None and entry.recorded_at is not None]
+    if not recorded_at:
+        return None
+    return max(recorded_at, key=lambda value: value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value)
 
 
 def _reset_credits_snapshot_for_account(
@@ -393,6 +422,10 @@ def _usage_entry_is_recent_enough(recorded_at: datetime | None) -> bool:
 def _usage_refresh_interval_seconds() -> int:
     settings = config_settings.get_settings()
     return int(getattr(settings, "usage_refresh_interval_seconds", _DEFAULT_USAGE_REFRESH_INTERVAL_SECONDS))
+
+
+def _display_window_expired(entry: UsageHistory | None, now_epoch: int) -> bool:
+    return entry is not None and entry.reset_at is not None and entry.reset_at <= now_epoch
 
 
 def _effective_usage_windows(

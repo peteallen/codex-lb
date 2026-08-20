@@ -3,23 +3,28 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
+import random
 from collections import deque
-from typing import Any, Literal, Mapping, TypeVar, cast
+from dataclasses import replace
+from typing import Any, Literal, Mapping, cast
 from uuid import uuid4
 
 import anyio
 
-from app.core import shutdown as shutdown_state
 from app.core.clients.files import create_file as core_create_file  # noqa: F401
 from app.core.clients.files import finalize_file as core_finalize_file  # noqa: F401
 from app.core.clients.proxy import CodexControlResponse as CodexControlResponse
-from app.core.clients.proxy import (  # noqa: F401  # noqa: F401
+from app.core.clients.proxy import (  # noqa: F401
     ImageFetchSession,
     ProxyResponseError,
     UpstreamProxyRouteTrace,
     _as_image_fetch_session,
+    _finalize_responses_lite_reasoning_context,
     _inline_content_images,
     _inline_input_image_urls,
+    _payload_has_responses_lite_websocket_marker,
+    _payload_uses_responses_lite,
     _ws_transport_payload_budget_bytes,
     apply_codex_installation_metadata,
     filter_inbound_headers,
@@ -33,6 +38,11 @@ from app.core.clients.proxy import (  # noqa: F401  # noqa: F401
 from app.core.clients.proxy import codex_control_request as core_codex_control_request  # noqa: F401
 from app.core.clients.proxy import compact_responses as core_compact_responses  # noqa: F401
 from app.core.clients.proxy import transcribe_audio as core_transcribe_audio  # noqa: F401
+from app.core.clients.proxy_websocket import (
+    UPSTREAM_WEBSOCKET_LIVENESS_TIMEOUT_CODE,
+    UpstreamWebSocketTransportError,
+    is_account_neutral_websocket_error_code,
+)
 from app.core.errors import (
     openai_error,
 )
@@ -42,7 +52,13 @@ from app.core.openai.requests import (
 )
 from app.core.resilience.overload import is_local_overload_error_code
 from app.core.types import JsonValue
-from app.core.utils.request_id import ensure_request_id, get_request_id, reset_request_id, set_request_id
+from app.core.utils.request_id import (
+    ensure_request_id,
+    ensure_request_scope_id,
+    get_request_id,
+    reset_request_id,
+    set_request_id,
+)
 from app.core.utils.sse import format_sse_event, parse_sse_data_json
 from app.modules.api_keys.service import (
     ApiKeyData,
@@ -58,22 +74,34 @@ from app.modules.proxy._service.compact import (
     _sticky_key_from_compact_payload as _sticky_key_from_compact_payload,
 )
 from app.modules.proxy._service.http_bridge.helpers import (
+    _await_task_deferring_cancellation,
     _build_http_bridge_prewarm_text,
+    _http_bridge_durable_lease_ttl_seconds,
     _http_bridge_key_strength,
     _http_bridge_precreated_retry_failure_error,
-    _http_bridge_prewarm_canary_bucket,
+    _http_bridge_prewarm_enabled,
+    _http_bridge_request_budget_seconds,
     _http_bridge_request_counts_against_queue,
     _log_http_bridge_event,
+    _record_continuity_fail_closed,
     _record_http_bridge_prewarm_outcome,
+    _register_http_bridge_turn_state_aliases_locked,
+    _release_http_bridge_unanchored_handoff,
+)
+from app.modules.proxy._service.http_bridge.quarantine import (
+    _record_http_bridge_quarantine_wedged_pending,
 )
 from app.modules.proxy._service.http_bridge.service_stubs import (
+    _call_with_supported_optional_kwargs,
     _classify_upstream_close,
     _count_external_image_urls,
     _enforce_response_create_size_limit,
+    _estimated_lease_tokens_from_request_usage_budget,
     _fingerprint_input_items,
     _inline_top_level_input_image_urls,
     _normalize_service_tier_value,
     _normalize_session_id,
+    _prepare_websocket_request_state_for_account_switch,
     _prepare_websocket_request_state_for_auth_replay,
     _prepare_websocket_request_state_for_visible_output_replay,
     _prewarm_response_timeout_seconds,
@@ -82,6 +110,7 @@ from app.modules.proxy._service.http_bridge.service_stubs import (
     _security_work_advisory_event,
     _service_as_image_fetch_session,
     _service_get_settings,
+    _service_get_settings_cache,
     _service_inline_input_image_urls,
     _service_lease_http_session,
     _service_time,
@@ -106,13 +135,16 @@ from app.modules.proxy._service.observability import (
     _truncate_identifier as _truncate_identifier,
 )
 from app.modules.proxy._service.support import (
+    _ACCOUNT_MODEL_UNSUPPORTED_ERROR_CODE,
     _HARD_HTTP_BRIDGE_AFFINITY_KINDS,  # noqa: F401
+    _REQUEST_TRANSPORT_WEBSOCKET,
     _WEBSOCKET_FULL_REPLAY_WAIT_POLL_SECONDS,  # noqa: F401
+    _api_key_fair_share_threshold_pct_from_settings,
     _clear_websocket_request_error_overrides,
     _copy_websocket_route_metadata_from_session,
     _event_type_from_payload,
     _HTTPBridgeSession,
-    _request_log_useragent_fields,
+    _request_log_client_fields,
     _websocket_request_can_replay_before_visible_output,
     _WebSocketRequestState,
 )
@@ -150,37 +182,54 @@ from app.modules.proxy._service.warmup import (
     _WarmupUsageSnapshot as _WarmupUsageSnapshot,
 )
 from app.modules.proxy.affinity import (
+    _AffinityPolicy,
     _extract_model_class,
     _owner_lookup_session_id_from_headers,
+    _sticky_key_from_turn_state_header,
 )
 from app.modules.proxy.api_key_usage import estimate_api_key_request_usage
+from app.modules.proxy.continuity import is_http_bridge_account_neutral_replay
+from app.modules.proxy.durable_bridge_repository import (
+    DurableBridgeAliasRegistration,
+    DurableBridgeAliasRegistrationReceipt,
+    durable_bridge_hash,
+)
+from app.modules.proxy.fair_share import (
+    API_KEY_STREAM_FAIR_SHARE_ERROR_CODE,
+    ApiKeyFairShareDenialError,
+)
 from app.modules.proxy.helpers import (
     _normalize_error_code,
     _parse_openai_error,
 )
+from app.modules.proxy.load_balancer import effective_account_concurrency_caps
 from app.modules.proxy.tool_call_dedupe import (
     dedupe_replayed_side_effect_input_items,
 )
 
 logger = logging.getLogger("app.modules.proxy.service")
-T = TypeVar("T")
-_TEXT_DELTA_EVENT_TYPES = frozenset({"response.output_text.delta", "response.refusal.delta"})
+
+_HTTP_BRIDGE_CLEAN_CLOSE_RETRY_MAX_COUNT = 1
+_HTTP_BRIDGE_CLEAN_CLOSE_RETRY_JITTER_MAX_SECONDS = 2.0
+
 _REQUEST_TRANSPORT_HTTP = "http"
-_UPSTREAM_CLOSE_CODES_SKIP_SAME_ACCOUNT_RETRY = frozenset({1011})
 _WEBSOCKET_AUTH_INVALIDATED_FAILURE_CODE = "account_auth_invalidated"
-_SECURITY_WORK_AUTHORIZATION_REQUIRED_CODE = "security_work_authorization_required"
 _NO_SECURITY_WORK_AUTHORIZED_ACCOUNTS_CODE = "no_security_work_authorized_accounts"
-_SECURITY_WORK_RETRY_MESSAGE = (
-    "Upstream flagged this request as possible cybersecurity work. "
-    "codex-lb is retrying on an account marked as authorized for security work."
-)
 _SECURITY_WORK_NO_AUTHORIZED_ACCOUNTS_MESSAGE = (
     "Upstream flagged this request as possible cybersecurity work, but no account is marked as authorized for "
     "security work. codex-lb is continuing with normal account selection; the upstream request may still fail until "
     "an account with Trusted Access for Cyber is marked as security-work-authorized."
 )
-_HTTP_BRIDGE_BACKGROUND_CLOSE_TIMEOUT_SECONDS = 5.0
-_HTTP_BRIDGE_BACKGROUND_CLEANUP_WARN_THRESHOLD = 100
+
+
+async def _rollback_http_bridge_recovery_turn_state_registration(
+    service: Any,
+    receipt: DurableBridgeAliasRegistrationReceipt,
+) -> tuple[bool, asyncio.CancelledError | None]:
+    rollback_task = asyncio.create_task(
+        service._durable_bridge.rollback_recovery_turn_state_registration(receipt=receipt)
+    )
+    return await _await_task_deferring_cancellation(rollback_task)
 
 
 async def _send_http_bridge_request_text_with_archive_id(
@@ -190,9 +239,39 @@ async def _send_http_bridge_request_text_with_archive_id(
 ) -> None:
     token = set_request_id(request_state.archive_request_id)
     try:
-        await session.upstream.send_text(text_data)
+        request_state.response_create_sent_at = _service_time().monotonic()
+        session.upstream_reader_wakeup.set()
+        try:
+            await session.upstream.send_text(text_data)
+        except BaseException:
+            # A failed or cancelled send is settled by its caller. Disarm the
+            # owner watchdog before lifecycle ownership is released so the
+            # reader cannot race that cleanup and settle the request twice.
+            request_state.response_create_sent_at = None
+            session.upstream_reader_wakeup.set()
+            raise
     finally:
         reset_request_id(token)
+
+
+async def _settle_claimed_http_bridge_liveness_failure(
+    service: Any,
+    session: "_HTTPBridgeSession",
+    *,
+    error_message: str,
+) -> None:
+    """Finish the pending-deque settlement claimed beside a failed send."""
+
+    if session.liveness_settlement_owner != "send":
+        raise RuntimeError("HTTP bridge liveness settlement started without the send claim")
+    async with session.lifecycle_lock:
+        await service._fail_http_bridge_reader_and_maybe_retire(
+            session,
+            error_code=UPSTREAM_WEBSOCKET_LIVENESS_TIMEOUT_CODE,
+            error_message=error_message,
+            penalize_account=False,
+            force_retire=True,
+        )
 
 
 def _text_with_account_installation_id(text_data: str, codex_installation_id: str | None) -> str:
@@ -237,6 +316,30 @@ def _request_kind_from_headers(headers: Mapping[str, str] | None) -> str:
 
 
 class _HTTPBridgeRequestSubmitMixin:
+    @staticmethod
+    def _http_bridge_clean_close_retry_max_count() -> int:
+        configured = _HTTP_BRIDGE_CLEAN_CLOSE_RETRY_MAX_COUNT
+        # Keep this recovery bounded even if an unsafe higher value is supplied.
+        return max(0, min(1, configured))
+
+    @staticmethod
+    def _http_bridge_clean_close_retry_jitter_seconds() -> float:
+        settings = _service_get_settings()
+        maximum = max(
+            0.0,
+            min(
+                30.0,
+                float(
+                    getattr(
+                        settings,
+                        "http_responses_session_bridge_clean_close_retry_jitter_max_seconds",
+                        _HTTP_BRIDGE_CLEAN_CLOSE_RETRY_JITTER_MAX_SECONDS,
+                    )
+                ),
+            ),
+        )
+        return random.uniform(0.0, maximum) if maximum > 0 else 0.0
+
     def _prepare_http_bridge_request(
         self: Any,
         payload: ResponsesRequest,
@@ -266,7 +369,11 @@ class _HTTPBridgeRequestSubmitMixin:
             request_log_id=request_id or get_request_id() or ensure_request_id(None),
             enforce_openai_sdk_contract=enforce_openai_sdk_contract,
         )
-        request_state.useragent, request_state.useragent_group = _request_log_useragent_fields(headers)
+        (
+            request_state.useragent,
+            request_state.useragent_group,
+            request_state.conversation_id,
+        ) = _request_log_client_fields(headers)
         request_state.client_ip = client_ip
         return request_state, text_data
 
@@ -285,6 +392,7 @@ class _HTTPBridgeRequestSubmitMixin:
         request_id: str | None = None,
         request_log_id: str | None = None,
         enforce_openai_sdk_contract: bool = True,
+        enforce_size_limit: bool = True,
     ) -> tuple[_WebSocketRequestState, str]:
         deduped_replayed_input_count: int | None = None
         deduped_replayed_input_fingerprint: str | None = None
@@ -306,6 +414,13 @@ class _HTTPBridgeRequestSubmitMixin:
             upstream_payload["type"] = "response.create"
         if client_metadata:
             upstream_payload["client_metadata"] = client_metadata
+        _finalize_responses_lite_reasoning_context(
+            upstream_payload,
+            responses_lite=(
+                _payload_uses_responses_lite(upstream_payload)
+                or _payload_has_responses_lite_websocket_marker(upstream_payload)
+            ),
+        )
         forwarded_service_tier = _normalize_service_tier_value(upstream_payload.get("service_tier"))
         input_item_count = 0
         input_full_fingerprint: str | None = None
@@ -317,6 +432,12 @@ class _HTTPBridgeRequestSubmitMixin:
                 input_full_fingerprint = _fingerprint_input_items(payload_input_list)
 
         resolved_request_id = request_id or f"ws_{uuid4().hex}"
+        header_request_kind = _request_kind_from_headers(headers)
+        generate_false_prewarm = header_request_kind == "prewarm" and upstream_payload.get("generate") is False
+        connection_request_kind = header_request_kind if transport == _REQUEST_TRANSPORT_WEBSOCKET else None
+        request_kind = (
+            "normal" if connection_request_kind == "prewarm" and not generate_false_prewarm else header_request_kind
+        )
         request_state = _WebSocketRequestState(
             request_id=resolved_request_id,
             request_log_id=request_log_id,
@@ -335,9 +456,15 @@ class _HTTPBridgeRequestSubmitMixin:
             request_usage_budget=estimate_api_key_request_usage(payload),
             previous_response_id=payload.previous_response_id,
             session_id=_normalize_session_id(session_id),
+            hard_continuity_anchor=(
+                payload.previous_response_id is not None
+                or _sticky_key_from_turn_state_header(headers or {}) is not None
+            ),
             input_item_count=input_item_count,
             input_full_fingerprint=input_full_fingerprint,
-            request_kind=_request_kind_from_headers(headers),
+            request_kind=request_kind,
+            connection_request_kind=connection_request_kind,
+            generate_false_prewarm=generate_false_prewarm,
         )
         if deduped_replayed_input_count is not None:
             request_state.input_item_count = deduped_replayed_input_count
@@ -378,7 +505,10 @@ class _HTTPBridgeRequestSubmitMixin:
                     slim_summary["historical_images_slimmed"],
                 )
         request_state.request_text = text_data
-        _enforce_response_create_size_limit(request_state)
+        # The direct WebSocket path defers this so it can first decide whether an
+        # oversized turn qualifies for the upstream-HTTP fallback.
+        if enforce_size_limit:
+            _enforce_response_create_size_limit(request_state)
         return request_state, text_data
 
     def _http_bridge_text_with_account_installation_id(
@@ -473,7 +603,163 @@ class _HTTPBridgeRequestSubmitMixin:
         request_state: _WebSocketRequestState,
         text_data: str,
         queue_limit: int,
+        recovery_turn_state: str | None = None,
     ) -> None:
+        request_scope_id = ensure_request_scope_id()
+        try:
+            await self._submit_http_bridge_request_with_handoff(
+                session,
+                request_state=request_state,
+                text_data=text_data,
+                queue_limit=queue_limit,
+                request_scope_id=request_scope_id,
+                recovery_turn_state=recovery_turn_state,
+            )
+        finally:
+            _release_http_bridge_unanchored_handoff(
+                session,
+                request_scope_id=request_scope_id,
+            )
+
+    async def _submit_http_bridge_request_with_handoff(
+        self: Any,
+        session: "_HTTPBridgeSession",
+        *,
+        request_state: _WebSocketRequestState,
+        text_data: str,
+        queue_limit: int,
+        request_scope_id: str,
+        recovery_turn_state: str | None = None,
+    ) -> None:
+        # Eventless upstream timeouts retire the current socket.  A client
+        # reconnect can otherwise create a fresh socket for the same hard key
+        # and submit the identical request repeatedly while the retry circuit
+        # is cooling down.  Gate new submissions before any reconnect/send so
+        # the circuit turns this into a bounded 503 instead of another
+        # response.create attempt.  A proof-gated full resend remains allowed
+        # because it is the client's own replay-safe request, not an opaque
+        # continuation replay.
+        allow_proof_gated_continuity_replay = bool(
+            request_state.previous_response_id is not None
+            and request_state.fresh_upstream_request_is_retry_safe
+            and request_state.fresh_upstream_request_text
+            and request_state.response_event_count == 0
+            and request_state.replay_count == 0
+        )
+        if not await self._http_bridge_precreated_retry_allowed(
+            session,
+            allow_proof_gated_continuity_replay=allow_proof_gated_continuity_replay,
+        ):
+            retry_after_seconds = max(
+                1,
+                math.ceil(await self._http_bridge_precreated_retry_cooldown_seconds(session)),
+            )
+            _log_http_bridge_event(
+                "submit_retry_circuit_suppressed",
+                session.key,
+                account_id=session.account.id,
+                model=session.request_model,
+                detail="hard_key_cooldown",
+                cache_key_family=session.key.affinity_kind,
+                model_class=_extract_model_class(session.request_model) if session.request_model else None,
+            )
+            raise ProxyResponseError(
+                503,
+                openai_error(
+                    "upstream_request_timeout",
+                    "HTTP responses session bridge is cooling down after repeated upstream timeouts; retry shortly.",
+                ),
+                retry_after_seconds=retry_after_seconds,
+            )
+        # Persist the recovery checkpoint only after the retry circuit has
+        # admitted this request. A client reconnect suppressed by the
+        # cooldown must not create or refresh a journal entry for a request
+        # that was never dispatched upstream.
+        if (
+            request_state.fresh_upstream_request_is_retry_safe
+            and request_state.fresh_upstream_request_text
+            and request_state.replay_count == 0
+            and request_state.recovery_attempt_fingerprint is None
+            and session.durable_session_id is not None
+            and session.durable_owner_epoch is not None
+        ):
+            attempt_fingerprint = durable_bridge_hash(request_state.fresh_upstream_request_text)
+            try:
+                attempt = await self._durable_bridge.record_recovery_attempt(
+                    session_id=session.durable_session_id,
+                    api_key_id=session.key.api_key_id,
+                    instance_id=_service_get_settings().http_responses_session_bridge_instance_id,
+                    owner_epoch=session.durable_owner_epoch,
+                    request_fingerprint=attempt_fingerprint,
+                    request_id=request_state.request_id,
+                    account_id=session.account.id,
+                    model=request_state.model,
+                    replay_safe=True,
+                )
+                if attempt is None:
+                    # ``None`` is the durable owner fence rejecting this
+                    # worker, not an unavailable journal (which raises and
+                    # is handled below). Never dispatch from a stale owner.
+                    session.closed = True
+                    session.upstream_control.reconnect_requested = True
+                    session.upstream_control.retire_after_drain = True
+                    _record_continuity_fail_closed(
+                        surface="http_bridge",
+                        reason="recovery_attempt_owner_fence_rejected",
+                        previous_response_id=request_state.previous_response_id,
+                        session_id=request_state.session_id,
+                        upstream_error_code="bridge_continuity_persistence_failed",
+                    )
+                    raise ProxyResponseError(
+                        502,
+                        openai_error(
+                            "bridge_continuity_persistence_failed",
+                            "HTTP responses session ownership changed; retry the request.",
+                        ),
+                    )
+                if getattr(attempt.state, "value", attempt.state) != "unknown":
+                    raise ProxyResponseError(
+                        502,
+                        openai_error(
+                            "bridge_continuity_persistence_failed",
+                            "The recovery checkpoint was already consumed; retry the request.",
+                        ),
+                    )
+                if getattr(attempt, "request_id", request_state.request_id) != request_state.request_id:
+                    raise ProxyResponseError(
+                        502,
+                        openai_error(
+                            "bridge_continuity_persistence_failed",
+                            "Another recovery request is already in flight; retry the request.",
+                        ),
+                    )
+                request_state.recovery_attempt_fingerprint = attempt_fingerprint
+                request_state.recovery_attempt_session_id = session.durable_session_id
+                request_state.recovery_attempt_owner_epoch = session.durable_owner_epoch
+            except ProxyResponseError:
+                raise
+            except Exception as exc:
+                # The journal is an additional recovery fence. Without a
+                # durable UNKNOWN row, an ambiguous send cannot be claimed by
+                # another owner, so fail closed instead of dispatching an
+                # unjournaled recovery-safe request.
+                session.closed = True
+                session.upstream_control.reconnect_requested = True
+                session.upstream_control.retire_after_drain = True
+                _record_continuity_fail_closed(
+                    surface="http_bridge",
+                    reason="recovery_attempt_persistence_failed",
+                    previous_response_id=request_state.previous_response_id,
+                    session_id=request_state.session_id,
+                    upstream_error_code="bridge_continuity_persistence_failed",
+                )
+                raise ProxyResponseError(
+                    502,
+                    openai_error(
+                        "bridge_continuity_persistence_failed",
+                        "Recovered response continuity could not be persisted; retry the request.",
+                    ),
+                ) from exc
         text_data = self._http_bridge_text_with_account_installation_id(session, request_state, text_data)
         if request_state.response_id is not None or request_state.response_event_count > 0:
             _log_http_bridge_event(
@@ -495,6 +781,13 @@ class _HTTPBridgeRequestSubmitMixin:
                     "HTTP responses session bridge request already has upstream response events",
                     error_type="server_error",
                 ),
+            )
+        if session.upstream_control.retire_after_drain:
+            if not session.upstream_close_attempted:
+                await self._retire_http_bridge_after_drain_if_ready(session)
+            raise ProxyResponseError(
+                502,
+                openai_error("upstream_unavailable", "HTTP responses session bridge is retiring"),
             )
         if session.closed:
             async with session.lifecycle_lock:
@@ -545,6 +838,7 @@ class _HTTPBridgeRequestSubmitMixin:
                         request_state=request_state,
                         text_data=text_data,
                         send_request=False,
+                        require_same_account=_http_bridge_key_strength(session.key) == "hard",
                     )
                     if recovered:
                         session.closed = False
@@ -561,41 +855,79 @@ class _HTTPBridgeRequestSubmitMixin:
                             502,
                             openai_error("upstream_unavailable", "HTTP responses session bridge is closed"),
                         )
-        if session.upstream_control.retire_after_drain:
-            await self._retire_http_bridge_after_drain_if_ready(session)
-            raise ProxyResponseError(
-                502,
-                openai_error("upstream_unavailable", "HTTP responses session bridge is retiring"),
-            )
         text_data = self._http_bridge_text_with_account_installation_id(session, request_state, text_data)
         request_state.session_previous_gap_ms = int(max(0.0, request_state.started_at - session.last_used_at) * 1000)
-        await self._maybe_prewarm_http_bridge_session(
-            session,
-            request_state=request_state,
-            text_data=text_data,
-        )
         gate_acquired = False
         request_enqueued = False
+        admission_waiter_registered = False
         async with session.pending_lock:
-            if session.queued_request_count >= queue_limit:
-                _log_http_bridge_event(
-                    "bridge_queue_full",
-                    session.key,
-                    account_id=session.account.id,
-                    model=session.request_model,
-                    pending_count=session.queued_request_count,
-                    cache_key_family=session.key.affinity_kind,
-                    model_class=_extract_model_class(session.request_model) if session.request_model else None,
+            await self._ensure_http_bridge_session_stream_lease_locked(session, request_state=request_state)
+            # Register the submit as an admission waiter atomically with the
+            # reacquire so a previous turn's finalizer unwinding concurrently
+            # cannot see an apparently idle session and release this lease
+            # before the turn is counted into the session queue.
+            session.admission_waiter_count += 1
+            admission_waiter_registered = True
+        try:
+            await self._maybe_prewarm_http_bridge_session(
+                session,
+                request_state=request_state,
+                text_data=text_data,
+            )
+        except BaseException:
+            if getattr(session, "unanchored_reservation_id", None) == request_scope_id:
+                session.unanchored_reservation_id = None
+            cleanup_task = asyncio.create_task(
+                self._cleanup_http_bridge_submit_interruption(
+                    session,
+                    request_state=request_state,
+                    gate_acquired=False,
+                    request_enqueued=False,
+                    counted_in_queue=False,
+                    admission_waiter_registered=admission_waiter_registered,
                 )
-                raise ProxyResponseError(
-                    429,
-                    openai_error(
+            )
+            await _await_task_deferring_cancellation(cleanup_task)
+            raise
+        try:
+            async with session.pending_lock:
+                if session.queued_request_count >= queue_limit:
+                    _log_http_bridge_event(
                         "bridge_queue_full",
-                        "HTTP responses session bridge queue is full",
-                        error_type="rate_limit_error",
-                    ),
+                        session.key,
+                        account_id=session.account.id,
+                        model=session.request_model,
+                        pending_count=session.queued_request_count,
+                        cache_key_family=session.key.affinity_kind,
+                        model_class=_extract_model_class(session.request_model) if session.request_model else None,
+                    )
+                    raise ProxyResponseError(
+                        429,
+                        openai_error(
+                            "bridge_queue_full",
+                            "HTTP responses session bridge queue is full",
+                            error_type="rate_limit_error",
+                        ),
+                    )
+                await self._ensure_http_bridge_session_stream_lease_locked(session, request_state=request_state)
+                session.queued_request_count += 1
+                if getattr(session, "unanchored_reservation_id", None) == request_scope_id:
+                    session.unanchored_reservation_id = None
+        except BaseException:
+            if getattr(session, "unanchored_reservation_id", None) == request_scope_id:
+                session.unanchored_reservation_id = None
+            cleanup_task = asyncio.create_task(
+                self._cleanup_http_bridge_submit_interruption(
+                    session,
+                    request_state=request_state,
+                    gate_acquired=False,
+                    request_enqueued=False,
+                    counted_in_queue=False,
+                    admission_waiter_registered=admission_waiter_registered,
                 )
-            session.queued_request_count += 1
+            )
+            await _await_task_deferring_cancellation(cleanup_task)
+            raise
         try:
             text_data = await self._inline_http_bridge_image_urls(text_data, request_state)
             text_data = self._http_bridge_text_with_account_installation_id(session, request_state, text_data)
@@ -606,6 +938,10 @@ class _HTTPBridgeRequestSubmitMixin:
             )
             _copy_websocket_route_metadata_from_session(request_state, session)
             request_state.bridge_queue_wait_started_at = _service_time().monotonic()
+            request_state.response_create_gate_wait_started_at = _service_time().monotonic()
+            # Bridge ownership is established before this late admission. A
+            # cap race stays a bounded error/wait on that owner; it must not
+            # publish a replacement bridge as a spillover side effect.
             await self._acquire_request_state_response_create_admission(
                 request_state,
                 response_create_gate=session.response_create_gate,
@@ -630,6 +966,16 @@ class _HTTPBridgeRequestSubmitMixin:
                     current_session = http_bridge_sessions.get(session.key)
                 session_unregistered = current_session is None and _http_bridge_key_strength(session.key) == "hard"
                 session_replaced = current_session is not None and current_session is not session
+                if session.closed and current_session is session and not session.upstream_control.retire_after_drain:
+                    recovered = await self._retry_http_bridge_request_on_fresh_upstream(
+                        session,
+                        request_state=request_state,
+                        text_data=text_data,
+                        send_request=False,
+                        require_same_account=_http_bridge_key_strength(session.key) == "hard",
+                    )
+                    if recovered:
+                        session.closed = False
                 if session.closed or session_unregistered or session_replaced:
                     _log_http_bridge_event(
                         "submit_on_closed",
@@ -652,11 +998,245 @@ class _HTTPBridgeRequestSubmitMixin:
                         502,
                         openai_error("upstream_unavailable", "HTTP responses session bridge is closed"),
                     )
-                async with session.pending_lock:
-                    session.pending_requests.append(request_state)
-                request_enqueued = True
-                await _send_http_bridge_request_text_with_archive_id(session, request_state, text_data)
-                session.last_used_at = _service_time().monotonic()
+                recovery_receipt: DurableBridgeAliasRegistrationReceipt | None = None
+                upstream_send_started = False
+                try:
+                    if recovery_turn_state is not None:
+                        registration_cancellation: asyncio.CancelledError | None = None
+                        try:
+                            async with session.recovery_alias_lock:
+                                registration_task = asyncio.create_task(
+                                    self._register_http_bridge_recovery_turn_state_locked(
+                                        session,
+                                        recovery_turn_state,
+                                    )
+                                )
+                                (
+                                    (
+                                        recovery_alias_registered,
+                                        recovery_receipt,
+                                    ),
+                                    registration_cancellation,
+                                ) = await _await_task_deferring_cancellation(registration_task)
+                                if registration_cancellation is not None or not recovery_alias_registered:
+                                    session.closed = True
+                                    session.upstream_control.reconnect_requested = True
+                                    session.upstream_control.retire_after_drain = True
+                                    if (
+                                        recovery_receipt is not None
+                                        and recovery_receipt.status == DurableBridgeAliasRegistration.REGISTERED
+                                    ):
+                                        try:
+                                            (
+                                                rolled_back,
+                                                rollback_cancellation,
+                                            ) = await _rollback_http_bridge_recovery_turn_state_registration(
+                                                self,
+                                                recovery_receipt,
+                                            )
+                                        except Exception:
+                                            rolled_back = False
+                                            rollback_cancellation = None
+                                            logger.warning(
+                                                "Failed to roll back recovered HTTP bridge turn-state alias",
+                                                exc_info=True,
+                                            )
+                                        registration_cancellation = registration_cancellation or rollback_cancellation
+                                        recovery_receipt = None
+                                        if not rolled_back:
+                                            _record_continuity_fail_closed(
+                                                surface="http_bridge",
+                                                reason="recovery_alias_rollback_failed",
+                                                previous_response_id=request_state.previous_response_id,
+                                                session_id=request_state.session_id,
+                                                upstream_error_code="bridge_continuity_persistence_failed",
+                                            )
+                                if registration_cancellation is not None:
+                                    raise registration_cancellation
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception:
+                            logger.warning(
+                                "Failed to persist recovered HTTP bridge turn-state before upstream dispatch",
+                                exc_info=True,
+                            )
+                            recovery_alias_registered = False
+                        if not recovery_alias_registered:
+                            session.closed = True
+                            session.upstream_control.reconnect_requested = True
+                            session.upstream_control.retire_after_drain = True
+                            _record_continuity_fail_closed(
+                                surface="http_bridge",
+                                reason="recovery_alias_registration_failed",
+                                previous_response_id=request_state.previous_response_id,
+                                session_id=request_state.session_id,
+                                upstream_error_code="bridge_continuity_persistence_failed",
+                            )
+                            raise ProxyResponseError(
+                                502,
+                                openai_error(
+                                    "bridge_continuity_persistence_failed",
+                                    "Recovered response continuity could not be persisted; retry the request.",
+                                ),
+                            )
+                    if request_state.recovery_attempt_fingerprint is not None:
+                        try:
+                            owner_lookup = await self._durable_bridge.renew_live_session(
+                                session_id=session.durable_session_id,
+                                api_key_id=session.key.api_key_id,
+                                instance_id=_service_get_settings().http_responses_session_bridge_instance_id,
+                                owner_epoch=session.durable_owner_epoch,
+                                lease_ttl_seconds=_http_bridge_durable_lease_ttl_seconds(),
+                                latest_turn_state=session.downstream_turn_state,
+                                latest_response_id=None,
+                            )
+                        except Exception as exc:
+                            session.closed = True
+                            session.upstream_control.reconnect_requested = True
+                            session.upstream_control.retire_after_drain = True
+                            raise ProxyResponseError(
+                                502,
+                                openai_error(
+                                    "bridge_continuity_persistence_failed",
+                                    "HTTP responses session ownership could not be renewed; retry the request.",
+                                ),
+                            ) from exc
+                        if (
+                            owner_lookup is None
+                            or owner_lookup.owner_instance_id
+                            != _service_get_settings().http_responses_session_bridge_instance_id
+                            or owner_lookup.owner_epoch != session.durable_owner_epoch
+                        ):
+                            session.closed = True
+                            session.upstream_control.reconnect_requested = True
+                            session.upstream_control.retire_after_drain = True
+                            raise ProxyResponseError(
+                                502,
+                                openai_error(
+                                    "bridge_continuity_persistence_failed",
+                                    "HTTP responses session ownership changed before dispatch; retry the request.",
+                                ),
+                            )
+                    # The journal entry is created before queue admission so
+                    # concurrent requests cannot both enter the gate without
+                    # a recovery generation. Revalidate it after the gate and
+                    # lifecycle locks, immediately before dispatch: a waiter
+                    # may have observed UNKNOWN while the first request
+                    # settled the row REPLAYED.
+                    if (
+                        request_state.recovery_attempt_fingerprint is not None
+                        and not request_state.recovery_attempt_claimed
+                    ):
+                        if (
+                            request_state.recovery_attempt_session_id != session.durable_session_id
+                            or request_state.recovery_attempt_owner_epoch != session.durable_owner_epoch
+                        ):
+                            session.closed = True
+                            session.upstream_control.reconnect_requested = True
+                            session.upstream_control.retire_after_drain = True
+                            raise ProxyResponseError(
+                                502,
+                                openai_error(
+                                    "bridge_continuity_persistence_failed",
+                                    "HTTP responses session ownership changed before dispatch; retry the request.",
+                                ),
+                            )
+                        try:
+                            dispatch_attempt = await self._durable_bridge.record_recovery_attempt(
+                                session_id=session.durable_session_id,
+                                api_key_id=session.key.api_key_id,
+                                instance_id=_service_get_settings().http_responses_session_bridge_instance_id,
+                                owner_epoch=session.durable_owner_epoch,
+                                request_fingerprint=request_state.recovery_attempt_fingerprint,
+                                request_id=request_state.request_id,
+                                account_id=session.account.id,
+                                model=request_state.model,
+                                replay_safe=True,
+                            )
+                        except Exception as exc:
+                            session.closed = True
+                            session.upstream_control.reconnect_requested = True
+                            session.upstream_control.retire_after_drain = True
+                            raise ProxyResponseError(
+                                502,
+                                openai_error(
+                                    "bridge_continuity_persistence_failed",
+                                    "Recovered response continuity could not be revalidated; retry the request.",
+                                ),
+                            ) from exc
+                        if (
+                            dispatch_attempt is None
+                            or getattr(dispatch_attempt.state, "value", dispatch_attempt.state) != "unknown"
+                            or getattr(dispatch_attempt, "request_id", request_state.request_id)
+                            != request_state.request_id
+                        ):
+                            session.closed = True
+                            session.upstream_control.reconnect_requested = True
+                            session.upstream_control.retire_after_drain = True
+                            raise ProxyResponseError(
+                                502,
+                                openai_error(
+                                    "bridge_continuity_persistence_failed",
+                                    "The recovery checkpoint was consumed before dispatch; retry the request.",
+                                ),
+                            )
+                    async with session.pending_lock:
+                        session.pending_requests.append(request_state)
+                        session.admission_waiter_count = max(0, session.admission_waiter_count - 1)
+                        admission_waiter_registered = False
+                    request_enqueued = True
+                    upstream_send_started = True
+                    try:
+                        await _send_http_bridge_request_text_with_archive_id(session, request_state, text_data)
+                    except BaseException as exc:
+                        request_state.recovery_attempt_dispatched = True
+                        # Publish retirement while lifecycle ownership is still
+                        # held; a gate waiter must never reuse an ambiguously sent
+                        # response.create socket between unlock and cleanup.
+                        session.closed = True
+                        session.upstream_control.reconnect_requested = True
+                        session.upstream_control.retire_after_drain = True
+                        if (
+                            isinstance(exc, UpstreamWebSocketTransportError)
+                            and exc.error_code == UPSTREAM_WEBSOCKET_LIVENESS_TIMEOUT_CODE
+                        ):
+                            # Only this narrow claim, not ``closed``, tells the
+                            # reader that the submitter will settle siblings.
+                            # Keep it inside lifecycle_lock with the failing
+                            # send so the reader cannot observe an ownership gap.
+                            session.claim_liveness_settlement()
+                        raise
+                    request_state.recovery_attempt_dispatched = True
+                    session.last_used_at = _service_time().monotonic()
+                except asyncio.CancelledError:
+                    if recovery_receipt is not None and not upstream_send_started:
+                        session.closed = True
+                        session.upstream_control.reconnect_requested = True
+                        session.upstream_control.retire_after_drain = True
+                        async with session.recovery_alias_lock:
+                            try:
+                                (
+                                    rolled_back,
+                                    _rollback_cancellation,
+                                ) = await _rollback_http_bridge_recovery_turn_state_registration(
+                                    self,
+                                    recovery_receipt,
+                                )
+                            except Exception:
+                                rolled_back = False
+                                logger.warning(
+                                    "Failed to roll back cancelled HTTP bridge recovery alias",
+                                    exc_info=True,
+                                )
+                            if not rolled_back:
+                                _record_continuity_fail_closed(
+                                    surface="http_bridge",
+                                    reason="recovery_alias_rollback_failed",
+                                    previous_response_id=request_state.previous_response_id,
+                                    session_id=request_state.session_id,
+                                    upstream_error_code="bridge_continuity_persistence_failed",
+                                )
+                    raise
         except ProxyResponseError:
             await self._cleanup_http_bridge_submit_interruption(
                 session,
@@ -664,17 +1244,33 @@ class _HTTPBridgeRequestSubmitMixin:
                 gate_acquired=gate_acquired,
                 request_enqueued=request_enqueued,
                 counted_in_queue=True,
+                admission_waiter_registered=admission_waiter_registered,
             )
+            if not session.upstream_close_attempted:
+                await self._retire_http_bridge_after_drain_if_ready(session)
             raise
-        except asyncio.CancelledError:
-            await self._cleanup_http_bridge_submit_interruption(
-                session,
-                request_state=request_state,
-                gate_acquired=gate_acquired,
-                request_enqueued=request_enqueued,
-                counted_in_queue=True,
+        except asyncio.CancelledError as cancellation:
+            cleanup_task = asyncio.create_task(
+                self._cleanup_http_bridge_submit_interruption(
+                    session,
+                    request_state=request_state,
+                    gate_acquired=gate_acquired,
+                    request_enqueued=request_enqueued,
+                    counted_in_queue=True,
+                    admission_waiter_registered=admission_waiter_registered,
+                )
             )
-            raise
+            try:
+                await _await_task_deferring_cancellation(cleanup_task)
+            except Exception:
+                logger.warning("Failed to clean up cancelled HTTP bridge submit", exc_info=True)
+            if session.upstream_control.retire_after_drain and not session.upstream_close_attempted:
+                retire_task = asyncio.create_task(self._retire_http_bridge_after_drain_if_ready(session))
+                try:
+                    await _await_task_deferring_cancellation(retire_task)
+                except Exception:
+                    logger.warning("Failed to retire cancelled HTTP bridge recovery", exc_info=True)
+            raise cancellation
         except Exception as exc:
             _log_http_bridge_event(
                 "send_failure",
@@ -685,35 +1281,58 @@ class _HTTPBridgeRequestSubmitMixin:
                 cache_key_family=session.key.affinity_kind,
                 model_class=_extract_model_class(session.request_model) if session.request_model else None,
             )
-            retried = await self._retry_http_bridge_request_on_fresh_upstream(
-                session,
-                request_state=request_state,
-                text_data=text_data,
-            )
-            if retried:
-                return
-            await self._cleanup_http_bridge_submit_interruption(
-                session,
-                request_state=request_state,
-                gate_acquired=gate_acquired,
-                request_enqueued=request_enqueued,
-                counted_in_queue=True,
-            )
-            await self._fail_pending_websocket_requests(
-                account=session.account,
-                account_id_value=session.account.id,
-                pending_requests=deque([request_state]),
-                pending_lock=anyio.Lock(),
-                error_code="stream_incomplete",
-                error_message="Upstream websocket closed before response.completed",
-                api_key=None,
-                response_create_gate=session.response_create_gate,
-            )
-            session.closed = True
-            try:
-                await session.upstream.close()
-            except Exception:
-                logger.debug("Failed to close HTTP bridge upstream websocket after send failure", exc_info=True)
+            # send_text may fail after the complete response.create frame was
+            # handed to the kernel. Never reconnect-and-resend from this path;
+            # only failures proven to precede dispatch may be replayed.
+            error_code = exc.error_code if isinstance(exc, UpstreamWebSocketTransportError) else "stream_incomplete"
+            # Liveness expiry and local network loss are transport failures,
+            # not evidence against the selected account. Keep this in sync
+            # with the reader path's shared provenance classification.
+            account_neutral = is_account_neutral_websocket_error_code(error_code)
+            if error_code == UPSTREAM_WEBSOCKET_LIVENESS_TIMEOUT_CODE:
+                # The sender claimed ownership beside the failing send while
+                # holding lifecycle_lock. It therefore owns the entire session
+                # deque, including older in-flight requests; settling only this
+                # request would strand its siblings after the reader yields.
+                # Publish the cleanup task before the first await after the
+                # claim. Shielding it makes cancellation wait for settlement,
+                # so the claim can never outlive its exactly-once owner.
+                settlement_task = asyncio.create_task(
+                    _settle_claimed_http_bridge_liveness_failure(
+                        self,
+                        session,
+                        error_message=str(exc) or "Upstream websocket liveness failed",
+                    ),
+                    name="http-bridge-liveness-send-settlement",
+                )
+                _, settlement_cancellation = await _await_task_deferring_cancellation(settlement_task)
+                if settlement_cancellation is not None:
+                    raise settlement_cancellation
+            else:
+                await self._cleanup_http_bridge_submit_interruption(
+                    session,
+                    request_state=request_state,
+                    gate_acquired=gate_acquired,
+                    request_enqueued=request_enqueued,
+                    counted_in_queue=True,
+                    admission_waiter_registered=admission_waiter_registered,
+                )
+                await self._fail_pending_websocket_requests(
+                    account=session.account,
+                    account_id_value=session.account.id,
+                    pending_requests=deque([request_state]),
+                    pending_lock=anyio.Lock(),
+                    error_code=error_code,
+                    error_message=str(exc) or "Upstream websocket closed before response.completed",
+                    api_key=None,
+                    response_create_gate=session.response_create_gate,
+                    penalize_account=not account_neutral,
+                )
+                session.closed = True
+                try:
+                    await session.upstream.close()
+                except Exception:
+                    logger.debug("Failed to close HTTP bridge upstream websocket after send failure", exc_info=True)
             # Always raise 502 so the client can retry with
             # previous_response_id intact.  Returning 400
             # previous_response_not_found causes the client to drop
@@ -721,7 +1340,7 @@ class _HTTPBridgeRequestSubmitMixin:
             # history, inflating per-turn context by ~20x.
             raise ProxyResponseError(
                 502,
-                openai_error("upstream_unavailable", str(exc) or "Upstream websocket closed"),
+                openai_error(error_code, str(exc) or "Upstream websocket closed"),
             ) from exc
 
     async def _maybe_prewarm_http_bridge_session(
@@ -735,36 +1354,24 @@ class _HTTPBridgeRequestSubmitMixin:
         if not session.codex_session or session.prewarmed or request_state.previous_response_id is not None:
             request_state.prewarm_status = request_state.prewarm_status or "not_applicable"
             return
-        bucket, reason = _http_bridge_prewarm_canary_bucket(
-            settings,
-            session=session,
-            request_state=request_state,
-            text_data=text_data,
-        )
-        request_state.prewarm_canary_bucket = bucket
-        request_state.prewarm_eligible_reason = reason
-        if bucket == "not_eligible":
+        if not _http_bridge_prewarm_enabled(settings):
             request_state.prewarm_status = "not_applicable"
-            return
-        if bucket == "control":
-            request_state.prewarm_status = "canary_miss"
-            _record_http_bridge_prewarm_outcome(outcome="canary_miss", cohort=reason, bucket=bucket)
             return
         prewarm_lock = session.prewarm_lock
         if prewarm_lock is None:
             request_state.prewarm_status = "skipped"
-            _record_http_bridge_prewarm_outcome(outcome="skipped", cohort=reason, bucket=bucket)
+            _record_http_bridge_prewarm_outcome(outcome="skipped")
             return
         async with prewarm_lock:
             if session.prewarmed:
                 request_state.prewarm_status = "skipped"
-                _record_http_bridge_prewarm_outcome(outcome="skipped", cohort=reason, bucket=bucket)
+                _record_http_bridge_prewarm_outcome(outcome="skipped")
                 return
             warmup_text = _build_http_bridge_prewarm_text(text_data)
             session.prewarmed = True
             if warmup_text is None:
                 request_state.prewarm_status = "skipped"
-                _record_http_bridge_prewarm_outcome(outcome="skipped", cohort=reason, bucket=bucket)
+                _record_http_bridge_prewarm_outcome(outcome="skipped")
                 return
 
             prewarm_started_at = _service_time().monotonic()
@@ -785,6 +1392,7 @@ class _HTTPBridgeRequestSubmitMixin:
             )
             gate_acquired = False
             request_enqueued = False
+            warmup_send_started = False
             try:
                 event_queue = warmup_state.event_queue
                 assert event_queue is not None
@@ -834,7 +1442,8 @@ class _HTTPBridgeRequestSubmitMixin:
                     async with session.pending_lock:
                         session.pending_requests.append(warmup_state)
                     request_enqueued = True
-                    await session.upstream.send_text(warmup_text)
+                    warmup_send_started = True
+                    await _send_http_bridge_request_text_with_archive_id(session, warmup_state, warmup_text)
                 while True:
                     try:
                         event_block = await asyncio.wait_for(
@@ -846,7 +1455,7 @@ class _HTTPBridgeRequestSubmitMixin:
                             max(0.0, _service_time().monotonic() - prewarm_started_at) * 1000
                         )
                         request_state.prewarm_status = "timeout"
-                        _record_http_bridge_prewarm_outcome(outcome="timeout", cohort=reason, bucket=bucket)
+                        _record_http_bridge_prewarm_outcome(outcome="timeout")
                         logger.warning(
                             "HTTP bridge prewarm timed out request_id=%s model=%s",
                             request_state.request_id,
@@ -861,6 +1470,10 @@ class _HTTPBridgeRequestSubmitMixin:
                                 session,
                                 request_state=request_state,
                                 restart_reader=True,
+                                require_same_account=is_http_bridge_account_neutral_replay(
+                                    kind=session.key.affinity_kind,
+                                    key=session.key.affinity_key,
+                                ),
                             )
                         except Exception:
                             session.closed = True
@@ -892,7 +1505,7 @@ class _HTTPBridgeRequestSubmitMixin:
                 session.last_used_at = _service_time().monotonic()
                 request_state.prewarm_latency_ms = int(max(0.0, session.last_used_at - prewarm_started_at) * 1000)
                 request_state.prewarm_status = "success"
-                _record_http_bridge_prewarm_outcome(outcome="success", cohort=reason, bucket=bucket)
+                _record_http_bridge_prewarm_outcome(outcome="success")
             except ProxyResponseError as exc:
                 error = _parse_openai_error(exc.payload)
                 code = _normalize_error_code(error.code if error else None, error.type if error else None)
@@ -909,29 +1522,43 @@ class _HTTPBridgeRequestSubmitMixin:
                         max(0.0, _service_time().monotonic() - prewarm_started_at) * 1000
                     )
                     request_state.prewarm_status = "skipped"
-                    _record_http_bridge_prewarm_outcome(outcome="skipped", cohort=reason, bucket=bucket)
+                    _record_http_bridge_prewarm_outcome(outcome="skipped")
                     return
                 session.prewarmed = False
                 request_state.prewarm_latency_ms = int(
                     max(0.0, _service_time().monotonic() - prewarm_started_at) * 1000
                 )
                 request_state.prewarm_status = "error"
-                _record_http_bridge_prewarm_outcome(outcome="error", cohort=reason, bucket=bucket)
+                _record_http_bridge_prewarm_outcome(outcome="error")
                 raise
             except BaseException:
+                if warmup_send_started:
+                    session.closed = True
+                    session.upstream_control.reconnect_requested = True
+                    session.upstream_control.retire_after_drain = True
                 session.prewarmed = False
                 request_state.prewarm_latency_ms = int(
                     max(0.0, _service_time().monotonic() - prewarm_started_at) * 1000
                 )
                 request_state.prewarm_status = "error"
-                _record_http_bridge_prewarm_outcome(outcome="error", cohort=reason, bucket=bucket)
-                await self._cleanup_http_bridge_submit_interruption(
-                    session,
-                    request_state=warmup_state,
-                    gate_acquired=gate_acquired,
-                    request_enqueued=request_enqueued,
-                    counted_in_queue=False,
+                _record_http_bridge_prewarm_outcome(outcome="error")
+                cleanup_task = asyncio.create_task(
+                    self._cleanup_http_bridge_submit_interruption(
+                        session,
+                        request_state=warmup_state,
+                        gate_acquired=gate_acquired,
+                        request_enqueued=request_enqueued,
+                        counted_in_queue=False,
+                    )
                 )
+                await _await_task_deferring_cancellation(cleanup_task)
+                if (
+                    warmup_send_started
+                    and session.upstream_control.retire_after_drain
+                    and not session.upstream_close_attempted
+                ):
+                    retire_task = asyncio.create_task(self._retire_http_bridge_after_drain_if_ready(session))
+                    await _await_task_deferring_cancellation(retire_task)
                 raise
 
     async def _cleanup_http_bridge_submit_interruption(
@@ -942,12 +1569,17 @@ class _HTTPBridgeRequestSubmitMixin:
         gate_acquired: bool,
         request_enqueued: bool,
         counted_in_queue: bool,
+        admission_waiter_registered: bool = False,
     ) -> None:
+        retire_closed_session = False
         async with session.pending_lock:
             if request_enqueued and request_state in session.pending_requests:
                 session.pending_requests.remove(request_state)
             if counted_in_queue:
                 session.queued_request_count = max(0, session.queued_request_count - 1)
+            if admission_waiter_registered:
+                session.admission_waiter_count = max(0, session.admission_waiter_count - 1)
+            retire_closed_session = session.closed and session.admission_waiter_count == 0
         self._cancel_request_state_api_key_reservation_heartbeat(request_state)
         if request_state.response_create_gate is not None:
             if gate_acquired or request_state.response_create_gate_acquired:
@@ -967,6 +1599,150 @@ class _HTTPBridgeRequestSubmitMixin:
                 request_state.response_create_gate_acquired = False
         elif gate_acquired:
             await _release_websocket_response_create_gate(request_state, session.response_create_gate)
+        if retire_closed_session:
+            await self._retire_stale_pending_http_bridge_session(
+                session,
+                detail="last_admission_waiter_cancelled",
+                response_events_seen=max(
+                    request_state.response_event_count,
+                    int(request_state.response_id is not None or request_state.latency_response_created_ms is not None),
+                ),
+            )
+        await self._maybe_release_idle_http_bridge_session_lease(session)
+
+    async def _ensure_http_bridge_session_stream_lease_locked(
+        self: Any,
+        session: "_HTTPBridgeSession",
+        *,
+        request_state: _WebSocketRequestState | None = None,
+    ) -> None:
+        """Reacquire the account stream lease for a session idled between turns.
+
+        Callers hold ``session.pending_lock``. The lease is released when the
+        session's last in-flight turn detaches, so an idle session does not
+        occupy a per-account stream slot; the next turn must pass normal cap
+        admission again. Denial raises the standard local-cap envelope so the
+        existing recoverable capacity wait applies.
+
+        The lease stays per-session (one upstream stream): a session that
+        already holds a lease admits further queued turns without acquiring
+        another, because those turns multiplex over the session's single
+        upstream WebSocket — unchanged from the pre-existing per-session
+        lease lifecycle.
+
+        Keyed sessions thread their API key through the reacquire so the
+        turn joins the per-key stream accounting and passes the same
+        congestion-gated fair-share admission as initial selection; a
+        fair-share denial raises the standard local-cap envelope with the
+        fair-share code so the recoverable capacity wait applies.
+        """
+        if session.account_lease is not None or session.closed:
+            return
+        load_balancer = getattr(self, "_load_balancer", None)
+        if load_balancer is None:
+            return
+        api_key_id = session.key.api_key_id
+        fair_share_threshold_pct = 0
+        if api_key_id is not None:
+            fair_share_threshold_pct = _api_key_fair_share_threshold_pct_from_settings(
+                await _service_get_settings_cache().get()
+            )
+        try:
+            lease = await load_balancer.acquire_account_lease(
+                session.account.id,
+                kind="stream",
+                # Carry the turn's usage-budget estimate like initial selection
+                # and reconnect do, so capacity-weighted routing pressure still
+                # sees large turns on reused warm sessions.
+                estimated_tokens=_estimated_lease_tokens_from_request_usage_budget(
+                    request_state.request_usage_budget if request_state is not None else None
+                ),
+                api_key_id=api_key_id,
+                api_key_stream_fair_share_threshold_pct=fair_share_threshold_pct,
+            )
+        except ApiKeyFairShareDenialError as denial:
+            raise ProxyResponseError(
+                429,
+                openai_error(
+                    API_KEY_STREAM_FAIR_SHARE_ERROR_CODE,
+                    str(denial),
+                    error_type="rate_limit_error",
+                ),
+            ) from None
+        if lease is None:
+            raise ProxyResponseError(
+                429,
+                openai_error(
+                    "account_stream_cap",
+                    "Account stream capacity is exhausted; wait for active streams to finish.",
+                    error_type="rate_limit_error",
+                ),
+            )
+        if session.closed:
+            # A close or eviction ran while the acquire await was suspended
+            # (the close path does not take pending_lock before settling the
+            # session's lease). Installing this lease on the closed session
+            # would leak the slot: close already settled, and the idle
+            # release helper skips closed sessions. Return the slot and fail
+            # the turn like any other submit on a closed bridge.
+            async def release_detached_lease() -> None:
+                try:
+                    await load_balancer.release_account_lease(lease)
+                except Exception:
+                    logger.warning(
+                        "Failed to release stream lease acquired for closed HTTP bridge session",
+                        exc_info=True,
+                    )
+
+            release_task = asyncio.create_task(release_detached_lease())
+            _, cancellation = await _await_task_deferring_cancellation(release_task)
+            if cancellation is not None:
+                raise cancellation
+            raise ProxyResponseError(
+                502,
+                openai_error("upstream_unavailable", "HTTP responses session bridge is closed"),
+            )
+        session.account_lease = lease
+
+    async def _maybe_release_idle_http_bridge_session_lease(
+        self: Any,
+        session: "_HTTPBridgeSession",
+    ) -> None:
+        """Release the account stream lease once a session has no in-flight work.
+
+        The per-account stream cap exists to bound concurrent upstream
+        streams (one bridge session holds one slot for its single upstream
+        WebSocket); an idle bridge session keeping its upstream WebSocket warm
+        must not occupy a slot for its whole idle TTL. Session close releases
+        via its own path, so a session that closed keeps that settlement.
+        """
+        load_balancer = getattr(self, "_load_balancer", None)
+        if load_balancer is None:
+            return
+        lease = None
+        async with session.pending_lock:
+            if (
+                not session.closed
+                and session.account_lease is not None
+                and session.queued_request_count == 0
+                and session.admission_waiter_count == 0
+                and not session.pending_requests
+            ):
+                lease = session.account_lease
+                session.account_lease = None
+        if lease is None:
+            return
+
+        async def release_idle_lease() -> None:
+            try:
+                await load_balancer.release_account_lease(lease)
+            except Exception:
+                logger.warning("Failed to release idle HTTP bridge account lease", exc_info=True)
+
+        release_task = asyncio.create_task(release_idle_lease())
+        _, cancellation = await _await_task_deferring_cancellation(release_task)
+        if cancellation is not None:
+            raise cancellation
 
     async def _detach_http_bridge_request(
         self: Any,
@@ -983,20 +1759,104 @@ class _HTTPBridgeRequestSubmitMixin:
                 session.upstream_control.reconnect_requested = True
                 session.upstream_control.retire_after_drain = True
                 detached = True
-        request_state.event_queue = None
-        # event_queue is nulled unconditionally because by the time
-        # _detach is called from the finally block in
-        # _stream_http_bridge_session_events, the terminal event has
-        # already been delivered via _pop_terminal_websocket_request_state.
-        # A late-arriving event on a nulled queue is a no-op.
+            # Queue revocation and pending ownership use the same lock. A
+            # completed handler that wins first keeps its local queue reference;
+            # a detach that wins first leaves no queue for that handler to claim.
+            request_state.event_queue = None
         await _release_websocket_response_create_gate(request_state, session.response_create_gate)
         if not detached:
+            if request_state.terminal_settlement_phase == "abandoned":
+                # Belt-and-braces for issue #1594: terminal bookkeeping
+                # claimed this request out of pending ownership, aborted, and
+                # its shielded abort settlement also failed. Nothing else owns
+                # the reservation any more, so reclaim settlement here instead
+                # of keying solely on pending-deque membership.
+                self._cancel_request_state_api_key_reservation_heartbeat(request_state)
+                await self._release_websocket_request_state_reservation(request_state)
+                request_state.api_key_reservation = None
+                request_state.terminal_settlement_phase = None
             return False
         self._cancel_request_state_api_key_reservation_heartbeat(request_state)
         await self._release_websocket_request_state_reservation(request_state)
         request_state.api_key_reservation = None
         await self._retire_http_bridge_after_drain_if_ready(session)
         return True
+
+    async def _fail_stale_http_bridge_pending_requests(
+        self: Any,
+        session: "_HTTPBridgeSession",
+        request_states: list[_WebSocketRequestState],
+        *,
+        detail: str,
+    ) -> None:
+        stale_requests: deque[_WebSocketRequestState] = deque()
+        response_events_seen = 0
+        async with session.pending_lock:
+            for request_state in request_states:
+                if request_state not in session.pending_requests:
+                    continue
+                response_events_seen = max(
+                    response_events_seen,
+                    request_state.response_event_count,
+                    int(
+                        request_state.response_id is not None
+                        or request_state.latency_response_created_ms is not None
+                        or request_state.downstream_visible
+                    ),
+                )
+                session.pending_requests.remove(request_state)
+                if _http_bridge_request_counts_against_queue(request_state):
+                    session.queued_request_count = max(0, session.queued_request_count - 1)
+                stale_requests.append(request_state)
+        if not stale_requests:
+            return
+        # A stale gate holder that streamed response events without ever
+        # receiving ``response.created`` proves the reattach wedge (#1534)
+        # even when the session itself survives with other active requests.
+        _record_http_bridge_quarantine_wedged_pending(self, session, stale_requests)
+        if response_events_seen == 0:
+            await self._record_http_bridge_retry_circuit_failure(session, detail=detail)
+        await self._fail_pending_websocket_requests(
+            account=session.account,
+            account_id_value=session.account.id,
+            pending_requests=stale_requests,
+            pending_lock=session.pending_lock,
+            error_code="upstream_request_timeout",
+            error_message="HTTP bridge response-create gate holder timed out",
+            api_key=None,
+            response_create_gate=session.response_create_gate,
+            penalize_account=False,
+        )
+
+    def _classify_http_bridge_stale_gate_holders(
+        self: Any,
+        pending_states: list[_WebSocketRequestState],
+        *,
+        now: float,
+        threshold_seconds: float,
+        session_closed: bool,
+    ) -> tuple[list[_WebSocketRequestState], bool]:
+        stale_states = [
+            state
+            for state in pending_states
+            if not state.draining_until_terminal
+            and self._http_bridge_pending_state_is_stale(
+                state,
+                now=now,
+                threshold_seconds=threshold_seconds,
+                session_closed=session_closed,
+            )
+        ]
+        active_states = [
+            # A draining request still owns terminal response continuity.  It
+            # must keep the session alive while stale holders are cleaned up.
+            state
+            for state in pending_states
+            if state not in stale_states
+        ]
+        if stale_states and active_states:
+            return stale_states, False
+        return [], bool(stale_states)
 
     async def _retire_http_bridge_after_drain_if_ready(self: Any, session: "_HTTPBridgeSession") -> bool:
         if not (session.upstream_control.reconnect_requested and session.upstream_control.retire_after_drain):
@@ -1005,13 +1865,16 @@ class _HTTPBridgeRequestSubmitMixin:
             has_visible_pending = any(
                 _http_bridge_request_counts_against_queue(request_state) for request_state in session.pending_requests
             )
-            should_reconnect = not has_visible_pending and session.queued_request_count == 0
+            should_reconnect = (
+                not has_visible_pending and session.queued_request_count == 0 and not session.upstream_close_attempted
+            )
             if should_reconnect:
                 session.pending_requests.clear()
+                session.upstream_close_attempted = True
         if not should_reconnect:
             return False
 
-        await self._close_http_bridge_session(session)
+        await self._close_http_bridge_session_bounded(session, reason="retire_after_drain")
         return True
 
     async def _retire_stale_pending_http_bridge_session(
@@ -1019,37 +1882,34 @@ class _HTTPBridgeRequestSubmitMixin:
         session: "_HTTPBridgeSession",
         *,
         detail: str,
+        retry_circuit_detail: str | None = None,
+        response_events_seen: int | None = None,
     ) -> None:
+        async with session.pending_lock:
+            retired_request_states = list(session.pending_requests)
+        # Direct retirement (for example the all-stale stuck-gate path, where
+        # the wedged reattach is the only pending request) cancels the reader
+        # and fails the pendings without passing the partial-cleanup hook or
+        # the reader-failure funnel, so evaluate the wedge shape (#1534) here
+        # too; recording is idempotent for callers that already quarantined.
+        _record_http_bridge_quarantine_wedged_pending(self, session, retired_request_states)
+        if response_events_seen is None or response_events_seen == 0:
+            await self._record_http_bridge_retry_circuit_failure(
+                session,
+                detail=retry_circuit_detail or detail,
+            )
         session.closed = True
         async with self._http_bridge_lock:
             if self._http_bridge_sessions.get(session.key) is session:
                 self._http_bridge_sessions.pop(session.key, None)
                 self._unregister_http_bridge_turn_states_locked(session)
                 self._unregister_http_bridge_previous_response_ids_locked(session)
-        if session.durable_session_id is not None and session.durable_owner_epoch is not None:
-            durable_session_id = session.durable_session_id
-            durable_owner_epoch = session.durable_owner_epoch
-            session.durable_session_id = None
-            session.durable_owner_epoch = None
-            try:
-                await self._durable_bridge.release_live_session(
-                    session_id=durable_session_id,
-                    instance_id=_service_get_settings().http_responses_session_bridge_instance_id,
-                    owner_epoch=durable_owner_epoch,
-                    draining=shutdown_state.is_bridge_drain_active(),
-                )
-            except Exception:
-                session.durable_session_id = durable_session_id
-                session.durable_owner_epoch = durable_owner_epoch
-                logger.warning("Failed to release stale pending HTTP bridge session lease", exc_info=True)
-        await self._load_balancer.release_account_lease(session.account_lease)
-        session.account_lease = None
-        if not session.upstream_close_attempted:
-            session.upstream_close_attempted = True
-            try:
-                await session.upstream.close()
-            except Exception:
-                logger.debug("Failed to close stale pending HTTP bridge upstream websocket", exc_info=True)
+        async with session.pending_lock:
+            should_close = not session.upstream_close_attempted
+            if should_close:
+                session.upstream_close_attempted = True
+        if should_close:
+            await self._close_http_bridge_session_bounded(session, reason="retire_stale_pending")
         _log_http_bridge_event(
             "retire_stale_pending",
             session.key,
@@ -1068,7 +1928,12 @@ class _HTTPBridgeRequestSubmitMixin:
         request_state: _WebSocketRequestState,
         text_data: str,
         send_request: bool = True,
+        require_same_account: bool = False,
     ) -> bool:
+        require_same_account = require_same_account or is_http_bridge_account_neutral_replay(
+            kind=session.key.affinity_kind,
+            key=session.key.affinity_key,
+        )
         retry_text_data = text_data
         using_fresh_replay = False
         if request_state.previous_response_id is not None and send_request:
@@ -1076,16 +1941,14 @@ class _HTTPBridgeRequestSubmitMixin:
             # upstream already accepted the continuation. Re-sending the same
             # previous_response_id request can fork continuity with duplicate
             # child responses, so only reconnect-without-resend is allowed.
-            # The single exception is proxy-injected anchors on trim-safe
-            # full-resend payloads: dropping the anchor and replaying the
-            # original unanchored request is equivalent to the client's own
-            # retry. Session-level injections do not opt in because their
-            # payload may depend on the anchor for context preservation.
-            if (
-                not request_state.proxy_injected_previous_response_id
-                or not request_state.fresh_upstream_request_text
-                or not request_state.fresh_upstream_request_is_retry_safe
-            ):
+            # The single exception is a proof-gated, trim-safe full-resend
+            # payload: dropping the anchor and replaying the original
+            # unanchored request is equivalent to the client's own retry.
+            # The proof is independent of where the anchor came from; a
+            # client-provided full resend is as safe as a durable injection.
+            # Session-level follow-ups do not opt in because their context may
+            # depend on the anchor.
+            if not request_state.fresh_upstream_request_text or not request_state.fresh_upstream_request_is_retry_safe:
                 return False
             retry_text_data = request_state.fresh_upstream_request_text
             using_fresh_replay = True
@@ -1108,6 +1971,7 @@ class _HTTPBridgeRequestSubmitMixin:
                 session,
                 request_state=request_state,
                 restart_reader=True,
+                require_same_account=require_same_account,
             )
             if send_request:
                 retry_text_data = self._http_bridge_text_with_account_installation_id(
@@ -1123,49 +1987,213 @@ class _HTTPBridgeRequestSubmitMixin:
             _clear_websocket_request_error_overrides(request_state)
             session.last_used_at = _service_time().monotonic()
             return True
+        except UpstreamWebSocketTransportError:
+            # The new socket may have accepted response.create. Let the reader
+            # owner retire the whole session with the typed, non-replayable
+            # failure instead of falling back to the earlier close reason.
+            raise
         except Exception:
             logger.warning("HTTP bridge retry on fresh upstream failed", exc_info=True)
             return False
 
-    async def _retry_http_bridge_precreated_request(self: Any, session: "_HTTPBridgeSession") -> bool:
-        async with session.pending_lock:
-            retryable_requests = [
-                request_state
-                for request_state in session.pending_requests
-                if not request_state.draining_until_terminal
-                and _websocket_request_can_replay_before_visible_output(request_state)
-            ]
-            if len(retryable_requests) != 1:
+    async def _retry_http_bridge_precreated_request(
+        self: Any,
+        session: "_HTTPBridgeSession",
+        *,
+        request_state: _WebSocketRequestState | None = None,
+        restart_reader: bool = False,
+    ) -> bool:
+        clean_close_retry_max_count = self._http_bridge_clean_close_retry_max_count()
+        account_neutral_recovery = is_http_bridge_account_neutral_replay(
+            kind=session.key.affinity_kind,
+            key=session.key.affinity_key,
+        )
+
+        def request_is_retryable(request_state: _WebSocketRequestState) -> bool:
+            if _websocket_request_can_replay_before_visible_output(request_state):
+                return True
+            if (
+                clean_close_retry_max_count <= 0
+                or request_state.replay_count != 1
+                or request_state.response_event_count != 0
+                or request_state.clean_close_replay_count >= clean_close_retry_max_count
+                or _classify_upstream_close(
+                    session.last_upstream_close_code,
+                    response_events_seen=request_state.response_event_count,
+                )
+                != "clean"
+            ):
                 return False
-            request_state = retryable_requests[0]
+            return _websocket_request_can_replay_before_visible_output(
+                request_state,
+                allow_clean_close_retry=True,
+            )
+
+        fresh_hard_request_account_switch_candidate = False
+        proof_gated_continuity_replay_candidate = False
+        if session.key.strength == "hard":
+            async with session.pending_lock:
+                retryable_candidates = [
+                    request_state
+                    for request_state in session.pending_requests
+                    if not request_state.draining_until_terminal and request_is_retryable(request_state)
+                ]
+                if len(retryable_candidates) == 1:
+                    candidate = retryable_candidates[0]
+                    fresh_hard_request_account_switch_candidate = (
+                        candidate.previous_response_id is None
+                        and not candidate.hard_continuity_anchor
+                        and not candidate.proxy_injected_previous_response_id
+                        and not candidate.file_required_preferred_account
+                        and candidate.response_event_count == 0
+                        and candidate.replay_count == 0
+                    )
+                    proof_gated_continuity_replay_candidate = (
+                        candidate.previous_response_id is not None
+                        and candidate.fresh_upstream_request_is_retry_safe
+                        and bool(candidate.fresh_upstream_request_text)
+                        and candidate.response_event_count == 0
+                        and candidate.replay_count == 0
+                    )
+        if not await self._http_bridge_precreated_retry_allowed(
+            session,
+            allow_fresh_hard_account_switch=fresh_hard_request_account_switch_candidate,
+            allow_proof_gated_continuity_replay=proof_gated_continuity_replay_candidate,
+        ):
+            return False
+
+        account_neutral_recovery = is_http_bridge_account_neutral_replay(
+            kind=session.key.affinity_kind,
+            key=session.key.affinity_key,
+        )
+        hard_owner_bound = _http_bridge_key_strength(session.key) == "hard"
+        async with session.pending_lock:
+            if request_state is not None:
+                if (
+                    request_state not in session.pending_requests
+                    or any(pending_request is not request_state for pending_request in session.pending_requests)
+                    or request_state.draining_until_terminal
+                    or not _http_bridge_request_counts_against_queue(request_state)
+                    or not request_is_retryable(request_state)
+                ):
+                    return False
+            else:
+                retryable_requests = [
+                    request_state
+                    for request_state in session.pending_requests
+                    if not request_state.draining_until_terminal and request_is_retryable(request_state)
+                ]
+                if len(retryable_requests) != 1:
+                    return False
+                request_state = retryable_requests[0]
+            model_fallback_replay = request_state.precreated_replay_reason == _ACCOUNT_MODEL_UNSUPPORTED_ERROR_CODE
             if request_state.previous_response_id is not None and not (
-                request_state.proxy_injected_previous_response_id
-                and request_state.fresh_upstream_request_is_retry_safe
-                and request_state.fresh_upstream_request_text
+                request_state.fresh_upstream_request_is_retry_safe and request_state.fresh_upstream_request_text
             ):
                 # Once a continuation is pending upstream, reconnecting without
                 # replay cannot complete the current request, while replaying it
                 # is unsafe without upstream idempotency guarantees. Proxy-
-                # injected retry-safe anchors are equivalent to the client's own
-                # full resend once the anchor is stripped.
+                # injected anchors and proof-gated client full resends are
+                # equivalent to the client's own retry once the anchor is
+                # stripped. The latter remains pinned to the current owner.
                 return False
             close_classification = _classify_upstream_close(
                 session.last_upstream_close_code,
                 response_events_seen=request_state.response_event_count,
             )
-            if close_classification == "rejected":
-                request_state.error_code_override = "upstream_rejected_input"
-                request_state.error_http_status_override = 502
-                request_state.error_message_override = (
-                    "Upstream rejected the request before response.created "
-                    f"(close_code={session.last_upstream_close_code})"
-                )
+            close_generation = session.last_upstream_close_generation
+            hard_session_affinity = session.key.strength == "hard"
+            fresh_hard_request_account_switch_allowed = (
+                hard_session_affinity
+                and request_state.previous_response_id is None
+                and not request_state.hard_continuity_anchor
+                and not request_state.proxy_injected_previous_response_id
+                and not request_state.file_required_preferred_account
+            )
+            clean_close_hard_continuation = (
+                close_classification == "clean"
+                and hard_session_affinity
+                and request_state.previous_response_id is not None
+            )
+            clean_close_hard_continuity_anchor = (
+                close_classification == "clean" and hard_session_affinity and request_state.hard_continuity_anchor
+            )
+            clean_close_retry_for_current_close = (
+                close_classification == "clean"
+                and request_state.clean_close_retry_close_generation != close_generation
+                and not request_state.clean_close_retry_in_progress
+            )
+            additional_clean_close_retry = (
+                clean_close_retry_for_current_close
+                and request_state.replay_count == 1
+                and request_state.response_event_count == 0
+                and request_state.clean_close_replay_count < clean_close_retry_max_count
+            )
+            if request_state.replay_count >= 1 and not additional_clean_close_retry:
                 return False
-            request_text = _prepare_websocket_request_state_for_visible_output_replay(request_state)
-            if request_text is None:
-                return False
+            if request_state.previous_response_id is not None:
+                require_preferred_reconnect = False
+                if account_neutral_recovery:
+                    request_state.preferred_account_id = session.account.id
+                    switch_text = None
+                else:
+                    switch_text = _prepare_websocket_request_state_for_account_switch(request_state)
+                if switch_text is None:
+                    # The retained full body may be retry-safe for continuity
+                    # while still naming an account-scoped uploaded file.  In
+                    # that case retry on the same owner-bound anchor instead of
+                    # letting visible-output replay strip the anchor and migrate.
+                    fresh_retry_safe = request_state.fresh_upstream_request_is_retry_safe
+                    request_state.fresh_upstream_request_is_retry_safe = False
+                    try:
+                        request_text = _prepare_websocket_request_state_for_visible_output_replay(request_state)
+                    finally:
+                        request_state.fresh_upstream_request_is_retry_safe = fresh_retry_safe
+                    if request_text is None:
+                        return False
+                    require_preferred_reconnect = request_state.preferred_account_id is not None
+                else:
+                    request_text = _prepare_websocket_request_state_for_visible_output_replay(request_state)
+                    if request_text is None:
+                        return False
+                    if not hard_owner_bound:
+                        request_state.excluded_account_ids.add(session.account.id)
+            else:
+                # Account-scoped uploaded files cannot be replayed on a
+                # different owner. Keep the preferred account mandatory for
+                # both silent recovery and clean-close recovery.
+                require_preferred_reconnect = account_neutral_recovery or request_state.file_required_preferred_account
+                request_text = _prepare_websocket_request_state_for_visible_output_replay(request_state)
+                if request_text is None:
+                    return False
+                if account_neutral_recovery:
+                    request_state.preferred_account_id = session.account.id
+                elif not request_state.file_required_preferred_account:
+                    if hard_owner_bound and not model_fallback_replay and not fresh_hard_request_account_switch_allowed:
+                        request_state.preferred_account_id = session.account.id
+                    else:
+                        request_state.preferred_account_id = None
+                        request_state.excluded_account_ids.add(session.account.id)
+            if session.account.id in request_state.excluded_account_ids:
+                session.upstream_turn_state = None
+                session.downstream_turn_state = None
+                session.headers = {
+                    key: value for key, value in session.headers.items() if key.lower() != "x-codex-turn-state"
+                }
+            if close_classification == "clean":
+                if not clean_close_retry_for_current_close:
+                    return False
+                request_state.clean_close_retry_in_progress = True
+                request_state.clean_close_retry_result = None
+                request_state.clean_close_retry_close_generation = close_generation
+            if additional_clean_close_retry:
+                request_state.clean_close_replay_count += 1
+        retry_jitter_seconds = (
+            self._http_bridge_clean_close_retry_jitter_seconds() if additional_clean_close_retry else 0.0
+        )
+        retry_event = "retry_precreated_clean_close" if additional_clean_close_retry else "retry_precreated"
         _log_http_bridge_event(
-            "retry_precreated",
+            retry_event,
             session.key,
             account_id=session.account.id,
             model=session.request_model,
@@ -1173,16 +2201,141 @@ class _HTTPBridgeRequestSubmitMixin:
             cache_key_family=session.key.affinity_kind,
             model_class=_extract_model_class(session.request_model) if session.request_model else None,
         )
+        reconnect_reader_kwargs = {"restart_reader": True} if restart_reader else {}
         try:
-            await self._reconnect_http_bridge_session(session, request_state=request_state)
+            if retry_jitter_seconds > 0:
+                logger.info(
+                    "HTTP bridge clean-close retry jitter request_id=%s sleep_seconds=%.3f",
+                    request_state.request_id,
+                    retry_jitter_seconds,
+                )
+                await asyncio.sleep(retry_jitter_seconds)
+                request_deadline = request_state.bridge_request_deadline
+                if request_deadline is None:
+                    request_deadline = request_state.started_at + _http_bridge_request_budget_seconds(
+                        _service_get_settings()
+                    )
+                now_monotonic = _service_time().monotonic()
+                async with session.pending_lock:
+                    request_still_owned = (
+                        request_state in session.pending_requests and not request_state.draining_until_terminal
+                    )
+                if not request_still_owned or now_monotonic >= request_deadline:
+                    logger.info(
+                        "HTTP bridge clean-close retry abandoned after jitter request_id=%s "
+                        "still_owned=%s deadline_expired=%s",
+                        request_state.request_id,
+                        request_still_owned,
+                        now_monotonic >= request_deadline,
+                    )
+                    request_state.clean_close_retry_result = False
+                    return False
+            # A fresh hard-session replay may select a replacement account.
+            # The admission lease is account-scoped, so release the old
+            # account's lease before reconnecting; the post-reconnect path
+            # below acquires a lease for the account actually selected.
+            if fresh_hard_request_account_switch_allowed:
+                await self._release_request_state_account_response_create_lease(request_state)
+            if hard_owner_bound and not model_fallback_replay and not fresh_hard_request_account_switch_allowed:
+                await self._reconnect_http_bridge_session(
+                    session,
+                    request_state=request_state,
+                    require_same_account=True,
+                    **reconnect_reader_kwargs,
+                )
+            elif require_preferred_reconnect:
+                await self._reconnect_http_bridge_session(
+                    session,
+                    request_state=request_state,
+                    require_same_account=account_neutral_recovery,
+                    require_preferred_account=True,
+                    **reconnect_reader_kwargs,
+                )
+            elif clean_close_hard_continuation or clean_close_hard_continuity_anchor:
+                await self._reconnect_http_bridge_session(
+                    session,
+                    request_state=request_state,
+                    # Continuity anchors (previous_response_id and turn-state)
+                    # are account-bound. Do not migrate them while recovering a
+                    # clean handoff close.
+                    require_same_account=True,
+                    **reconnect_reader_kwargs,
+                )
+            else:
+                await self._reconnect_http_bridge_session(
+                    session,
+                    request_state=request_state,
+                    **reconnect_reader_kwargs,
+                )
+            if request_state.account_response_create_lease is None:
+                current_settings = await _service_get_settings_cache().get()
+                request_state.account_response_create_lease = (
+                    await self._acquire_account_response_create_lease_or_overload(
+                        account_id=session.account.id,
+                        request_id=request_state.request_log_id or request_state.request_id,
+                        surface="http_bridge",
+                        concurrency_caps=effective_account_concurrency_caps(current_settings),
+                    )
+                )
+                request_state.account_response_create_release = self._load_balancer.release_account_lease
+            enforce_capacity_retry_deadline = request_state.response_create_admission_reacquire_required
+            if enforce_capacity_retry_deadline:
+                retry_deadline = request_state.bridge_request_deadline
+                if retry_deadline is None:
+                    retry_deadline = request_state.started_at + _http_bridge_request_budget_seconds(
+                        _service_get_settings()
+                    )
+                remaining_retry_budget_seconds = retry_deadline - _service_time().monotonic()
+                if remaining_retry_budget_seconds <= 0:
+                    request_state.response_create_admission_reacquire_required = False
+                    await self._release_request_state_account_response_create_lease(request_state)
+                    return False
+                try:
+                    request_state.response_create_admission = await asyncio.wait_for(
+                        self._get_work_admission().acquire_response_create(),
+                        timeout=remaining_retry_budget_seconds,
+                    )
+                except TimeoutError:
+                    request_state.response_create_admission_reacquire_required = False
+                    await self._release_request_state_account_response_create_lease(request_state)
+                    return False
+                request_state.response_create_admission_reacquire_required = False
+                if _service_time().monotonic() >= retry_deadline:
+                    request_state.response_create_admission.release()
+                    request_state.response_create_admission = None
+                    await self._release_request_state_account_response_create_lease(request_state)
+                    return False
+                async with session.pending_lock:
+                    retry_consumer_attached = (
+                        request_state in session.pending_requests
+                        and request_state.event_queue is not None
+                        and not request_state.draining_until_terminal
+                    )
+                if not retry_consumer_attached:
+                    request_state.response_create_admission.release()
+                    request_state.response_create_admission = None
+                    await self._release_request_state_account_response_create_lease(request_state)
+                    return False
             request_text = self._http_bridge_text_with_account_installation_id(session, request_state, request_text)
             await _send_http_bridge_request_text_with_archive_id(session, request_state, request_text)
             session.last_used_at = _service_time().monotonic()
+            request_state.clean_close_retry_result = True
             return True
+        except asyncio.CancelledError:
+            request_state.clean_close_retry_result = False
+            raise
+        except UpstreamWebSocketTransportError:
+            request_state.clean_close_retry_result = False
+            raise
         except Exception as exc:
-            request_state.error_code_override, request_state.error_message_override = (
-                _http_bridge_precreated_retry_failure_error(exc)
-            )
+            request_state.clean_close_retry_result = False
+            (
+                request_state.error_http_status_override,
+                request_state.error_code_override,
+                request_state.error_message_override,
+                request_state.error_type_override,
+                request_state.error_param_override,
+            ) = _http_bridge_precreated_retry_failure_error(exc)
             if isinstance(exc, ProxyResponseError):
                 logger.info(
                     "HTTP bridge pre-created retry failed with terminal proxy error code=%s message=%s",
@@ -1192,6 +2345,8 @@ class _HTTPBridgeRequestSubmitMixin:
             else:
                 logger.warning("HTTP bridge pre-created retry failed", exc_info=True)
             return False
+        finally:
+            request_state.clean_close_retry_in_progress = False
 
     async def _retry_http_bridge_precreated_auth_request(
         self: Any,
@@ -1225,6 +2380,12 @@ class _HTTPBridgeRequestSubmitMixin:
             request_state.force_refresh_account_id = None
             request_state.preferred_account_id = None
             request_state.excluded_account_ids.add(session.account.id)
+            if is_http_bridge_account_neutral_replay(
+                kind=session.key.affinity_kind,
+                key=session.key.affinity_key,
+            ):
+                setattr(request_state, "account_health_error_handled", True)
+                return "not_replayable"
 
         async with session.pending_lock:
             if request_state not in session.pending_requests:
@@ -1241,15 +2402,28 @@ class _HTTPBridgeRequestSubmitMixin:
             model_class=_extract_model_class(session.request_model) if session.request_model else None,
         )
         try:
-            await self._reconnect_http_bridge_session(session, request_state=request_state)
+            await self._reconnect_http_bridge_session(
+                session,
+                request_state=request_state,
+                require_same_account=is_http_bridge_account_neutral_replay(
+                    kind=session.key.affinity_kind,
+                    key=session.key.affinity_key,
+                ),
+            )
             request_text = self._http_bridge_text_with_account_installation_id(session, request_state, request_text)
             await _send_http_bridge_request_text_with_archive_id(session, request_state, request_text)
             session.last_used_at = _service_time().monotonic()
             return "retried"
+        except UpstreamWebSocketTransportError:
+            raise
         except Exception as exc:
-            request_state.error_code_override, request_state.error_message_override = (
-                _http_bridge_precreated_retry_failure_error(exc)
-            )
+            (
+                request_state.error_http_status_override,
+                request_state.error_code_override,
+                request_state.error_message_override,
+                request_state.error_type_override,
+                request_state.error_param_override,
+            ) = _http_bridge_precreated_retry_failure_error(exc)
             if isinstance(exc, ProxyResponseError):
                 logger.info(
                     "HTTP bridge pre-created auth retry failed with terminal proxy error code=%s message=%s",
@@ -1271,19 +2445,60 @@ class _HTTPBridgeRequestSubmitMixin:
             return False
         if request_state.replay_count >= 1:
             return False
+        if is_http_bridge_account_neutral_replay(
+            kind=session.key.affinity_kind,
+            key=session.key.affinity_key,
+        ):
+            return False
         retry_text = request_state.request_text
         if not retry_text:
             return False
+        if request_state.file_required_preferred_account:
+            return False
+        if not _websocket_request_can_replay_before_visible_output(request_state):
+            return False
+
+        owner_account_id = session.account.id
+        previous_replay_count = request_state.replay_count
+        previous_response_id = request_state.response_id
+        previous_response_event_count = request_state.response_event_count
+        previous_upstream_model_output_seen = request_state.upstream_model_output_seen
+        previous_affinity_policy = request_state.affinity_policy
+        previous_session_affinity = session.affinity
+        previous_session_codex_session = session.codex_session
+        previous_session_upstream_turn_state = session.upstream_turn_state
+        previous_session_downstream_turn_state = session.downstream_turn_state
+        previous_session_turn_state_aliases = set(session.downstream_turn_state_aliases)
+        previous_session_turn_state_alias_registration_generations = dict(
+            session.turn_state_alias_registration_generations
+        )
+        previous_session_headers = session.headers
         if request_state.previous_response_id is not None:
-            if not (
-                request_state.fresh_upstream_request_text is not None
-                and request_state.fresh_upstream_request_is_retry_safe
-            ):
-                return False
-            retry_text = request_state.fresh_upstream_request_text
+            retry_text = _prepare_websocket_request_state_for_account_switch(request_state)
+        if retry_text is None:
+            return False
+
+        request_state.preferred_account_id = None
+        request_state.excluded_account_ids.add(owner_account_id)
+        request_state.affinity_policy = replace(
+            request_state.affinity_policy,
+            key=None,
+            kind=None,
+            reallocate_sticky=True,
+        )
+        replacement_session_affinity = replace(
+            session.affinity,
+            key=None,
+            kind=None,
+            reallocate_sticky=True,
+            codex_session_source=None,
+        )
 
         request_state.replay_count += 1
         request_state.response_id = None
+        request_state.response_event_count = 0
+        request_state.upstream_model_output_seen = False
+        request_state.deferred_reasoning_downstream_texts = []
         request_state.awaiting_response_created = True
         if retry_text != request_state.request_text:
             request_state.previous_response_id = None
@@ -1304,16 +2519,47 @@ class _HTTPBridgeRequestSubmitMixin:
             cache_key_family=session.key.affinity_kind,
             model_class=_extract_model_class(session.request_model) if session.request_model else None,
         )
+        reconnected = False
         try:
-            await self._reconnect_http_bridge_session(
+            request_state.precreated_replay_account_id = session.account.id
+            await self._release_request_state_account_response_create_lease(request_state)
+            await _call_with_supported_optional_kwargs(
+                self._reconnect_http_bridge_session,
                 session,
+                optional_kwargs={
+                    "owner_rebind_affinity": previous_session_affinity,
+                    "selection_affinity": replacement_session_affinity,
+                },
                 request_state=request_state,
                 require_security_work_authorized=True,
             )
+            reconnected = True
+            settings = await _service_get_settings_cache().get()
+            request_state.account_response_create_lease = await self._acquire_account_response_create_lease_or_overload(
+                account_id=session.account.id,
+                request_id=request_state.request_id,
+                surface="http_bridge_security_retry",
+                concurrency_caps=effective_account_concurrency_caps(settings),
+            )
+            request_state.account_response_create_release = self._load_balancer.release_account_lease
+            if session.account.id != owner_account_id:
+                if (
+                    previous_session_affinity.codex_session_source == "session_header"
+                    and previous_session_affinity.selection_key is not None
+                    and previous_session_affinity.kind is not None
+                ):
+                    async with self._repo_factory() as repos:
+                        await repos.sticky_sessions.upsert(
+                            previous_session_affinity.selection_key,
+                            session.account.id,
+                            kind=previous_session_affinity.kind,
+                        )
             retry_text = self._http_bridge_text_with_account_installation_id(session, request_state, retry_text)
             await _send_http_bridge_request_text_with_archive_id(session, request_state, retry_text)
             session.last_used_at = _service_time().monotonic()
             return True
+        except UpstreamWebSocketTransportError:
+            raise
         except Exception as exc:
             logger.warning("HTTP bridge security-work retry failed", exc_info=True)
             if isinstance(exc, ProxyResponseError):
@@ -1334,4 +2580,77 @@ class _HTTPBridgeRequestSubmitMixin:
                 if request_state in session.pending_requests:
                     session.pending_requests.remove(request_state)
                     session.queued_request_count = max(0, session.queued_request_count - 1)
+            if reconnected:
+                # Ownership and the replacement socket were already swapped,
+                # but response.create never reached that socket.  Retire the
+                # replacement instead of leaving a live bridge with aliases
+                # rebound to a turn that was never submitted.
+                session.upstream_control.reconnect_requested = True
+                session.upstream_control.retire_after_drain = True
+                await self._retire_http_bridge_after_drain_if_ready(session)
+            else:
+                request_state.replay_count = previous_replay_count
+                request_state.response_id = previous_response_id
+                request_state.response_event_count = previous_response_event_count
+                request_state.upstream_model_output_seen = previous_upstream_model_output_seen
+                request_state.deferred_reasoning_downstream_texts = []
+                request_state.affinity_policy = previous_affinity_policy
+                session.affinity = previous_session_affinity
+                session.codex_session = previous_session_codex_session
+                session.upstream_turn_state = previous_session_upstream_turn_state
+                session.downstream_turn_state = previous_session_downstream_turn_state
+                async with self._http_bridge_lock:
+                    session.downstream_turn_state_aliases.update(previous_session_turn_state_aliases)
+                    session.turn_state_alias_registration_generations.update(
+                        previous_session_turn_state_alias_registration_generations
+                    )
+                    _register_http_bridge_turn_state_aliases_locked(self, session)
+                session.headers = previous_session_headers
             return False
+
+    async def _claim_http_bridge_replacement_before_swap(
+        self: Any,
+        session: "_HTTPBridgeSession",
+        *,
+        account_id: str,
+        upstream: Any,
+        release_selected_account_lease: Any,
+        owner_rebind_affinity: _AffinityPolicy,
+    ) -> None:
+        if account_id == session.account.id:
+            return
+        try:
+            if owner_rebind_affinity.legacy_selection_key is not None and owner_rebind_affinity.kind is not None:
+                async with self._repo_factory() as repos:
+                    legacy_owner_id = await repos.sticky_sessions.get_account_id(
+                        owner_rebind_affinity.legacy_selection_key,
+                        kind=owner_rebind_affinity.kind,
+                        max_age_seconds=owner_rebind_affinity.max_age_seconds,
+                    )
+                if legacy_owner_id is not None and legacy_owner_id != account_id:
+                    raise ProxyResponseError(
+                        502,
+                        openai_error(
+                            "continuity_owner_conflict",
+                            "Security retry conflicts with a legacy continuity owner.",
+                            error_type="server_error",
+                        ),
+                    )
+            if session.durable_session_id is not None:
+                await _call_with_supported_optional_kwargs(
+                    self._claim_durable_http_bridge_session,
+                    session,
+                    optional_kwargs={
+                        "claim_account_id": account_id,
+                        "clear_latest_turn_state": True,
+                    },
+                    allow_takeover=True,
+                    force_owner_epoch_advance=True,
+                )
+        except BaseException:
+            try:
+                await upstream.close()
+            except Exception:
+                logger.debug("Failed to close unclaimed HTTP bridge replacement websocket", exc_info=True)
+            await release_selected_account_lease()
+            raise

@@ -32,6 +32,40 @@ See `openspec/specs/responses-api-compat/spec.md` for normative requirements.
 - `/v1/responses/compact` is supported only when the upstream implements it.
 - `prompt_cache_key` affinity on OpenAI-style routes is intentionally bounded by a dashboard-managed freshness window, unlike durable backend `session_id` or dashboard sticky-thread routing.
 - Codex-native direct websocket `/backend-api/codex/responses` treats upstream `previous_response_id` as an ephemeral anchor. If that anchor goes stale, the proxy must mask raw `previous_response_not_found` details and emit a sanitized `codex_previous_response_stale` classifier so compatible Codex clients can soft-reset and retry without `previous_response_id`.
+- Upstream Responses WebSockets use transport ping/pong control frames to detect a black-holed connection without confusing valid application-event silence with an idle turn. Direct and routed connections reuse `proxy_downstream_websocket_idle_timeout_seconds` for this zero-config liveness budget.
+- A post-send liveness timeout is delivery-ambiguous. It remains account-neutral, is never transparently replayed, and retires the affected upstream socket so a client retry opens a fresh route without risking duplicated model work or tool side effects.
+- HTTP bridge settlement ownership is explicit: `closed` rejects new work but does not imply that a submitter owns existing siblings. Only a liveness-failed send claims whole-deque settlement under the lifecycle lock; otherwise the reader remains responsible for settling pending requests when the transport dies.
+
+## Oversized downstream WebSocket HTTP fallback
+
+The upstream Responses WebSocket has a frame budget that does not apply to the
+upstream HTTP/SSE route. After historical slimming, codex-lb can move one
+otherwise valid downstream WebSocket turn to upstream HTTP without changing the
+client-facing event stream. This is deliberately narrower than a general
+transport retry: the decision happens before upstream dispatch and admits only
+an unanchored, conversation-free complete resend or a client-anchored input made
+entirely of current tool outputs. Conversation-backed requests,
+proxy-injected anchors, and anchored non-tool requests remain fail-closed.
+
+The HTTP relay inherits the routing proof already established during WebSocket
+request preparation. Previous-response ownership, session affinity, file-owner
+pinning, admission, and API-key reservation settlement are transferred rather
+than recomputed. A turn that produces `resp_A` over upstream HTTP records that
+transport in the API-key/session-scoped owner cache and request log; an exact
+continuation of `resp_A` stays on HTTP, while an unrelated response id and
+legacy rows without transport provenance follow the ordinary WebSocket path.
+
+For example, a complete resend containing several inline screenshots can
+arrive without `previous_response_id` or `conversation`, exceed the final
+projected WebSocket frame budget, and still deliver normal `response.created`,
+delta, and terminal events to the same downstream socket through the HTTP
+relay. A second unanchored resend cannot overtake that relay, and connection
+cancellation targets the newest active turn.
+
+Operationally, monitor `payload_too_large`, `stream_incomplete`, upstream
+transport on WebSocket request logs, and reservation-settlement failures after
+deployment. A rise in HTTP-upstream WebSocket turns is expected only for these
+oversized bodies and exact continuations of their HTTP-created response ids.
 
 ## Fast Mode and Service Tiers
 
@@ -69,6 +103,15 @@ Responses request with:
 Clients that expose Fast Mode as `fast` may keep using that spelling; codex-lb
 normalizes it to `priority` before forwarding.
 
+### Operator Fast Mode prohibition
+
+Operators can enable the Routing setting `prohibitFastMode` when qualified
+Codex harness model aliases such as `gpt-5.6-sol-xhigh-fast` must run at the
+normal OpenAI tier. The alias still supplies its canonical model and reasoning
+effort, but does not derive `service_tier: "priority"`. This policy does not
+rewrite an explicit client tier or an API-key-enforced tier; see
+`openspec/specs/fast-mode-policy/context.md` for scope and operating notes.
+
 API keys can also force the tier for traffic that uses that key. Set the key's
 enforced service tier to `priority` or `fast`; both values are stored and
 returned as `priority`.
@@ -101,10 +144,11 @@ when upstream reports a different actual tier.
 - **Upstream error / no accounts:** Non-streaming responses return an OpenAI error envelope with 5xx status.
 - **Compact upstream transport/client failure:** Retry only inside `/codex/responses/compact` when the failure is safely retryable; otherwise return an explicit upstream error without surrogate fallback.
 - **HTTP bridge session closes or expires:** The next compatible HTTP `/v1/responses` or `/backend-api/codex/responses` request recreates a fresh upstream websocket bridge session; continuity is guaranteed only within the lifetime of one active bridged session.
-- **Multi-instance routing without bridge owner policy:** if operators do not configure a bridge ring or front-door affinity, continuity can still fragment across replicas. With a configured bridge ring, hard continuity keys still fail closed on the wrong replica, while gateway-safe prompt-cache requests may accept locality misses instead of failing.
+- **Multi-instance routing without bridge owner policy:** if operators do not configure a bridge ring or front-door affinity, continuity can still fragment across replicas. With a configured bridge ring, hard continuity keys landing on a non-owner replica are proxy-forwarded to the owner replica; the proxy fails closed only when the owner endpoint or ring membership cannot be resolved or the forward signature fails authentication. Gateway-safe prompt-cache requests may accept locality misses and continue locally instead of forwarding.
 - **Codex websocket reconnects:** Reconnect continuity now depends on the client replaying the accepted `x-codex-turn-state`; generated turn-state is emitted on accept for backend Codex routes and echoed back when the client already supplies one.
 - **Codex websocket stale previous-response anchors:** Direct backend Codex websocket stale-anchor failures are surfaced as `response.failed` / `codex_previous_response_stale` without the raw upstream code or missing `resp_...` id; OpenAI-compatible `/v1/responses` websocket clients continue to receive generic `stream_incomplete` masking.
 - **Websocket handshake forbidden/not-found:** Auto transport now fails loud on `403` / `404` instead of silently hiding the websocket regression behind HTTP fallback.
+- **Upstream websocket stops answering pings:** Pending direct-WebSocket and HTTP-bridge work fails with `upstream_websocket_liveness_timeout`; the account remains healthy and the request is not replayed because upstream acceptance is unknown.
 - **Invalid request payloads:** Return 4xx with `invalid_request_error`.
 
 ## Error Envelope Mapping (Reference)
@@ -137,6 +181,25 @@ Cursor-style model alias request:
 
 This forwards upstream as `model: "gpt-5.4-mini"` with `reasoning.effort: "high"`.
 
+## Known Client Integrations (Reference)
+
+Third-party agents that consume the `/v1` Responses surface documented by this
+capability (rendered guide: `docs/client-setup.md`). These are configuration
+examples against the existing contract, not separate compatibility surfaces:
+
+- **OpenCode** — built-in `openai` provider with a `baseURL` override; uses the
+  Responses API path so `encrypted_content` / multi-turn reasoning state is
+  preserved (Chat Completions custom providers drop it).
+- **OpenClaw** — custom provider with `"api": "openai-responses"` against
+  `/v1`; Codex-native provider builds may target `/backend-api/codex` instead.
+- **Hermes Agent** (Nous Research) — named custom provider with
+  `api_mode: codex_responses` against `/v1`; the responses transport carries
+  reasoning state across turns like the OpenCode path.
+
+New client guides added to `docs/client-setup.md` should stay configuration-only
+examples of this contract; anything needing new proxy behavior requires its own
+OpenSpec change first.
+
 ## Operational Notes
 
 - Pre-release: run unit/integration tests and optional OpenAI client compatibility tests.
@@ -146,5 +209,6 @@ This forwards upstream as `model: "gpt-5.4-mini"` with `reasoning.effort: "high"
 - Post-deploy: monitor `capacity_exhausted_active_sessions`, Codex-session bridge reuse/evict counts, websocket handshake 403/404 rates after the narrower auto-fallback policy, and backend Codex HTTP vs websocket cache-ratio gaps.
 - When tracing compact incidents, confirm that request logs and upstream logs show direct `/codex/responses/compact` usage without surrogate `/codex/responses` fallback.
 - Post-deploy: monitor `no_accounts`, `stream_incomplete`, and `upstream_unavailable`.
+- Post-deploy: monitor `upstream_websocket_liveness_timeout`; recurring failures indicate a host route, VPN, proxy, or intermediary that black-holes established WebSockets.
 - Post-deploy: monitor `codex_previous_response_stale` on `/backend-api/codex/responses`; recurring spikes mean clients are still relying on stale upstream anchors and should perform the documented full-context retry without `previous_response_id`.
 - Websocket/Codex CLI tier verification runbook: `openspec/specs/responses-api-compat/ops.md`

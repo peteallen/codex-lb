@@ -1,12 +1,21 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import timedelta
 
 import pytest
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.cache.invalidation import (
+    NAMESPACE_UPSTREAM_ROUTE,
+    CacheInvalidationPoller,
+    set_cache_invalidation_poller,
+)
+from app.core.config.settings import get_settings
 from app.core.crypto import TokenEncryptor
+from app.core.upstream_proxy.cache import get_upstream_route_cache
 from app.core.utils.time import utcnow
 from app.db.models import (
     Account,
@@ -15,7 +24,10 @@ from app.db.models import (
     AdditionalUsageHistory,
     ApiKey,
     ApiKeyAccountAssignment,
+    CacheInvalidation,
+    HttpBridgeSessionAlias,
     HttpBridgeSessionRecord,
+    HttpBridgeSessionState,
     RequestLog,
     StickySession,
     StickySessionKind,
@@ -29,6 +41,8 @@ from app.modules.accounts.repository import (
     _slot_lock_key,
     _slot_lock_keys,
 )
+from app.modules.proxy.durable_bridge_coordinator import DurableBridgeSessionCoordinator
+from app.modules.proxy.durable_bridge_repository import durable_bridge_api_key_scope, durable_bridge_hash
 from app.modules.request_logs.repository import RequestLogsRepository
 from app.modules.usage.repository import UsageRepository
 
@@ -118,6 +132,77 @@ async def test_accounts_upsert_reauthorized_heals_deactivated_identity_even_when
         result = await session.execute(select(Account).where(Account.email == "reauth@example.com"))
         rows = list(result.scalars().all())
         assert len(rows) == 1
+
+
+@pytest.mark.asyncio
+async def test_replace_reauthorized_discards_pending_downgrade_evidence(db_setup):
+    """In-place reauthentication must reset pending plan-downgrade evidence.
+
+    Regression for the replaced-credential half of #1456's review: account ids
+    are deterministic, so reauthenticating a row in place reuses the id with new
+    token material — and without the replacement-time discard, the new
+    credential's very first `free` payload would count as the second observation
+    and land a downgrade on a single sample.
+    """
+    from app.modules.usage.plan_downgrade_observations import PlanDowngradeObservationStore
+
+    store = PlanDowngradeObservationStore()
+    async with SessionLocal() as session:
+        repo = AccountsRepository(session)
+        await repo.upsert(_make_account("acc_reauth_evidence", "reauth-evidence@example.com"))
+
+        assert (
+            await store.observe(
+                "acc_reauth_evidence",
+                credential_fingerprint="fp-previous-credential",
+                observed_plan_type="free",
+            )
+            == 1
+        )
+
+        incoming = _make_account("acc_reauth_evidence", "reauth-evidence@example.com")
+        replaced = await repo.replace_reauthorized("acc_reauth_evidence", incoming)
+        assert replaced is not None
+
+    assert await store.get("acc_reauth_evidence") is None, (
+        "fresh credential material must discard evidence gathered under the previous credential"
+    )
+
+
+@pytest.mark.asyncio
+async def test_upsert_account_slot_discards_pending_downgrade_evidence_on_reimport(db_setup):
+    """Re-importing an account in place must reset pending downgrade evidence.
+
+    The delete-then-re-import flow is covered by ``ondelete="CASCADE"``; this
+    pins the other replacement shape, where the import lands on the existing row
+    through ``upsert_account_slot`` without any deletion.
+    """
+    from app.modules.usage.plan_downgrade_observations import PlanDowngradeObservationStore
+
+    store = PlanDowngradeObservationStore()
+    async with SessionLocal() as session:
+        repo = AccountsRepository(session)
+        original = _make_account("acc_reimport_evidence", "reimport-evidence@example.com")
+        original.chatgpt_account_id = "upstream_reimport"
+        await repo.upsert_account_slot(original)
+
+        assert (
+            await store.observe(
+                "acc_reimport_evidence",
+                credential_fingerprint="fp-previous-credential",
+                observed_plan_type="free",
+            )
+            == 1
+        )
+
+        reimported = _make_account("acc_reimport_evidence", "reimport-evidence@example.com")
+        reimported.chatgpt_account_id = "upstream_reimport"
+        saved = await repo.upsert_account_slot(reimported)
+        assert saved.id == "acc_reimport_evidence"
+
+    assert await store.get("acc_reimport_evidence") is None, (
+        "an in-place re-import must discard evidence gathered under the previous credential"
+    )
 
 
 @pytest.mark.asyncio
@@ -418,6 +503,193 @@ def _make_account_with_chatgpt_id(account_id: str, email: str, chatgpt_id: str) 
     account = _make_account(account_id, email)
     account.chatgpt_account_id = chatgpt_id
     return account
+
+
+def _add_durable_bridge_session(session: AsyncSession, *, account_id: str, session_id: str) -> HttpBridgeSessionRecord:
+    api_key_scope = durable_bridge_api_key_scope(None)
+    session_key_value = f"sid-{session_id}"
+    turn_state = f"http_turn_{session_id}"
+    response_id = f"resp_{session_id}"
+    record = HttpBridgeSessionRecord(
+        id=session_id,
+        session_key_kind="session_header",
+        session_key_value=session_key_value,
+        session_key_hash=durable_bridge_hash(session_key_value),
+        api_key_scope=api_key_scope,
+        owner_instance_id="instance-a",
+        owner_epoch=1,
+        lease_expires_at=utcnow() + timedelta(minutes=5),
+        state=HttpBridgeSessionState.ACTIVE,
+        account_id=account_id,
+        latest_turn_state=turn_state,
+        latest_response_id=response_id,
+        latest_input_item_count=3,
+        latest_input_full_fingerprint="a" * 64,
+        latest_pending_tool_calls_json=json.dumps(
+            {
+                "response_id": response_id,
+                "calls": {"call_stale": "function_call"},
+            },
+            separators=(",", ":"),
+        ),
+        last_seen_at=utcnow(),
+    )
+    session.add(record)
+    session.add_all(
+        [
+            HttpBridgeSessionAlias(
+                session_id=session_id,
+                alias_kind="turn_state",
+                alias_value=turn_state,
+                alias_hash=durable_bridge_hash(turn_state),
+                api_key_scope=api_key_scope,
+            ),
+            HttpBridgeSessionAlias(
+                session_id=session_id,
+                alias_kind="previous_response_id",
+                alias_value=response_id,
+                alias_hash=durable_bridge_hash(response_id),
+                api_key_scope=api_key_scope,
+            ),
+            HttpBridgeSessionAlias(
+                session_id=session_id,
+                alias_kind="session_header",
+                alias_value=session_key_value,
+                alias_hash=durable_bridge_hash(session_key_value),
+                api_key_scope=api_key_scope,
+            ),
+        ]
+    )
+    return record
+
+
+async def _get_bridge_session(session: AsyncSession, session_id: str) -> HttpBridgeSessionRecord:
+    result = await session.execute(
+        select(HttpBridgeSessionRecord)
+        .where(HttpBridgeSessionRecord.id == session_id)
+        .execution_options(populate_existing=True)
+    )
+    return result.scalar_one()
+
+
+async def _get_bridge_aliases(session: AsyncSession, session_id: str) -> list[HttpBridgeSessionAlias]:
+    result = await session.execute(
+        select(HttpBridgeSessionAlias)
+        .where(HttpBridgeSessionAlias.session_id == session_id)
+        .execution_options(populate_existing=True)
+    )
+    return list(result.scalars().all())
+
+
+def _assert_bridge_session_closed_without_continuity(record: HttpBridgeSessionRecord) -> None:
+    assert record.account_id is None
+    assert record.state == HttpBridgeSessionState.CLOSED
+    assert record.closed_at is not None
+    assert record.owner_instance_id is None
+    assert record.lease_expires_at is None
+    assert record.latest_turn_state is None
+    assert record.latest_response_id is None
+    assert record.latest_input_item_count is None
+    assert record.latest_input_full_fingerprint is None
+    assert record.latest_pending_tool_calls_json is None
+
+
+@pytest.mark.asyncio
+async def test_accounts_update_status_closes_bridge_without_durable_aliases(db_setup):
+    async with SessionLocal() as session:
+        repo = AccountsRepository(session)
+        account = _make_account("acc_bridge_close", "bridge-close@example.com")
+        session_id = "bridge-update-status-close"
+        session.add(account)
+        bridge = _add_durable_bridge_session(
+            session,
+            account_id=account.id,
+            session_id=session_id,
+        )
+        await session.commit()
+
+        updated = await repo.update_status(
+            account.id,
+            AccountStatus.REAUTH_REQUIRED,
+            "Refresh token was revoked - re-login required",
+        )
+
+        assert updated is True
+        assert await _get_bridge_aliases(session, bridge.id) == []
+        _assert_bridge_session_closed_without_continuity(await _get_bridge_session(session, bridge.id))
+        assert (
+            await DurableBridgeSessionCoordinator(SessionLocal).lookup_request_targets(
+                session_key_kind="request",
+                session_key_value="req-after-close",
+                api_key_id=None,
+                turn_state=f"http_turn_{session_id}",
+                session_header=f"sid-{session_id}",
+                previous_response_id=f"resp_{session_id}",
+            )
+            is None
+        )
+
+
+@pytest.mark.asyncio
+async def test_accounts_update_status_if_current_closes_bridge_only_after_match(db_setup):
+    async with SessionLocal() as session:
+        repo = AccountsRepository(session)
+        account = _make_account("acc_bridge_cas", "bridge-cas@example.com")
+        session_id = "bridge-update-status-if-current"
+        session.add(account)
+        bridge = _add_durable_bridge_session(
+            session,
+            account_id=account.id,
+            session_id=session_id,
+        )
+        await session.commit()
+
+        stale_update = await repo.update_status_if_current(
+            account.id,
+            AccountStatus.DEACTIVATED,
+            "Refresh token was revoked - re-login required",
+            expected_status=AccountStatus.PAUSED,
+        )
+
+        assert stale_update is False
+        unchanged = await _get_bridge_session(session, bridge.id)
+        assert unchanged.account_id == account.id
+        assert unchanged.state == HttpBridgeSessionState.ACTIVE
+        assert unchanged.latest_turn_state == "http_turn_bridge-update-status-if-current"
+        assert unchanged.latest_response_id == "resp_bridge-update-status-if-current"
+        assert len(await _get_bridge_aliases(session, bridge.id)) == 3
+        unchanged_lookup = await DurableBridgeSessionCoordinator(SessionLocal).lookup_request_targets(
+            session_key_kind="request",
+            session_key_value="req-stale-cas",
+            api_key_id=None,
+            turn_state=f"http_turn_{session_id}",
+            session_header=f"sid-{session_id}",
+            previous_response_id=f"resp_{session_id}",
+        )
+        assert unchanged_lookup is not None
+        assert unchanged_lookup.account_id == account.id
+
+        matched_update = await repo.update_status_if_current(
+            account.id,
+            AccountStatus.DEACTIVATED,
+            "Refresh token was revoked - re-login required",
+            expected_status=AccountStatus.ACTIVE,
+        )
+
+        assert matched_update is True
+        assert await _get_bridge_aliases(session, bridge.id) == []
+        _assert_bridge_session_closed_without_continuity(await _get_bridge_session(session, bridge.id))
+        assert (
+            await DurableBridgeSessionCoordinator(SessionLocal).lookup_request_targets(
+                session_key_kind="request",
+                session_key_value="req-after-cas-close",
+                api_key_id=None,
+                turn_state=f"http_turn_{session_id}",
+                session_header=f"sid-{session_id}",
+                previous_response_id=f"resp_{session_id}",
+            )
+            is None
+        )
 
 
 @pytest.mark.asyncio
@@ -732,7 +1004,10 @@ async def test_accounts_upsert_merge_by_chatgpt_identity_prefers_matching_worksp
 
 
 @pytest.mark.asyncio
-async def test_accounts_upsert_merge_by_chatgpt_identity_reconciles_duplicate_rows(db_setup):
+async def test_accounts_upsert_merge_by_chatgpt_identity_reconciles_duplicate_rows(db_setup, monkeypatch):
+    monkeypatch.setenv("CODEX_LB_UPSTREAM_ROUTE_CACHE_TTL_SECONDS", "60")
+    get_settings.cache_clear()
+    set_cache_invalidation_poller(CacheInvalidationPoller(SessionLocal))
     async with SessionLocal() as session:
         repo = AccountsRepository(session)
 
@@ -830,12 +1105,30 @@ async def test_accounts_upsert_merge_by_chatgpt_identity_reconciles_duplicate_ro
         )
         await session.commit()
 
+        route_cache = get_upstream_route_cache()
+        route_cache.store_route(duplicate_row.id, None, generation=route_cache.generation)
+        assert route_cache.get(duplicate_row.id) is not None
+        version_before = (
+            await session.scalar(
+                select(CacheInvalidation.version).where(CacheInvalidation.namespace == NAMESPACE_UPSTREAM_ROUTE)
+            )
+            or 0
+        )
+
         reauth = _make_account_with_chatgpt_id("acc_merge_main", "merge@example.com", "chatgpt_merge")
         reauth.plan_type = "team"
         saved = await repo.upsert(reauth, merge_by_email=False, merge_by_chatgpt_identity=True)
 
         assert saved.id == "acc_merge_main"
         assert saved.plan_type == "team"
+        assert route_cache.get(duplicate_row.id) is None
+        version_after = (
+            await session.scalar(
+                select(CacheInvalidation.version).where(CacheInvalidation.namespace == NAMESPACE_UPSTREAM_ROUTE)
+            )
+            or 0
+        )
+        assert version_after > version_before
 
         rows = list(
             (await session.execute(select(Account).where(Account.chatgpt_account_id == "chatgpt_merge")))
@@ -996,12 +1289,16 @@ async def test_request_logs_repository_filters(db_setup):
             requested_at=now - timedelta(minutes=5),
         )
 
-        results, total = await repo.list_recent(limit=0, account_ids=["acc1"])
+        result = await repo.list_recent(limit=0, account_ids=["acc1"])
+        results = result.logs
+        total = result.total
         assert len(results) == 1
         assert results[0].account_id == "acc1"
         assert total == 1
 
-        results, total = await repo.list_recent(limit=0, include_success=False)
+        result = await repo.list_recent(limit=0, include_success=False)
+        results = result.logs
+        total = result.total
         assert len(results) == 1
         assert results[0].error_code == "rate_limit_exceeded"
         assert total == 1

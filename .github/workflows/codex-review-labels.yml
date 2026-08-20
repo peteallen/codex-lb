@@ -38,14 +38,33 @@ jobs:
 
     steps:
       - name: Checkout trusted base
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
           ref: ${{ github.event.repository.default_branch }}
 
+      - name: Mint label sync App token
+        id: app-token
+        if: ${{ vars.CODEX_LABEL_SYNC_APP_ID != '' }}
+        continue-on-error: true
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1
+        with:
+          app-id: ${{ vars.CODEX_LABEL_SYNC_APP_ID }}
+          private-key: ${{ secrets.CODEX_LABEL_SYNC_APP_PRIVATE_KEY }}
+          permission-actions: write
+          permission-checks: read
+          permission-contents: read
+          permission-issues: write
+          permission-pull-requests: read
+          permission-statuses: read
+
       - name: Sync labels
         env:
-          GH_TOKEN: ${{ secrets.CODEX_LABEL_SYNC_TOKEN || secrets.RELEASE_PLEASE_TOKEN || github.token }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token || secrets.CODEX_LABEL_SYNC_TOKEN || secrets.RELEASE_PLEASE_TOKEN || github.token }}
+          GH_FALLBACK_TOKEN: ${{ github.token }}
+          # App installation tokens cannot call GET /user; the script derives the
+          # @codex review sender login from this slug as "<slug>[bot]" instead.
+          GH_APP_SLUG: ${{ steps.app-token.outputs.token && steps.app-token.outputs.app-slug || '' }}
           PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
           REPO: ${{ github.repository }}
         run: |
@@ -69,14 +88,33 @@ jobs:
 
     steps:
       - name: Checkout trusted base
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
           ref: ${{ github.event.repository.default_branch }}
 
+      - name: Mint label sync App token
+        id: app-token
+        if: ${{ vars.CODEX_LABEL_SYNC_APP_ID != '' }}
+        continue-on-error: true
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1
+        with:
+          app-id: ${{ vars.CODEX_LABEL_SYNC_APP_ID }}
+          private-key: ${{ secrets.CODEX_LABEL_SYNC_APP_PRIVATE_KEY }}
+          permission-actions: write
+          permission-checks: read
+          permission-contents: read
+          permission-issues: write
+          permission-pull-requests: read
+          permission-statuses: read
+
       - name: Sync labels
         env:
-          GH_TOKEN: ${{ secrets.CODEX_LABEL_SYNC_TOKEN || secrets.RELEASE_PLEASE_TOKEN || github.token }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token || secrets.CODEX_LABEL_SYNC_TOKEN || secrets.RELEASE_PLEASE_TOKEN || github.token }}
+          GH_FALLBACK_TOKEN: ${{ github.token }}
+          # App installation tokens cannot call GET /user; the script derives the
+          # @codex review sender login from this slug as "<slug>[bot]" instead.
+          GH_APP_SLUG: ${{ steps.app-token.outputs.token && steps.app-token.outputs.app-slug || '' }}
           REPO: ${{ github.repository }}
         run: |
           if [ ! -f .github/scripts/sync_codex_ok_labels.py ]; then

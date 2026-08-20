@@ -22,6 +22,21 @@ os.environ["CODEX_LB_MODEL_REGISTRY_ENABLED"] = "false"
 os.environ["CODEX_LB_STICKY_SESSION_CLEANUP_ENABLED"] = "false"
 os.environ["CODEX_LB_HTTP_RESPONSES_SESSION_BRIDGE_ENABLED"] = "false"
 os.environ["CODEX_LB_QUOTA_PLANNER_SCHEDULER_ENABLED"] = "false"
+# Route-resolution caching is opt-in per test (cache-specific tests set a TTL
+# explicitly); keeping it off preserves fresh-read semantics everywhere else.
+os.environ["CODEX_LB_UPSTREAM_ROUTE_CACHE_TTL_SECONDS"] = "0"
+# The app-level automations scheduler ticks on the real clock; with leader
+# election enabled its startup tick runs as a background task and can land
+# inside a test that stages its own due-now jobs, racing the test's
+# claim_run. Tests drive automations via AutomationsService.run_due_jobs
+# with explicit clocks or construct AutomationsScheduler directly.
+os.environ["CODEX_LB_AUTOMATIONS_SCHEDULER_ENABLED"] = "false"
+# NOTE: Leader election is intentionally NOT disabled via an env override here.
+# It is default-enabled in production, and a global override would leak into
+# every ``Settings()`` constructed anywhere in the suite — breaking the
+# production-default assertion in test_settings_multi_replica.py. Instead the
+# ambient app lifespan's leader election is replaced with a no-op by the autouse
+# ``_disable_leader_election_startup`` fixture below (see its docstring).
 
 from app.db.models import Base  # noqa: E402
 from app.db.session import engine  # noqa: E402
@@ -36,7 +51,50 @@ class _NoopScheduler:
         return None
 
 
+class _NoopLeaderElection:
+    """Stand-in for the leader-election singleton during the test app lifespan.
+
+    Leader election is default-enabled in production and performs REAL SQLite
+    writes (acquire / renew / release) on the shared single-writer test database
+    via the app lifespan's release keeper. Left running, those renewal/release
+    writes contend with unrelated integration tests' DB work and with schema
+    teardown, surfacing as ``database is locked`` at setup/teardown.
+
+    Rather than override the production default (which would leak into every
+    ``Settings()`` and defeat the default-value unit tests), we scope the
+    disabling to the app lifespan by swapping the resolved singleton for this
+    no-op. It mirrors the module's own ``leader_election_enabled=False`` escape
+    hatch — always "leader", body runs inline, keeper/release are no-ops — but
+    without touching ``Settings`` and without any DB writes. Tests that exercise
+    leader election construct their own ``LeaderElection`` instances with their
+    own enabled settings (see tests/unit/test_leader_election.py and
+    tests/integration/test_multi_replica.py) and are unaffected.
+    """
+
+    leader_id = "test-noop-leader"
+
+    @property
+    def is_leader(self) -> bool:
+        return True
+
+    async def try_acquire(self) -> bool:
+        return True
+
+    async def renew(self) -> bool:
+        return True
+
+    async def run_if_leader(self, fn):
+        return await fn()
+
+    def start_release_keeper(self) -> None:
+        return None
+
+    async def release(self) -> None:
+        return None
+
+
 def _drop_test_migration_tables(sync_conn) -> None:
+    sync_conn.execute(text("DROP TABLE IF EXISTS realtime_call_bindings"))
     sync_conn.execute(text("DROP TABLE IF EXISTS alembic_version"))
     sync_conn.execute(text("DROP TABLE IF EXISTS schema_migrations"))
 
@@ -76,10 +134,57 @@ async def app_instance(_reset_db_state, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _disable_request_log_count_cache(monkeypatch):
+    """Zero the request-log COUNT cache TTL so listing totals stay exact
+    within a test. The TTL is a fixed constant in production (issue #1340
+    phase 2); the cache-behavior test patches it back to a positive value."""
+    import app.modules.request_logs.repository as logs_repository_module
+
+    monkeypatch.setattr(logs_repository_module, "_COUNT_CACHE_TTL_SECONDS", 0.0)
+
+
+@pytest.fixture(autouse=True)
 def _disable_rate_limit_reset_credits_scheduler_startup(monkeypatch):
     import app.main as main_module
 
     monkeypatch.setattr(main_module, "build_rate_limit_reset_credits_scheduler", lambda: _NoopScheduler())
+
+
+@pytest.fixture(autouse=True)
+def _disable_account_usage_rollup_scheduler_startup(monkeypatch):
+    import app.main as main_module
+
+    monkeypatch.setattr(main_module, "build_account_usage_rollup_scheduler", lambda: _NoopScheduler())
+
+
+@pytest.fixture(autouse=True)
+def _disable_data_retention_scheduler_startup(monkeypatch):
+    import app.main as main_module
+
+    monkeypatch.setattr(main_module, "build_data_retention_scheduler", lambda: _NoopScheduler())
+
+
+@pytest.fixture(autouse=True)
+def _disable_leader_election_startup(monkeypatch):
+    """Replace the ambient app-lifespan leader election with a no-op.
+
+    Scoped exactly like the sibling ``_disable_*_scheduler_startup`` fixtures:
+    it swaps what ``get_leader_election()`` resolves to (both the reference the
+    app lifespan imported into ``app.main`` and the source-module singleton
+    every scheduler resolves via ``importlib``), so the lifespan's release
+    keeper and any leader-gated scheduler tick become no-ops instead of writing
+    to the shared test SQLite. Crucially it leaves ``Settings`` untouched, so
+    unit tests still observe the real production default
+    (``leader_election_enabled is True``). Tests that patch the leader election
+    themselves (e.g. test_graceful_shutdown, the scheduler unit tests, and
+    test_multi_replica) override this per-test and keep working.
+    """
+    import app.core.scheduling.leader_election as leader_election_module
+    import app.main as main_module
+
+    election = _NoopLeaderElection()
+    monkeypatch.setattr(leader_election_module, "get_leader_election", lambda: election)
+    monkeypatch.setattr(main_module, "get_leader_election", lambda: election)
 
 
 @pytest_asyncio.fixture(scope="session", autouse=True)
@@ -96,10 +201,64 @@ async def db_setup(_reset_db_state):
 
 @pytest_asyncio.fixture
 async def async_client(app_instance):
+    async def _drain_proxy_persistence(response) -> None:
+        # Request-log writes and API-key settlements are detached from the
+        # response path in production; tests assert on their effects right
+        # after a response, so flush them per request to keep the historical
+        # synchronous semantics inside the suite. The detach contract itself
+        # is pinned by dedicated tests that bypass this hook.
+        del response
+        service = getattr(app_instance.state, "proxy_service", None)
+        if service is not None and hasattr(service, "drain_persistence_tasks"):
+            await service.drain_persistence_tasks(timeout_seconds=5)
+
     async with app_instance.router.lifespan_context(app_instance):
         transport = ASGITransport(app=app_instance)
-        async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+        async with AsyncClient(
+            transport=transport,
+            base_url="http://testserver",
+            event_hooks={"response": [_drain_proxy_persistence]},
+        ) as client:
             yield client
+
+
+@pytest.fixture(autouse=True)
+def _disable_default_refresh_claims():
+    """Disable the process-default cross-replica refresh-claim coordinator.
+
+    The default coordinator writes claim rows through the real database on
+    every token refresh; unit tests exercise AuthManager against stub repos
+    without a migrated schema. Tests covering claim semantics install a real
+    ``RefreshClaimCoordinator`` explicitly (constructor injection or
+    ``set_refresh_claim_coordinator``).
+    """
+    from app.modules.accounts import refresh_claims
+
+    refresh_claims.set_refresh_claim_coordinator(None)
+    yield
+    refresh_claims.reset_refresh_claim_coordinator()
+
+
+@pytest.fixture(autouse=True)
+def _scope_plan_downgrade_observation_store(request):
+    """Keep the cross-replica downgrade-observation store test-local.
+
+    The process default persists observations through the real database so the
+    paid -> free confirmation sequence stays coherent across replicas. Pure unit
+    tests drive ``UsageUpdater`` against stub repositories with no migrated
+    schema, so they get an isolated in-memory store that preserves
+    single-process semantics. Integration tests keep the database-backed default
+    (that is the behavior under test), and simply get a clean table per test.
+    """
+    from app.modules.usage import plan_downgrade_observations as observations_module
+
+    is_unit_test = "/tests/unit/" in request.path.as_posix() if hasattr(request, "path") else False
+    if is_unit_test:
+        observations_module.set_plan_downgrade_observation_store(
+            observations_module.InMemoryPlanDowngradeObservationStore()
+        )
+    yield
+    observations_module.reset_plan_downgrade_observation_store()
 
 
 @pytest.fixture(autouse=True)
@@ -118,8 +277,12 @@ def _reset_model_registry():
 
     registry = get_model_registry()
     registry._snapshot = None
+    registry._metadata_models = None
+    registry._applied_content_hash = None
     yield
     registry._snapshot = None
+    registry._metadata_models = None
+    registry._applied_content_hash = None
 
 
 @pytest.fixture(autouse=True)
@@ -156,6 +319,44 @@ def _reset_global_state() -> None:
     except Exception:
         pass
     try:
+        from app.core.cache.invalidation import set_cache_invalidation_poller
+
+        set_cache_invalidation_poller(None)
+    except Exception:
+        pass
+    try:
+        from app.core.config.settings_cache import get_settings_cache
+
+        settings_cache = get_settings_cache()
+        settings_cache._cached_settings = None
+        settings_cache._cached_at = 0.0
+    except Exception:
+        pass
+    try:
+        from app.core.upstream_proxy.cache import get_upstream_route_cache
+
+        get_upstream_route_cache().clear()
+    except Exception:
+        pass
+    try:
+        # Pending workspace-less plan-downgrade confirmations live in a
+        # process-global fallback store when persistence is disabled, so a test
+        # that leaves one behind would otherwise give the next test a head start
+        # toward a downgrade (issue #1456).
+        from app.modules.usage.updater import _FALLBACK_PLAN_DOWNGRADE_OBSERVATIONS
+
+        _FALLBACK_PLAN_DOWNGRADE_OBSERVATIONS.clear_all()
+    except Exception:
+        pass
+    try:
+        # Pending last-used touches would otherwise leak a previous test's key
+        # ids into the next test's flush (harmless guarded UPDATEs, but noisy).
+        from app.modules.api_keys.last_used_coalescer import get_api_key_last_used_coalescer
+
+        get_api_key_last_used_coalescer().clear()
+    except Exception:
+        pass
+    try:
         from app.core.resilience.degradation import set_normal
 
         set_normal()
@@ -175,3 +376,13 @@ def _reset_hot_path_caches():
     _reset_global_state()
     yield
     _reset_global_state()
+
+
+@pytest.fixture(autouse=True)
+def _reset_shutdown_task_admission():
+    """Keep the process-global shutdown admission barrier test-local."""
+    from app.core import shutdown as shutdown_state
+
+    shutdown_state.reset()
+    yield
+    shutdown_state.reset()

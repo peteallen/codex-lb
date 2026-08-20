@@ -22,11 +22,16 @@ from app.core.auth.dependencies import (
 from app.core.clients.http import _build_ssl_context
 from app.core.config.settings_cache import get_settings_cache
 from app.core.crypto import TokenEncryptor
-from app.core.exceptions import DashboardBadRequestError
+from app.core.exceptions import DashboardBadRequestError, DashboardSettingsConflictError
 from app.core.upstream_proxy import resolve_proxy_endpoint
+from app.core.upstream_proxy.cache import get_upstream_route_cache
 from app.db.models import Account, AccountProxyBinding, AccountStatus, ProxyEndpoint, ProxyPool, ProxyPoolMember
 from app.dependencies import SettingsContext, get_proxy_service_for_app, get_settings_context
-from app.modules.proxy.account_cache import clear_account_routing_unavailable, get_account_selection_cache
+from app.modules.proxy.account_cache import (
+    clear_account_routing_unavailable,
+    get_account_selection_cache,
+    propagate_account_routing_change,
+)
 from app.modules.settings.schemas import (
     AccountProxyBindingRequest,
     AccountProxyBindingResponse,
@@ -120,11 +125,19 @@ def _dashboard_settings_response(settings) -> DashboardSettingsResponse:
     return DashboardSettingsResponse(
         sticky_threads_enabled=settings.sticky_threads_enabled,
         upstream_stream_transport=settings.upstream_stream_transport,
+        prohibit_fast_mode=settings.prohibit_fast_mode,
         http_downstream_transport_policy=settings.http_downstream_transport_policy,
+        proxy_account_response_create_limit=settings.proxy_account_response_create_limit,
+        proxy_account_stream_limit=settings.proxy_account_stream_limit,
+        proxy_account_stream_recovery_reserve=settings.proxy_account_stream_recovery_reserve,
+        proxy_api_key_fair_share_congestion_threshold_pct=(settings.proxy_api_key_fair_share_congestion_threshold_pct),
         upstream_proxy_routing_enabled=settings.upstream_proxy_routing_enabled,
         upstream_proxy_default_pool_id=settings.upstream_proxy_default_pool_id,
         prefer_earlier_reset_accounts=settings.prefer_earlier_reset_accounts,
         prefer_earlier_reset_window=settings.prefer_earlier_reset_window,
+        show_reset_credit_badges=settings.show_reset_credit_badges,
+        auto_redeem_reset_credits_before_expiry=settings.auto_redeem_reset_credits_before_expiry,
+        show_reset_credit_expiry_badge=settings.show_reset_credit_expiry_badge,
         routing_strategy=settings.routing_strategy,
         relative_availability_power=settings.relative_availability_power,
         relative_availability_top_k=settings.relative_availability_top_k,
@@ -150,12 +163,18 @@ def _dashboard_settings_response(settings) -> DashboardSettingsResponse:
         limit_warmup_prompt=settings.limit_warmup_prompt,
         limit_warmup_cooldown_seconds=settings.limit_warmup_cooldown_seconds,
         limit_warmup_exhausted_threshold_percent=settings.limit_warmup_exhausted_threshold_percent,
+        limit_warmup_idle_threshold_percent=settings.limit_warmup_idle_threshold_percent,
         limit_warmup_min_available_percent=settings.limit_warmup_min_available_percent,
         weekly_pace_working_days=settings.weekly_pace_working_days,
         weekly_pace_smoothing_minutes=settings.weekly_pace_smoothing_minutes,
         guest_access_enabled=settings.guest_access_enabled,
         guest_password_configured=settings.guest_password_configured,
         limit_warmup_staggered_idle_enabled=settings.limit_warmup_staggered_idle_enabled,
+        request_log_retention_days=settings.request_log_retention_days,
+        usage_history_retention_days=settings.usage_history_retention_days,
+        request_log_retention_override_days=settings.request_log_retention_override_days,
+        usage_history_retention_override_days=settings.usage_history_retention_override_days,
+        version=settings.version,
     )
 
 
@@ -329,6 +348,9 @@ async def add_upstream_proxy_pool_member(
         if _is_duplicate_proxy_pool_member_error(exc):
             raise _duplicate_proxy_pool_member_error()
         raise
+    # Pool membership is a route-resolver input: clear + durably bump before
+    # responding (same contract as the account-binding upsert).
+    await get_upstream_route_cache().invalidate()
     endpoint_ids = (
         (
             await context.session.execute(
@@ -443,14 +465,27 @@ async def put_account_proxy_binding(
         close_bridge_sessions = row.pool_id != payload.pool_id or row.is_active != payload.is_active
         row.pool_id = payload.pool_id
         row.is_active = payload.is_active
+    reactivated = False
     if payload.is_active and _account_proxy_binding_should_reactivate(account):
         account.status = AccountStatus.ACTIVE
         account.deactivation_reason = None
         account.reset_at = None
         account.blocked_at = None
+        reactivated = True
+    await context.session.commit()
+    # Binding rows are a route-resolver input: clear this replica's route
+    # cache and durably bump ``upstream_route`` before responding so no
+    # request on the mutating replica resolves the pre-mutation binding.
+    await get_upstream_route_cache().invalidate()
+    if reactivated:
+        # Invalidate + bump only after the status commit so peers (and this
+        # replica's poller) never rebuild selection/routing inputs from the
+        # pre-commit row. The coalesced ``account_selection`` bump enqueued by
+        # ``invalidate()`` and the durable ``account_routing`` bump both fire
+        # post-commit, matching AccountService.reactivate_account.
         clear_account_routing_unavailable(account_id)
         get_account_selection_cache().invalidate()
-    await context.session.commit()
+        await propagate_account_routing_change()
     if close_bridge_sessions:
         await get_proxy_service_for_app(request.app).close_http_bridge_sessions_for_account(account_id)
     await context.session.refresh(row)
@@ -518,6 +553,10 @@ async def update_settings(
     context: SettingsContext = Depends(get_settings_context),
 ) -> DashboardSettingsResponse:
     current = await context.service.get_settings()
+    if payload.expected_version is not None and payload.expected_version != current.version:
+        raise DashboardSettingsConflictError(
+            "Settings were modified since this form was loaded; reload and retry",
+        )
     if (
         "upstream_proxy_default_pool_id" in payload.model_fields_set
         and payload.upstream_proxy_default_pool_id is not None
@@ -561,6 +600,28 @@ async def update_settings(
         single_account_id = (
             payload.single_account_id if "single_account_id" in payload.model_fields_set else current.single_account_id
         )
+        stream_limit = (
+            payload.proxy_account_stream_limit
+            if payload.proxy_account_stream_limit is not None
+            else current.proxy_account_stream_limit
+        )
+        stream_recovery_reserve = (
+            payload.proxy_account_stream_recovery_reserve
+            if payload.proxy_account_stream_recovery_reserve is not None
+            else current.proxy_account_stream_recovery_reserve
+        )
+        cap_fields_changed = bool(
+            {
+                "proxy_account_stream_limit",
+                "proxy_account_stream_recovery_reserve",
+            }
+            & payload.model_fields_set
+        )
+        if cap_fields_changed and stream_limit > 0 and stream_recovery_reserve > stream_limit:
+            raise DashboardBadRequestError(
+                "proxyAccountStreamRecoveryReserve must not exceed proxyAccountStreamLimit",
+                code="invalid_proxy_account_stream_recovery_reserve",
+            )
         updated = await context.service.update_settings(
             DashboardSettingsUpdateData(
                 sticky_threads_enabled=(
@@ -569,8 +630,31 @@ async def update_settings(
                     else current.sticky_threads_enabled
                 ),
                 upstream_stream_transport=payload.upstream_stream_transport or current.upstream_stream_transport,
+                prohibit_fast_mode=(
+                    payload.prohibit_fast_mode if payload.prohibit_fast_mode is not None else current.prohibit_fast_mode
+                ),
                 http_downstream_transport_policy=(
                     payload.http_downstream_transport_policy or current.http_downstream_transport_policy
+                ),
+                proxy_account_response_create_limit=(
+                    payload.proxy_account_response_create_limit
+                    if "proxy_account_response_create_limit" in payload.model_fields_set
+                    else None
+                ),
+                proxy_account_stream_limit=(
+                    payload.proxy_account_stream_limit
+                    if "proxy_account_stream_limit" in payload.model_fields_set
+                    else None
+                ),
+                proxy_account_stream_recovery_reserve=(
+                    payload.proxy_account_stream_recovery_reserve
+                    if "proxy_account_stream_recovery_reserve" in payload.model_fields_set
+                    else None
+                ),
+                proxy_api_key_fair_share_congestion_threshold_pct=(
+                    payload.proxy_api_key_fair_share_congestion_threshold_pct
+                    if "proxy_api_key_fair_share_congestion_threshold_pct" in payload.model_fields_set
+                    else None
                 ),
                 upstream_proxy_routing_enabled=(
                     payload.upstream_proxy_routing_enabled
@@ -588,6 +672,21 @@ async def update_settings(
                     else current.prefer_earlier_reset_accounts
                 ),
                 prefer_earlier_reset_window=payload.prefer_earlier_reset_window or current.prefer_earlier_reset_window,
+                show_reset_credit_badges=(
+                    payload.show_reset_credit_badges
+                    if payload.show_reset_credit_badges is not None
+                    else current.show_reset_credit_badges
+                ),
+                auto_redeem_reset_credits_before_expiry=(
+                    payload.auto_redeem_reset_credits_before_expiry
+                    if payload.auto_redeem_reset_credits_before_expiry is not None
+                    else current.auto_redeem_reset_credits_before_expiry
+                ),
+                show_reset_credit_expiry_badge=(
+                    payload.show_reset_credit_expiry_badge
+                    if payload.show_reset_credit_expiry_badge is not None
+                    else current.show_reset_credit_expiry_badge
+                ),
                 routing_strategy=payload.routing_strategy or current.routing_strategy,
                 relative_availability_power=(
                     payload.relative_availability_power
@@ -671,6 +770,11 @@ async def update_settings(
                     if payload.limit_warmup_exhausted_threshold_percent is not None
                     else current.limit_warmup_exhausted_threshold_percent
                 ),
+                limit_warmup_idle_threshold_percent=(
+                    payload.limit_warmup_idle_threshold_percent
+                    if payload.limit_warmup_idle_threshold_percent is not None
+                    else current.limit_warmup_idle_threshold_percent
+                ),
                 limit_warmup_min_available_percent=(
                     payload.limit_warmup_min_available_percent
                     if payload.limit_warmup_min_available_percent is not None
@@ -696,22 +800,62 @@ async def update_settings(
                     if payload.limit_warmup_staggered_idle_enabled is not None
                     else current.limit_warmup_staggered_idle_enabled
                 ),
-            )
+                request_log_retention_override_days=(
+                    payload.request_log_retention_override_days
+                    if "request_log_retention_override_days" in payload.model_fields_set
+                    else None
+                ),
+                usage_history_retention_override_days=(
+                    payload.usage_history_retention_override_days
+                    if "usage_history_retention_override_days" in payload.model_fields_set
+                    else None
+                ),
+                clear_request_log_retention_override=(
+                    "request_log_retention_override_days" in payload.model_fields_set
+                    and payload.request_log_retention_override_days is None
+                ),
+                clear_usage_history_retention_override=(
+                    "usage_history_retention_override_days" in payload.model_fields_set
+                    and payload.usage_history_retention_override_days is None
+                ),
+            ),
+            # CAS anchor: omitted fields above were merged from `current`
+            # (version checked against expectedVersion when supplied), so the
+            # repository must apply the UPDATE only if the row still carries
+            # that version; a writer committing in between yields 409 instead
+            # of silently reverting its fields.
+            expected_version=current.version,
         )
     except ValueError as exc:
         raise DashboardBadRequestError(str(exc), code="invalid_totp_config") from exc
 
+    upstream_route_inputs_changed = (
+        current.upstream_proxy_routing_enabled != updated.upstream_proxy_routing_enabled
+        or current.upstream_proxy_default_pool_id != updated.upstream_proxy_default_pool_id
+    )
+    # ``SettingsRepository.commit_refresh`` already cleared the route cache
+    # synchronously between the commit and its refresh await (no concurrent
+    # request can see the committed row alongside the stale cache); only the
+    # durable cross-replica signals remain here.
     await get_settings_cache().invalidate()
     changed_fields = [
         field_name
         for field_name in (
             "sticky_threads_enabled",
             "upstream_stream_transport",
+            "prohibit_fast_mode",
             "http_downstream_transport_policy",
+            "proxy_account_response_create_limit",
+            "proxy_account_stream_limit",
+            "proxy_account_stream_recovery_reserve",
+            "proxy_api_key_fair_share_congestion_threshold_pct",
             "upstream_proxy_routing_enabled",
             "upstream_proxy_default_pool_id",
             "prefer_earlier_reset_accounts",
             "prefer_earlier_reset_window",
+            "show_reset_credit_badges",
+            "auto_redeem_reset_credits_before_expiry",
+            "show_reset_credit_expiry_badge",
             "routing_strategy",
             "relative_availability_power",
             "relative_availability_top_k",
@@ -735,14 +879,25 @@ async def update_settings(
             "limit_warmup_prompt",
             "limit_warmup_cooldown_seconds",
             "limit_warmup_exhausted_threshold_percent",
+            "limit_warmup_idle_threshold_percent",
             "limit_warmup_min_available_percent",
             "weekly_pace_working_days",
             "weekly_pace_smoothing_minutes",
             "guest_access_enabled",
             "limit_warmup_staggered_idle_enabled",
+            "request_log_retention_override_days",
+            "usage_history_retention_override_days",
         )
         if getattr(current, field_name) != getattr(updated, field_name)
     ]
+    if upstream_route_inputs_changed:
+        # Durably bump ``upstream_route`` (with the coalesced retry fallback)
+        # rather than relying solely on the ``settings`` bump issued above:
+        # that bump is non-raising and enqueues no retry, so a transient write
+        # failure would leave peers on the stale route outcome until the TTL
+        # instead of the first recovered poll cycle. The re-clear inside
+        # ``invalidate`` is harmless; the guarding clear already ran pre-await.
+        await get_upstream_route_cache().invalidate()
     AuditService.log_async(
         "settings_changed",
         actor_ip=request.client.host if request.client else None,

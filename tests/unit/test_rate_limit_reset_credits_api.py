@@ -30,6 +30,7 @@ from app.db.models import Account, AccountStatus
 from app.modules.rate_limit_reset_credits import api as reset_credits_api
 from app.modules.rate_limit_reset_credits.api import (
     ConsumeResetCreditResponseSchema,
+    ResetCreditRedeemRequestAlreadyPinned,
     _assert_account_can_redeem_reset_credit,
     _build_refresh_usage_callback,
     _redeem_soonest_reset_credit,
@@ -84,6 +85,30 @@ def _response(credits: list[ResetCreditItem], available_count: int | None = None
 
 def _fake_request(host: str = "127.0.0.1") -> Request:
     return cast(Request, SimpleNamespace(client=SimpleNamespace(host=host)))
+
+
+@pytest.fixture(autouse=True)
+def fake_redeem_ledger(monkeypatch: pytest.MonkeyPatch) -> dict[tuple[str, str], str]:
+    """In-memory stand-in for the shared-DB redeem idempotency ledger.
+
+    Autouse so every helper test is hermetic: the no-body dashboard path now
+    synthesizes a redeem_request_id and pins it, so a success reaches
+    ``pin_redeem_request`` even without an explicit fixture request. Tests that
+    request it by name receive the same dict instance to assert ledger state.
+    The real DB-backed ledger is covered by
+    tests/integration/test_reset_credits_replica_safety.py.
+    """
+    ledger: dict[tuple[str, str], str] = {}
+
+    async def get_pinned(account_id: str, redeem_request_id: str) -> str | None:
+        return ledger.get((account_id, redeem_request_id))
+
+    async def pin(account_id: str, redeem_request_id: str, credit_id: str) -> str:
+        return ledger.setdefault((account_id, redeem_request_id), credit_id)
+
+    monkeypatch.setattr(reset_credits_api, "get_pinned_redeem_credit_id", get_pinned)
+    monkeypatch.setattr(reset_credits_api, "pin_redeem_request", pin)
+    return ledger
 
 
 def _static_fetch_fn(response: ResetCreditsResponse):
@@ -338,8 +363,44 @@ async def test_redeem_replaces_stale_cached_snapshot_when_fresh_fetch_has_no_ava
 
 
 @pytest.mark.asyncio
-async def test_redeem_retries_same_request_id_when_fresh_fetch_has_no_available_credit() -> None:
+async def test_redeem_with_request_id_but_no_pin_returns_conflict_on_empty_fresh_fetch(
+    fake_redeem_ledger: dict[tuple[str, str], str],
+) -> None:
+    """A redeem_request_id with NO durable pin is not proof of an idempotent
+    retry: when the fresh pre-consume fetch reports nothing available, the
+    stale cached credit MUST NOT be pinned and consumed. The endpoint returns a
+    conflict, replaces the stale snapshot with the fresh empty one, and pins
+    nothing."""
     store = RateLimitResetCreditsStore()
+    await store.set("acc_1", _snapshot([_credit("cached")], available_count=1))
+
+    with pytest.raises(DashboardConflictError) as excinfo:
+        await _redeem_soonest_reset_credit(
+            account=_account(),
+            store=store,
+            encryptor=StubEncryptor(),
+            fetch_fn=_static_fetch_fn(_response([], available_count=0)),
+            consume_fn=_raise_not_called,  # type: ignore[arg-type]
+            redeem_request_id="retry-id",
+        )
+
+    assert excinfo.value.code == "no_available_reset_credit"
+    cached = store.get("acc_1")
+    assert cached is not None
+    assert cached.available_count == 0
+    assert cached.credits == []
+    # Nothing pinned for the unproven retry.
+    assert fake_redeem_ledger == {}
+
+
+@pytest.mark.asyncio
+async def test_redeem_retries_same_request_id_after_local_credit_vanishes_with_durable_pin(
+    fake_redeem_ledger: dict[tuple[str, str], str],
+) -> None:
+    """When a durable pin already exists, a same-request retry consumes the
+    pinned credit even though the fresh fetch shows nothing available."""
+    store = RateLimitResetCreditsStore()
+    fake_redeem_ledger[("acc_1", "retry-id")] = "cached"
     await store.set("acc_1", _snapshot([_credit("cached")], available_count=1))
 
     captured: dict[str, Any] = {}
@@ -385,12 +446,40 @@ async def test_redeem_retries_same_request_id_when_fresh_fetch_has_no_available_
     assert result.available_count_before == 0
     assert result.available_count_after == 0
     assert store.get("acc_1") is None
+    # The pre-existing durable pin is preserved.
+    assert fake_redeem_ledger == {("acc_1", "retry-id"): "cached"}
 
 
 @pytest.mark.asyncio
-async def test_redeem_retries_same_request_id_after_local_credit_vanishes() -> None:
+async def test_redeem_skip_if_request_pinned_avoids_upstream_retry(
+    fake_redeem_ledger: dict[tuple[str, str], str],
+) -> None:
     store = RateLimitResetCreditsStore()
-    await store.remember_redeem_request("acc_1", "retry-id", "vanished")
+    fake_redeem_ledger[("acc_1", "auto-id")] = "cached"
+    await store.set("acc_1", _snapshot([_credit("cached")], available_count=1))
+
+    with pytest.raises(ResetCreditRedeemRequestAlreadyPinned) as excinfo:
+        await _redeem_soonest_reset_credit(
+            account=_account(),
+            store=store,
+            encryptor=StubEncryptor(),
+            fetch_fn=_raise_not_called,  # type: ignore[arg-type]
+            consume_fn=_raise_not_called,  # type: ignore[arg-type]
+            redeem_request_id="auto-id",
+            skip_if_redeem_request_pinned=True,
+        )
+
+    assert excinfo.value.account_id == "acc_1"
+    assert excinfo.value.credit_id == "cached"
+    assert fake_redeem_ledger == {("acc_1", "auto-id"): "cached"}
+
+
+@pytest.mark.asyncio
+async def test_redeem_retries_same_request_id_after_local_credit_vanishes(
+    fake_redeem_ledger: dict[tuple[str, str], str],
+) -> None:
+    store = RateLimitResetCreditsStore()
+    fake_redeem_ledger[("acc_1", "retry-id")] = "vanished"
     await store.set("acc_1", _snapshot([], available_count=0))
 
     captured: dict[str, Any] = {}
@@ -437,9 +526,11 @@ async def test_redeem_retries_same_request_id_after_local_credit_vanishes() -> N
 
 
 @pytest.mark.asyncio
-async def test_redeem_retries_same_request_id_preserves_original_credit_when_another_is_available() -> None:
+async def test_redeem_retries_same_request_id_preserves_original_credit_when_another_is_available(
+    fake_redeem_ledger: dict[tuple[str, str], str],
+) -> None:
     store = RateLimitResetCreditsStore()
-    await store.remember_redeem_request("acc_1", "retry-id", "original")
+    fake_redeem_ledger[("acc_1", "retry-id")] = "original"
     await store.set("acc_1", _snapshot([_credit("new-cached")], available_count=1))
 
     captured: dict[str, Any] = {}
@@ -482,7 +573,52 @@ async def test_redeem_retries_same_request_id_preserves_original_credit_when_ano
         "redeem_request_id": "retry-id",
     }
     assert result.response.code == "already_redeemed"
-    assert store.get_redeem_request_credit_id("acc_1", "retry-id") == "original"
+    assert fake_redeem_ledger[("acc_1", "retry-id")] == "original"
+
+
+@pytest.mark.asyncio
+async def test_redeem_without_request_id_synthesizes_one_and_pins_ledger(
+    fake_redeem_ledger: dict[tuple[str, str], str],
+) -> None:
+    """The no-body dashboard path (no client redeem_request_id) MUST still
+    participate in the durable ledger: the endpoint synthesizes a UUID, pins the
+    selected credit, and forwards that recorded id to upstream instead of an
+    unrecorded one."""
+    store = RateLimitResetCreditsStore()
+    await store.set("acc_1", _snapshot([_credit("c1")], available_count=1))
+
+    captured: dict[str, Any] = {}
+
+    async def consume_fn(
+        access_token: str,
+        account_id: str | None,
+        credit_id: str,
+        **kwargs: Any,
+    ) -> ConsumeResetCreditResponse:
+        captured.update({"credit_id": credit_id, "redeem_request_id": kwargs.get("redeem_request_id")})
+        return ConsumeResetCreditResponse.model_validate(
+            {
+                "code": "reset",
+                "credit": {"id": credit_id, "status": "redeemed", "redeemed_at": "2026-06-13T13:12:31Z"},
+                "windows_reset": 1,
+            }
+        )
+
+    await _redeem_soonest_reset_credit(
+        account=_account(),
+        store=store,
+        encryptor=StubEncryptor(),
+        fetch_fn=_static_fetch_fn(_response([_credit("c1")], available_count=1)),
+        consume_fn=consume_fn,
+        # No redeem_request_id: the still-supported no-body consume path.
+    )
+
+    # A synthesized id was recorded and forwarded to upstream (not None).
+    synthesized_id = captured["redeem_request_id"]
+    assert isinstance(synthesized_id, str) and synthesized_id
+    assert captured["credit_id"] == "c1"
+    # Exactly one ledger row was pinned for the synthesized id -> selected credit.
+    assert fake_redeem_ledger == {("acc_1", synthesized_id): "c1"}
 
 
 @pytest.mark.asyncio
@@ -523,6 +659,94 @@ async def test_redeem_consumes_fresh_available_credit_when_cached_credit_disappe
     assert result.available_count_before == 1
     assert result.available_count_after == 0
     assert store.get("acc_1") is None
+
+
+@pytest.mark.asyncio
+async def test_redeem_expected_credit_id_does_not_retarget_other_fresh_credit(
+    fake_redeem_ledger: dict[tuple[str, str], str],
+) -> None:
+    store = RateLimitResetCreditsStore()
+    await store.set("acc_1", _snapshot([_credit("target")], available_count=1))
+    consume_calls: list[str] = []
+    fresh_response = _response([_credit("later", expires_at="2026-08-01T00:00:00Z")], available_count=1)
+
+    async def consume_fn(
+        access_token: str,
+        account_id: str | None,
+        credit_id: str,
+        **kwargs: Any,
+    ) -> ConsumeResetCreditResponse:
+        consume_calls.append(credit_id)
+        return ConsumeResetCreditResponse.model_validate(
+            {
+                "code": "reset",
+                "credit": {"id": credit_id, "status": "redeemed", "redeemed_at": "2026-06-13T13:12:31Z"},
+                "windows_reset": 1,
+            }
+        )
+
+    with pytest.raises(DashboardConflictError) as excinfo:
+        await _redeem_soonest_reset_credit(
+            account=_account(),
+            store=store,
+            encryptor=StubEncryptor(),
+            fetch_fn=_static_fetch_fn(fresh_response),
+            consume_fn=consume_fn,
+            redeem_request_id="auto-id",
+            expected_credit_id="target",
+            expected_credit_expires_at=datetime(2026, 7, 12),
+        )
+
+    assert excinfo.value.code == "no_available_reset_credit"
+    assert consume_calls == []
+    assert fake_redeem_ledger == {}
+    snapshot = store.get("acc_1")
+    assert snapshot is not None
+    assert [credit.id for credit in snapshot.credits] == ["later"]
+
+
+@pytest.mark.asyncio
+async def test_redeem_expected_credit_expiry_change_does_not_consume(
+    fake_redeem_ledger: dict[tuple[str, str], str],
+) -> None:
+    store = RateLimitResetCreditsStore()
+    await store.set("acc_1", _snapshot([_credit("target")], available_count=1))
+    consume_calls: list[str] = []
+    fresh_response = _response([_credit("target", expires_at="2026-08-01T00:00:00Z")], available_count=1)
+
+    async def consume_fn(
+        access_token: str,
+        account_id: str | None,
+        credit_id: str,
+        **kwargs: Any,
+    ) -> ConsumeResetCreditResponse:
+        consume_calls.append(credit_id)
+        return ConsumeResetCreditResponse.model_validate(
+            {
+                "code": "reset",
+                "credit": {"id": credit_id, "status": "redeemed", "redeemed_at": "2026-06-13T13:12:31Z"},
+                "windows_reset": 1,
+            }
+        )
+
+    with pytest.raises(DashboardConflictError) as excinfo:
+        await _redeem_soonest_reset_credit(
+            account=_account(),
+            store=store,
+            encryptor=StubEncryptor(),
+            fetch_fn=_static_fetch_fn(fresh_response),
+            consume_fn=consume_fn,
+            redeem_request_id="auto-id",
+            expected_credit_id="target",
+            expected_credit_expires_at=datetime(2026, 7, 12),
+        )
+
+    assert excinfo.value.code == "target_reset_credit_changed"
+    assert consume_calls == []
+    assert fake_redeem_ledger == {}
+    snapshot = store.get("acc_1")
+    assert snapshot is not None
+    assert [credit.id for credit in snapshot.credits] == ["target"]
 
 
 @pytest.mark.asyncio
@@ -839,6 +1063,113 @@ async def test_serialize_reset_credit_redeem_uses_postgresql_advisory_lock() -> 
             {"lock_key": "reset-credit-redeem:acc_1"},
         )
     ]
+
+
+class _FakeSqliteSession:
+    def get_bind(self) -> Any:
+        return SimpleNamespace(dialect=SimpleNamespace(name="sqlite"))
+
+
+@pytest.mark.asyncio
+async def test_serialize_reset_credit_redeem_uses_durable_claim_on_sqlite(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[tuple[str, str]] = []
+
+    async def fake_acquire(account_id: str, holder_id: str) -> None:
+        events.append(("acquire", account_id))
+
+    async def fake_release(account_id: str, holder_id: str) -> None:
+        events.append(("release", account_id))
+
+    monkeypatch.setattr(reset_credits_api, "acquire_redeem_claim", fake_acquire)
+    monkeypatch.setattr(reset_credits_api, "release_redeem_claim", fake_release)
+
+    async with serialize_reset_credit_redeem("acc_1", session=cast(Any, _FakeSqliteSession())):
+        events.append(("locked", "acc_1"))
+
+    assert events == [("acquire", "acc_1"), ("locked", "acc_1"), ("release", "acc_1")]
+
+
+@pytest.mark.asyncio
+async def test_serialize_reset_credit_redeem_renews_sqlite_claim_while_held(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The sqlite branch keeps a heartbeat task alive for the section and cancels it before release."""
+    events: list[str] = []
+    heartbeat_running = asyncio.Event()
+
+    async def fake_acquire(account_id: str, holder_id: str) -> None:
+        events.append("acquire")
+
+    async def fake_release(account_id: str, holder_id: str) -> None:
+        events.append("release")
+
+    async def fake_heartbeat(account_id: str, holder_id: str) -> None:
+        events.append("heartbeat-start")
+        heartbeat_running.set()
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            events.append("heartbeat-cancelled")
+            raise
+
+    monkeypatch.setattr(reset_credits_api, "acquire_redeem_claim", fake_acquire)
+    monkeypatch.setattr(reset_credits_api, "release_redeem_claim", fake_release)
+    monkeypatch.setattr(reset_credits_api, "renew_redeem_claim_periodically", fake_heartbeat)
+
+    async with serialize_reset_credit_redeem("acc_1", session=cast(Any, _FakeSqliteSession())):
+        await asyncio.wait_for(heartbeat_running.wait(), timeout=5)
+        events.append("locked")
+
+    assert events == ["acquire", "heartbeat-start", "locked", "heartbeat-cancelled", "release"]
+
+
+@pytest.mark.asyncio
+async def test_serialize_reset_credit_redeem_propagates_sqlite_claim_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.modules.rate_limit_reset_credits.redeem_coordination import RedeemClaimTimeoutError
+
+    async def fake_acquire(account_id: str, holder_id: str) -> None:
+        raise RedeemClaimTimeoutError("claim held")
+
+    released: list[str] = []
+
+    async def fake_release(account_id: str, holder_id: str) -> None:
+        released.append(account_id)
+
+    monkeypatch.setattr(reset_credits_api, "acquire_redeem_claim", fake_acquire)
+    monkeypatch.setattr(reset_credits_api, "release_redeem_claim", fake_release)
+
+    with pytest.raises(RedeemClaimTimeoutError):
+        async with serialize_reset_credit_redeem("acc_1", session=cast(Any, _FakeSqliteSession())):
+            raise AssertionError("locked section must not run after a claim timeout")
+
+    assert released == []
+
+
+@pytest.mark.asyncio
+async def test_redeem_soonest_maps_claim_timeout_to_dashboard_conflict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The dashboard surface renders claim contention as its conflict envelope."""
+    from app.modules.rate_limit_reset_credits.redeem_coordination import RedeemClaimTimeoutError
+
+    async def fake_acquire(account_id: str, holder_id: str) -> None:
+        raise RedeemClaimTimeoutError("claim held")
+
+    monkeypatch.setattr(reset_credits_api, "acquire_redeem_claim", fake_acquire)
+
+    with pytest.raises(DashboardConflictError) as excinfo:
+        await _redeem_soonest_reset_credit(
+            account=_account(),
+            store=RateLimitResetCreditsStore(),
+            encryptor=StubEncryptor(),
+            lock_session=cast(Any, _FakeSqliteSession()),
+        )
+
+    assert excinfo.value.code == "reset_credit_redeem_in_progress"
 
 
 @pytest.mark.asyncio

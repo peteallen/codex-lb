@@ -38,11 +38,15 @@ function createZeroRow(date: string): DailyReportRow {
   return {
     date,
     requests: 0,
+    conversations: 0,
     inputTokens: 0,
     outputTokens: 0,
     cachedInputTokens: 0,
     costUsd: 0,
     activeAccounts: 0,
     errorCount: 0,
+    medianTtftMs: 0,
+    medianTps: 0,
+    medianQueueMs: 0,
   };
 }

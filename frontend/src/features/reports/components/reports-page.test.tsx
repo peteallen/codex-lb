@@ -1,4 +1,4 @@
-import { act, fireEvent, screen, within } from "@testing-library/react";
+import { act, fireEvent, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ReactNode } from "react";
@@ -6,12 +6,19 @@ import type { ReactNode } from "react";
 import { renderWithProviders } from "@/test/utils";
 import type { ReportsResponse } from "@/features/reports/schemas";
 import { listAccounts } from "@/features/accounts/api";
+import { listApiKeys } from "@/features/api-keys/api";
+import { createApiKey } from "@/test/mocks/factories";
 import { getBrowserReportsTimeZone } from "@/features/reports/date";
 import { useReports } from "@/features/reports/hooks/use-reports";
+import { REPORT_CHART_VISIBILITY_STORAGE_KEY } from "@/features/reports/hooks/use-report-chart-visibility";
 import { ReportsPage } from "./reports-page";
 
 vi.mock("@/features/accounts/api", () => ({
   listAccounts: vi.fn().mockResolvedValue({ accounts: [] }),
+}));
+
+vi.mock("@/features/api-keys/api", () => ({
+  listApiKeys: vi.fn().mockResolvedValue([]),
 }));
 
 vi.mock("@/features/reports/hooks/use-reports", () => ({
@@ -46,6 +53,7 @@ const EMPTY_REPORT: ReportsResponse = {
     totalCachedTokens: 0,
     totalRequests: 0,
     totalErrors: 0,
+    totalConversations: 0,
     activeAccounts: 0,
     avgCostPerDay: 0,
     avgRequestsPerDay: 0,
@@ -66,6 +74,7 @@ const EMPTY_REPORT: ReportsResponse = {
 
 const useReportsMock = vi.mocked(useReports);
 const listAccountsMock = vi.mocked(listAccounts);
+const listApiKeysMock = vi.mocked(listApiKeys);
 const getBrowserReportsTimeZoneMock = vi.mocked(getBrowserReportsTimeZone);
 type UseReportsMockResult = ReturnType<typeof useReports>;
 const REPORTS_TIMEZONE_STORAGE_KEY = "codex-lb-reports-timezone";
@@ -78,9 +87,11 @@ describe("ReportsPage", () => {
   beforeEach(() => {
     useReportsMock.mockReset();
     listAccountsMock.mockReset();
+    listApiKeysMock.mockReset();
     getBrowserReportsTimeZoneMock.mockReset();
     window.localStorage.clear();
     listAccountsMock.mockResolvedValue({ accounts: [] });
+    listApiKeysMock.mockResolvedValue([]);
     getBrowserReportsTimeZoneMock.mockReturnValue("America/Los_Angeles");
   });
 
@@ -139,6 +150,21 @@ describe("ReportsPage", () => {
       }),
       "America/Los_Angeles",
     );
+  });
+
+  it("shows the loading label without duplicating ellipsis punctuation", () => {
+    useReportsMock.mockReturnValue(
+      asUseReportsResult({
+        isLoading: true,
+        isError: false,
+        refetch: vi.fn(),
+      }),
+    );
+
+    renderWithProviders(<ReportsPage />);
+
+    expect(screen.getByText("Loading...")).toBeInTheDocument();
+    expect(screen.queryByText("Loading......")).not.toBeInTheDocument();
   });
 
   it("uses the live valid timezone for reports queries even when a cached value exists", async () => {
@@ -385,6 +411,102 @@ describe("ReportsPage", () => {
     ).toBeInTheDocument();
   });
 
+  it("loads API-key options with name and prefix labels and keeps the selection in the catalog scope", async () => {
+    const user = userEvent.setup();
+    listApiKeysMock.mockResolvedValue([
+      createApiKey({ id: "key_primary", name: "Primary key", keyPrefix: "sk-primary" }),
+      createApiKey({ id: "key_backup", name: "Backup key", keyPrefix: "sk-backup" }),
+    ]);
+    useReportsMock.mockImplementation((filters) =>
+      asUseReportsResult({
+        data: {
+          ...EMPTY_REPORT,
+          byModel: filters.apiKeyId.length
+            ? [{ model: "gpt-5.1", costUsd: 1, requests: 1, percentage: 100 }]
+            : [
+                { model: "gpt-5.1", costUsd: 1, requests: 1, percentage: 50 },
+                { model: "gpt-5.2", costUsd: 1, requests: 1, percentage: 50 },
+              ],
+        },
+        isLoading: false,
+        refetch: vi.fn(),
+      }),
+    );
+
+    renderWithProviders(<ReportsPage />);
+
+    await user.click(screen.getByRole("button", { name: /API Keys/i }));
+    expect(
+      await screen.findByRole("menuitemcheckbox", {
+        name: /Primary key · sk-primary/i,
+      }),
+    ).toBeInTheDocument();
+
+    await user.click(
+      screen.getByRole("menuitemcheckbox", { name: /Primary key · sk-primary/i }),
+    );
+
+    const recentCalls = useReportsMock.mock.calls.slice(-2);
+    expect(recentCalls[0]?.[0]).toEqual(expect.objectContaining({ apiKeyId: ["key_primary"] }));
+    expect(recentCalls[1]?.[0]).toEqual(
+      expect.objectContaining({ apiKeyId: ["key_primary"], model: "", useragent: "" }),
+    );
+  });
+
+  it("keeps a selected API key visible as a removable stale option", async () => {
+    const user = userEvent.setup();
+    useReportsMock.mockReturnValue(
+      asUseReportsResult({
+        data: EMPTY_REPORT,
+        isLoading: false,
+        isError: false,
+        refetch: vi.fn(),
+      }),
+    );
+
+    renderWithProviders(<ReportsPage initialFilters={{ apiKeyId: ["key_deleted"] }} />);
+
+    await user.click(screen.getByRole("button", { name: /key_deleted/i }));
+    expect(await screen.findByText("Stale")).toBeInTheDocument();
+    expect(
+      screen.getByRole("menuitemcheckbox", { name: /key_deleted/i }),
+    ).toBeInTheDocument();
+  });
+
+  it("keeps report data visible and retries a failed API-key catalog request", async () => {
+    const user = userEvent.setup();
+    listApiKeysMock.mockRejectedValueOnce(new Error("API-key catalog unavailable"));
+    useReportsMock.mockReturnValue(
+      asUseReportsResult({
+        data: EMPTY_REPORT,
+        isLoading: false,
+        isError: false,
+        refetch: vi.fn(),
+      }),
+    );
+
+    renderWithProviders(<ReportsPage />);
+
+    expect(
+      await screen.findByText(
+        /Failed to load API key options: API-key catalog unavailable/i,
+      ),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Total Cost")).toBeInTheDocument();
+
+    listApiKeysMock.mockResolvedValueOnce([]);
+    await user.click(screen.getByRole("button", { name: /retry/i }));
+
+    await waitFor(() => expect(listApiKeysMock).toHaveBeenCalledTimes(2));
+    await waitFor(() =>
+      expect(
+        screen.queryByText(
+          /Failed to load API key options: API-key catalog unavailable/i,
+        ),
+      ).not.toBeInTheDocument(),
+    );
+  });
+
   it("clears the last clicked preset highlight after manual date edits", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2030-01-15T12:00:00Z"));
@@ -533,6 +655,148 @@ describe("ReportsPage", () => {
     const useragentCard = await screen.findByText("Distribution by UserAgent");
 
     expect(modelCard.compareDocumentPosition(useragentCard)).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
+  });
+
+  it("renders a saved chart subset without changing reports query inputs", async () => {
+    window.localStorage.setItem(
+      REPORT_CHART_VISIBILITY_STORAGE_KEY,
+      JSON.stringify(["costByDay"]),
+    );
+    useReportsMock.mockReturnValue(
+      asUseReportsResult({
+        data: EMPTY_REPORT,
+        isLoading: false,
+        isError: false,
+        refetch: vi.fn(),
+      }),
+    );
+
+    renderWithProviders(<ReportsPage />);
+
+    expect(
+      await screen.findByText("Cost by Day", {
+        selector: "div.text-sm.font-semibold.text-foreground",
+      }),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("Tokens by Day")).not.toBeInTheDocument();
+    expect(screen.queryByText("Time to First Token")).not.toBeInTheDocument();
+    expect(screen.queryByText("Tokens per Second")).not.toBeInTheDocument();
+    expect(screen.queryByText("Queue Wait")).not.toBeInTheDocument();
+    expect(screen.getByText("Total Cost")).toBeInTheDocument();
+    expect(screen.getByText("Distribution by Model")).toBeInTheDocument();
+    expect(screen.getByText("Daily Breakdown")).toBeInTheDocument();
+
+    for (const [filters] of useReportsMock.mock.calls) {
+      expect(filters).not.toHaveProperty("visibleChartIds");
+    }
+  });
+
+  it("renders all five line charts by default", async () => {
+    useReportsMock.mockReturnValue(
+      asUseReportsResult({
+        data: EMPTY_REPORT,
+        isLoading: false,
+        isError: false,
+        refetch: vi.fn(),
+      }),
+    );
+
+    renderWithProviders(<ReportsPage />);
+
+    for (const heading of [
+      "Cost by Day",
+      "Tokens by Day",
+      "Time to First Token",
+      "Tokens per Second",
+      "Queue Wait",
+    ]) {
+      expect(await screen.findByText(heading)).toBeInTheDocument();
+    }
+  });
+
+  it("renders the selected Cost by Day and Queue Wait charts", async () => {
+    window.localStorage.setItem(
+      REPORT_CHART_VISIBILITY_STORAGE_KEY,
+      JSON.stringify(["queueWait", "costByDay"]),
+    );
+    useReportsMock.mockReturnValue(
+      asUseReportsResult({
+        data: EMPTY_REPORT,
+        isLoading: false,
+        isError: false,
+        refetch: vi.fn(),
+      }),
+    );
+
+    renderWithProviders(<ReportsPage />);
+
+    expect(await screen.findByText("Cost by Day")).toBeInTheDocument();
+    expect(await screen.findByText("Queue Wait")).toBeInTheDocument();
+    expect(screen.queryByText("Tokens by Day")).not.toBeInTheDocument();
+    expect(screen.queryByText("Time to First Token")).not.toBeInTheDocument();
+    expect(screen.queryByText("Tokens per Second")).not.toBeInTheDocument();
+  });
+
+  it("keeps summaries and non-line charts when every line chart is hidden", async () => {
+    const user = userEvent.setup();
+    useReportsMock.mockReturnValue(
+      asUseReportsResult({
+        data: EMPTY_REPORT,
+        isLoading: false,
+        isError: false,
+        refetch: vi.fn(),
+      }),
+    );
+
+    renderWithProviders(<ReportsPage />);
+
+    await user.click(screen.getByRole("button", { name: "Charts (5)" }));
+    for (const chartOption of screen.getAllByRole("menuitemcheckbox")) {
+      await user.click(chartOption);
+    }
+    await user.keyboard("{Escape}");
+
+    expect(screen.queryByText("Cost by Day")).not.toBeInTheDocument();
+    expect(screen.queryByText("Tokens by Day")).not.toBeInTheDocument();
+    expect(screen.queryByText("Time to First Token")).not.toBeInTheDocument();
+    expect(screen.queryByText("Tokens per Second")).not.toBeInTheDocument();
+    expect(screen.queryByText("Queue Wait")).not.toBeInTheDocument();
+    expect(screen.getByText("Total Cost")).toBeInTheDocument();
+    expect(screen.getByText("Distribution by Model")).toBeInTheDocument();
+    expect(screen.getByText("Distribution by UserAgent")).toBeInTheDocument();
+    expect(screen.getByText("Daily Breakdown")).toBeInTheDocument();
+    expect(window.localStorage.getItem(REPORT_CHART_VISIBILITY_STORAGE_KEY)).toBe(
+      JSON.stringify([]),
+    );
+  });
+
+  it("does not change reports query calls when chart visibility changes", async () => {
+    const user = userEvent.setup();
+    useReportsMock.mockReturnValue(
+      asUseReportsResult({
+        data: EMPTY_REPORT,
+        isLoading: false,
+        isError: false,
+        refetch: vi.fn(),
+      }),
+    );
+
+    renderWithProviders(
+      <ReportsPage initialFilters={{ model: "gpt-5.1", useragent: "CLI" }} />,
+    );
+
+    await screen.findByText("Cost by Day");
+    const callCountBeforeToggle = useReportsMock.mock.calls.length;
+    const callsBeforeToggle = useReportsMock.mock.calls.slice(-2).map(
+      ([filters, timeZone]) => [filters, timeZone],
+    );
+    await user.click(screen.getByRole("button", { name: "Charts (5)" }));
+    await user.click(
+      screen.getByRole("menuitemcheckbox", { name: "Queue Wait" }),
+    );
+
+    expect(useReportsMock.mock.calls.length).toBeGreaterThan(callCountBeforeToggle);
+    expect(useReportsMock.mock.calls.slice(-2)).toEqual(callsBeforeToggle);
   });
 
   it("keeps the model and user-agent metric toggles independent", async () => {

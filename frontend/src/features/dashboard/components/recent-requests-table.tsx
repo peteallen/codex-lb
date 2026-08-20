@@ -1,5 +1,6 @@
 import { Inbox } from "lucide-react";
 import { useMemo, useState } from "react";
+import { useTranslation } from "react-i18next";
 
 import { isEmailLabel } from "@/components/blur-email";
 import { CopyButton } from "@/components/copy-button";
@@ -26,15 +27,17 @@ import {
 import { PaginationControls } from "@/features/dashboard/components/filters/pagination-controls";
 import { RequestArchivePanel } from "@/features/conversation-archive/components/request-archive-panel";
 import type { AccountSummary, RequestLog } from "@/features/dashboard/schemas";
+import { useAuthStore } from "@/features/auth/hooks/use-auth";
+import { useDateDisplayFormatStore } from "@/hooks/use-date-format";
 import { REQUEST_STATUS_LABELS } from "@/utils/constants";
 import {
   formatDateTimeInline,
+  formatDateTimeLines,
   formatCompactNumber,
   formatCurrency,
   formatModelLabel,
   formatElapsed,
   formatSlug,
-  formatTimeLong,
 } from "@/utils/formatters";
 
 const STATUS_CLASS_MAP: Record<string, string> = {
@@ -81,9 +84,10 @@ export type RecentRequestsTableProps = {
   hasMore: boolean;
   onLimitChange: (limit: number) => void;
   onOffsetChange: (offset: number) => void;
+  onConversationClick?: (conversationId: string) => void;
 };
 
-function formatRequestCostSummary(request: RequestLog | null): string | null {
+function formatRequestCostSummary(request: RequestLog | null, t: ReturnType<typeof useTranslation>["t"]): string | null {
   if (!request || request.status !== "ok") {
     return null;
   }
@@ -96,19 +100,31 @@ function formatRequestCostSummary(request: RequestLog | null): string | null {
 
   if (nonCachedInputTokens != null && request.costBreakdown?.inputUsd != null) {
     segments.push(
-      `${formatCompactNumber(nonCachedInputTokens)} Input (${formatCurrency(request.costBreakdown.inputUsd)})`,
+      t("dashboard.requestDetails.costSegment", {
+        count: formatCompactNumber(nonCachedInputTokens),
+        label: t("common.units.input"),
+        cost: formatCurrency(request.costBreakdown.inputUsd),
+      }),
     );
   }
 
   if (request.cachedInputTokens != null && request.costBreakdown?.cachedInputUsd != null) {
     segments.push(
-      `${formatCompactNumber(request.cachedInputTokens)} Cached (${formatCurrency(request.costBreakdown.cachedInputUsd)})`,
+      t("dashboard.requestDetails.costSegment", {
+        count: formatCompactNumber(request.cachedInputTokens),
+        label: t("common.units.cached"),
+        cost: formatCurrency(request.costBreakdown.cachedInputUsd),
+      }),
     );
   }
 
   if (request.outputTokens != null && request.costBreakdown?.outputUsd != null) {
     segments.push(
-      `${formatCompactNumber(request.outputTokens)} Output (${formatCurrency(request.costBreakdown.outputUsd)})`,
+      t("dashboard.requestDetails.costSegment", {
+        count: formatCompactNumber(request.outputTokens),
+        label: t("common.units.output"),
+        cost: formatCurrency(request.costBreakdown.outputUsd),
+      }),
     );
   }
 
@@ -123,6 +139,51 @@ function formatRequestCostSummary(request: RequestLog | null): string | null {
   return `${formatCurrency(totalUsd)} = ${segments.join(" + ")}`;
 }
 
+function generationAnchorMs(request: RequestLog): number | null {
+  return (
+    request.latencyFirstTokenMs ??
+    request.latencyResponseCreatedMs ??
+    null
+  );
+}
+
+function formatGenerationSpeed(request: RequestLog): string | null {
+  const anchorMs = generationAnchorMs(request);
+  if (request.outputTokensRaw == null || request.latencyMs == null || anchorMs == null) {
+    return null;
+  }
+
+  const outputCount = request.outputTokensRaw;
+  const generationMs = request.latencyMs - anchorMs;
+  if (outputCount <= 0 || generationMs <= 0) {
+    return null;
+  }
+
+  return (outputCount / (generationMs / 1000)).toFixed(1);
+}
+
+function firstTokenDisplay(request: RequestLog): { text: string; approximate: boolean } | null {
+  const exact = formatCompactElapsed(request.latencyFirstTokenMs);
+  if (exact != null) {
+    return { text: exact, approximate: false };
+  }
+  if (request.outputTokensRaw == null || request.outputTokensRaw <= 0) {
+    return null;
+  }
+  const fallback = formatCompactElapsed(generationAnchorMs(request));
+  return fallback == null ? null : { text: fallback, approximate: true };
+}
+
+function formatCompactElapsed(ms: number | null | undefined): string | null {
+  if (ms == null) {
+    return null;
+  }
+  if (ms < 1000) {
+    return `${ms}ms`;
+  }
+  return `${(ms / 1000).toFixed(1)}s`;
+}
+
 export function RecentRequestsTable({
   requests,
   accounts,
@@ -132,10 +193,14 @@ export function RecentRequestsTable({
   hasMore,
   onLimitChange,
   onOffsetChange,
+  onConversationClick,
 }: RecentRequestsTableProps) {
+  const { t } = useTranslation();
   const [selectedRequest, setSelectedRequest] = useState<RequestLog | null>(null);
   const blurred = usePrivacyStore((s) => s.blurred);
-  const selectedRequestCostSummary = formatRequestCostSummary(selectedRequest);
+  const isAdmin = useAuthStore((state) => state.role === "admin");
+  const dateDisplayFormat = useDateDisplayFormatStore((state) => state.dateDisplayFormat);
+  const selectedRequestCostSummary = formatRequestCostSummary(selectedRequest, t);
 
   const accountLabelMap = useMemo(() => {
     const index = new Map<string, string>();
@@ -161,8 +226,8 @@ export function RecentRequestsTable({
     return (
       <EmptyState
         icon={Inbox}
-        title="No request logs"
-        description="No request logs match the current filters."
+        title={t("dashboard.requests.emptyTitle")}
+        description={t("dashboard.requests.emptyDescription")}
       />
     );
   }
@@ -171,25 +236,27 @@ export function RecentRequestsTable({
     <div className="space-y-3">
     <div className="rounded-xl border bg-card">
       <div className="relative overflow-x-auto">
-        <Table className="min-w-[1240px] table-fixed">
+        <Table className="w-full table-fixed">
           <TableHeader>
             <TableRow className="hover:bg-transparent">
-              <TableHead className="w-28 pl-4 text-[11px] font-medium uppercase tracking-wider text-muted-foreground/80">Time</TableHead>
-              <TableHead className="text-[11px] font-medium uppercase tracking-wider text-muted-foreground/80">Account</TableHead>
-              <TableHead className="w-24 text-[11px] font-medium uppercase tracking-wider text-muted-foreground/80">Plan</TableHead>
-              <TableHead className="text-[11px] font-medium uppercase tracking-wider text-muted-foreground/80">API Key</TableHead>
-              <TableHead className="text-[11px] font-medium uppercase tracking-wider text-muted-foreground/80">Model</TableHead>
-              <TableHead className="w-32 pr-3 text-[11px] font-medium uppercase tracking-wider text-muted-foreground/80">Transport</TableHead>
-              <TableHead className="w-24 pl-3 text-[11px] font-medium uppercase tracking-wider text-muted-foreground/80">Status</TableHead>
-              <TableHead className="w-24 text-right text-[11px] font-medium uppercase tracking-wider text-muted-foreground/80">Tokens</TableHead>
-              <TableHead className="w-16 text-right text-[11px] font-medium uppercase tracking-wider text-muted-foreground/80">Cost</TableHead>
-              <TableHead className="w-72 pr-4 text-[11px] font-medium uppercase tracking-wider text-muted-foreground/80">Details</TableHead>
+              <TableHead className="w-28 pl-4 text-[11px] font-medium uppercase tracking-wider text-muted-foreground/80">{t("dashboard.requests.columns.time")}</TableHead>
+              <TableHead className="text-[11px] font-medium uppercase tracking-wider text-muted-foreground/80">{t("dashboard.requests.columns.account")}</TableHead>
+              <TableHead className="w-24 text-[11px] font-medium uppercase tracking-wider text-muted-foreground/80">{t("dashboard.requests.columns.plan")}</TableHead>
+              <TableHead className="text-[11px] font-medium uppercase tracking-wider text-muted-foreground/80">{t("dashboard.requests.columns.apiKey")}</TableHead>
+              <TableHead className="text-[11px] font-medium uppercase tracking-wider text-muted-foreground/80">{t("dashboard.requests.columns.model")}</TableHead>
+              <TableHead className="w-32 pr-3 text-[11px] font-medium uppercase tracking-wider text-muted-foreground/80">{t("dashboard.requests.columns.transport")}</TableHead>
+              <TableHead className="w-24 pl-3 text-[11px] font-medium uppercase tracking-wider text-muted-foreground/80">{t("dashboard.requests.columns.status")}</TableHead>
+              <TableHead className="w-20 text-right text-[11px] font-medium uppercase tracking-wider text-muted-foreground/80">TTFT</TableHead>
+              <TableHead className="w-20 text-right text-[11px] font-medium uppercase tracking-wider text-muted-foreground/80">TPS</TableHead>
+              <TableHead className="w-24 text-right text-[11px] font-medium uppercase tracking-wider text-muted-foreground/80">{t("dashboard.requests.columns.tokens")}</TableHead>
+              <TableHead className="w-16 text-right text-[11px] font-medium uppercase tracking-wider text-muted-foreground/80">{t("dashboard.requests.columns.cost")}</TableHead>
+              <TableHead className="w-72 pr-4 text-[11px] font-medium uppercase tracking-wider text-muted-foreground/80">{t("dashboard.requests.columns.details")}</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
             {requests.map((request) => {
-              const time = formatTimeLong(request.requestedAt);
-              const accountLabel = request.accountId ? (accountLabelMap.get(request.accountId) ?? request.accountId) : "Unassigned";
+              const time = formatDateTimeLines(request.requestedAt, dateDisplayFormat);
+              const accountLabel = request.accountId ? (accountLabelMap.get(request.accountId) ?? request.accountId) : t("dashboard.requests.unassigned");
               const isEmailLabel = !!(request.accountId && emailLabelIds.has(request.accountId));
               const errorPreview = request.errorMessage || request.errorCode || "-";
               const hasError = !!(request.errorCode || request.errorMessage);
@@ -199,13 +266,15 @@ export function RecentRequestsTable({
               const planType = request.planType?.trim().toLowerCase() || null;
               const planLabel = planType ? formatSlug(planType) : "--";
               const upstreamTransport = request.upstreamTransport;
+              const generationSpeed = formatGenerationSpeed(request);
+              const firstToken = firstTokenDisplay(request);
 
               return (
                 <TableRow key={request.requestId}>
                   <TableCell className="pl-4 align-top">
                     <div className="leading-tight">
-                      <div className="text-sm font-medium">{time.time}</div>
-                      <div className="text-xs text-muted-foreground">{time.date}</div>
+                      <div className="text-sm font-medium">{time.primary}</div>
+                      <div className="text-xs text-muted-foreground">{time.secondary}</div>
                     </div>
                   </TableCell>
                   <TableCell className="truncate align-top text-sm">
@@ -242,7 +311,7 @@ export function RecentRequestsTable({
                       ) : null}
                       {showRequestedTier ? (
                         <div className="text-[11px] text-muted-foreground">
-                          Requested {request.requestedServiceTier}
+                          {t("dashboard.requests.requestedTier", { tier: request.requestedServiceTier })}
                         </div>
                       ) : null}
                     </div>
@@ -253,13 +322,13 @@ export function RecentRequestsTable({
                         <Badge
                           variant="outline"
                           className={TRANSPORT_CLASS_MAP[request.transport] ?? TRANSPORT_CLASS_MAP.http}
-                          title="Downstream client transport"
+                          title={t("dashboard.requests.downstreamTransport")}
                         >
                           {TRANSPORT_LABELS[request.transport] ?? request.transport}
                         </Badge>
                         {upstreamTransport ? (
                           <div className="text-[11px] text-muted-foreground">
-                            Up {TRANSPORT_LABELS[upstreamTransport] ?? upstreamTransport}
+                            {t("dashboard.requests.upstreamTransport", { transport: TRANSPORT_LABELS[upstreamTransport] ?? upstreamTransport })}
                           </div>
                         ) : null}
                       </div>
@@ -272,15 +341,32 @@ export function RecentRequestsTable({
                       variant="outline"
                       className={STATUS_CLASS_MAP[request.status] ?? STATUS_CLASS_MAP.error}
                     >
-                      {REQUEST_STATUS_LABELS[request.status] ?? request.status}
+                      {t(`dashboard.requestStatus.${request.status}`, { defaultValue: REQUEST_STATUS_LABELS[request.status] ?? request.status })}
                     </Badge>
+                  </TableCell>
+                  <TableCell className="text-right align-top font-mono text-xs tabular-nums">
+                    {firstToken == null ? (
+                      "--"
+                    ) : firstToken.approximate ? (
+                      <span
+                        className="text-muted-foreground"
+                        title={t("dashboard.requests.firstOutputApproxHint")}
+                      >
+                        ~{firstToken.text}
+                      </span>
+                    ) : (
+                      firstToken.text
+                    )}
+                  </TableCell>
+                  <TableCell className="text-right align-top font-mono text-xs tabular-nums">
+                    {generationSpeed ?? "--"}
                   </TableCell>
                   <TableCell className="text-right align-top font-mono text-xs tabular-nums">
                     <div className="leading-tight">
                       <div>{formatCompactNumber(request.tokens)}</div>
                       {request.cachedInputTokens != null && request.cachedInputTokens > 0 && (
                         <div className="text-[11px] text-muted-foreground">
-                          {formatCompactNumber(request.cachedInputTokens)} Cached
+                          {t("common.units.cachedShort", { count: formatCompactNumber(request.cachedInputTokens) })}
                         </div>
                       )}
                     </div>
@@ -308,7 +394,7 @@ export function RecentRequestsTable({
                           className="h-6 px-2 text-[11px]"
                           onClick={() => setSelectedRequest(request)}
                         >
-                          View Details
+                          {t("dashboard.requests.viewDetails")}
                         </Button>
                       </div>
                     ) : (
@@ -319,7 +405,7 @@ export function RecentRequestsTable({
                         className="h-6 px-2 text-[11px]"
                         onClick={() => setSelectedRequest(request)}
                       >
-                        View Details
+                        {t("dashboard.requests.viewDetails")}
                       </Button>
                     )}
                   </TableCell>
@@ -345,55 +431,100 @@ export function RecentRequestsTable({
       <Dialog open={selectedRequest !== null} onOpenChange={(open) => { if (!open) setSelectedRequest(null); }}>
         <DialogContent className="max-h-[85vh] sm:max-w-2xl">
           <DialogHeader>
-            <DialogTitle>Request Details</DialogTitle>
-            <DialogDescription>Inspect request metadata and copy the fields you need.</DialogDescription>
+            <DialogTitle>{t("dashboard.requestDetails.title")}</DialogTitle>
+            <DialogDescription>{t("dashboard.requestDetails.description")}</DialogDescription>
           </DialogHeader>
           <div className="grid gap-4 overflow-y-auto">
             <div className="space-y-3 rounded-md border bg-muted/30 p-4">
               <RequestDetailField
-                label="Request ID"
+                label={t("dashboard.requestDetails.requestId")}
                 value={selectedRequest?.requestId ?? "—"}
                 mono
                 copyValue={selectedRequest?.requestId ?? ""}
-                copyLabel="Copy Request ID"
+                copyLabel={t("dashboard.requestDetails.copyRequestId")}
                 compactCopy
               />
               <div className="grid gap-3 sm:grid-cols-3">
-                <RequestDetailField label="Status" value={selectedRequest ? (REQUEST_STATUS_LABELS[selectedRequest.status] ?? selectedRequest.status) : "—"} />
-                <RequestDetailField label="Model" value={selectedRequest ? formatModelLabel(selectedRequest.model, selectedRequest.reasoningEffort, selectedRequest.actualServiceTier ?? selectedRequest.serviceTier) : "—"} mono />
-                <RequestDetailField label="Request kind" value={selectedRequest ? (REQUEST_KIND_LABELS[selectedRequest.requestKind] ?? selectedRequest.requestKind) : "—"} />
-                <RequestDetailField label="Plan" value={selectedRequest?.planType ? formatSlug(selectedRequest.planType) : "—"} />
-                <RequestDetailField label="Elapsed" value={formatElapsed(selectedRequest?.latencyMs ?? null)} />
+                <RequestDetailField label={t("dashboard.requests.columns.status")} value={selectedRequest ? t(`dashboard.requestStatus.${selectedRequest.status}`, { defaultValue: REQUEST_STATUS_LABELS[selectedRequest.status] ?? selectedRequest.status }) : "—"} />
+                <RequestDetailField label={t("dashboard.requests.columns.model")} value={selectedRequest ? formatModelLabel(selectedRequest.model, selectedRequest.reasoningEffort, selectedRequest.actualServiceTier ?? selectedRequest.serviceTier) : "—"} mono />
+                <RequestDetailField label={t("dashboard.requestDetails.requestKind")} value={selectedRequest ? (REQUEST_KIND_LABELS[selectedRequest.requestKind] ?? selectedRequest.requestKind) : "—"} />
+                <RequestDetailField label={t("dashboard.requests.columns.plan")} value={selectedRequest?.planType ? formatSlug(selectedRequest.planType) : "—"} />
+                <RequestDetailField label={t("dashboard.requestDetails.elapsed")} value={formatElapsed(selectedRequest?.latencyMs ?? null)} />
+                <RequestDetailField label="TTFT" value={formatElapsed(selectedRequest?.latencyFirstTokenMs ?? null)} />
+                <RequestDetailField label={t("dashboard.requestDetails.queue")} value={formatElapsed(selectedRequest?.latencyQueueMs ?? null)} />
+                <RequestDetailField label="TPS" value={selectedRequest ? (formatGenerationSpeed(selectedRequest) ?? "—") : "—"} />
               </div>
               <div className="grid gap-3 sm:grid-cols-3">
-                <RequestDetailField label="Transport" value={selectedRequest?.transport ? (TRANSPORT_LABELS[selectedRequest.transport] ?? selectedRequest.transport) : "—"} />
-                <RequestDetailField label="Time" value={selectedRequest ? formatDateTimeInline(selectedRequest.requestedAt) : "—"} />
-                <RequestDetailField label="Error Code" value={selectedRequest?.errorCode ?? "—"} mono />
+                <RequestDetailField label={t("dashboard.requests.columns.transport")} value={selectedRequest?.transport ? (TRANSPORT_LABELS[selectedRequest.transport] ?? selectedRequest.transport) : "—"} />
+                <RequestDetailField label={t("dashboard.requests.columns.time")} value={selectedRequest ? formatDateTimeInline(selectedRequest.requestedAt, dateDisplayFormat) : "—"} />
+                <RequestDetailField label={t("dashboard.requestDetails.errorCode")} value={selectedRequest?.errorCode ?? "—"} mono />
               </div>
-              <RequestDetailField
-                label="User Agent"
-                value={selectedRequest?.useragent ?? "—"}
-                copyValue={selectedRequest?.useragent ?? undefined}
-                copyLabel="Copy User Agent"
-                compactCopy
-              />
-              <RequestDetailField
-                label="Client IP"
-                value={selectedRequest?.clientIp ?? "—"}
-                copyValue={selectedRequest?.clientIp ?? undefined}
-                copyLabel="Copy Client IP"
-                compactCopy
-              />
+              {isAdmin ? (
+                <RequestDetailField
+                  label={t("dashboard.requestDetails.userAgent")}
+                  value={selectedRequest?.useragent ?? "—"}
+                  copyValue={selectedRequest?.useragent ?? undefined}
+                  copyLabel={t("dashboard.requestDetails.copyUserAgent")}
+                  compactCopy
+                />
+              ) : null}
+              {isAdmin ? (
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <RequestDetailField
+                    label={t("dashboard.requestDetails.clientIp")}
+                    value={selectedRequest?.clientIp ?? "—"}
+                    copyValue={selectedRequest?.clientIp ?? undefined}
+                    copyLabel={t("dashboard.requestDetails.copyClientIp")}
+                    compactCopy
+                  />
+                  <div className="space-y-1">
+                    <div className="flex items-center gap-2">
+                      <div className="text-[11px] font-medium uppercase tracking-wider text-muted-foreground/80">
+                        {t("dashboard.requestDetails.conversationId")}
+                      </div>
+                      {selectedRequest?.conversationId ? (
+                        <CopyButton value={selectedRequest.conversationId} label={t("dashboard.requestDetails.copyConversationId")} iconOnly />
+                      ) : null}
+                    </div>
+                    <div className="flex flex-col items-start gap-2">
+                      {selectedRequest?.conversationId ? (
+                        onConversationClick ? (
+                          <button
+                            type="button"
+                            className="max-w-[200px] truncate text-left text-sm leading-relaxed text-primary hover:text-primary/80 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring rounded-sm"
+                            title={selectedRequest.conversationId}
+                            onClick={() => {
+                              setSelectedRequest(null);
+                              onConversationClick(selectedRequest?.conversationId ?? "");
+                            }}
+                            aria-label={t("dashboard.filters.conversationFilterAria", { id: selectedRequest.conversationId })}
+                          >
+                            {selectedRequest.conversationId}
+                          </button>
+                        ) : (
+                          <p className="max-w-[200px] truncate text-sm leading-relaxed" title={selectedRequest.conversationId ?? undefined}>
+                            {selectedRequest.conversationId}
+                          </p>
+                        )
+                      ) : (
+                        <p className="min-w-0 flex-1 break-all text-sm leading-relaxed">—</p>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              ) : null}
             </div>
 
-            <RequestArchivePanel
-              requestId={selectedRequest?.archiveRequestId ?? selectedRequest?.requestId}
-              requestedAt={selectedRequest?.requestedAt}
-            />
+            {isAdmin ? (
+              <RequestArchivePanel
+                requestId={selectedRequest?.archiveRequestId ?? selectedRequest?.requestId}
+                requestedAt={selectedRequest?.requestedAt}
+              />
+            ) : null}
 
             {selectedRequestCostSummary ? (
               <div className="space-y-2">
-                <h3 className="text-sm font-medium">Cost</h3>
+                <h3 className="text-sm font-medium">{t("dashboard.requests.columns.cost")}</h3>
                 <div className="rounded-md bg-muted/50 p-3">
                   <p className="whitespace-pre-wrap break-words font-mono text-xs leading-relaxed">
                     {selectedRequestCostSummary}
@@ -404,14 +535,14 @@ export function RecentRequestsTable({
 
             <div className="space-y-2">
               <div className="flex items-center gap-2">
-                <h3 className="text-sm font-medium">Full Error</h3>
+                <h3 className="text-sm font-medium">{t("dashboard.requestDetails.fullError")}</h3>
                 {selectedRequest?.errorMessage ? (
-                  <CopyButton value={selectedRequest.errorMessage} label="Copy Error" iconOnly />
+                  <CopyButton value={selectedRequest.errorMessage} label={t("dashboard.requestDetails.copyError")} iconOnly />
                 ) : null}
               </div>
               <div className="max-h-[36vh] overflow-y-auto rounded-md bg-muted/50 p-3">
                 <p className="whitespace-pre-wrap break-words font-mono text-xs leading-relaxed">
-                  {selectedRequest?.errorMessage ?? selectedRequest?.errorCode ?? "No error detail recorded."}
+                  {selectedRequest?.errorMessage ?? selectedRequest?.errorCode ?? t("dashboard.requestDetails.noErrorDetail")}
                 </p>
               </div>
             </div>
@@ -437,9 +568,12 @@ function RequestDetailField({
   value,
   mono = false,
   copyValue,
-  copyLabel = "Copy",
+  copyLabel,
   compactCopy = false,
 }: RequestDetailFieldProps) {
+  const { t } = useTranslation();
+  const copyLabelText = copyLabel ?? t("components.copyButton.copy");
+
   return (
     <div className="space-y-1">
       <div className="flex items-center gap-2">
@@ -447,7 +581,7 @@ function RequestDetailField({
           {label}
         </div>
         {copyValue ? (
-          <CopyButton value={copyValue} label={copyLabel} iconOnly={compactCopy} />
+          <CopyButton value={copyValue} label={copyLabelText} iconOnly={compactCopy} />
         ) : null}
       </div>
       <div className="flex flex-col items-start gap-2">

@@ -12,8 +12,7 @@ export function useDashboard(
 ) {
   const overviewRange: DashboardOverviewRange =
     typeof range === "string" ? { mode: "preset", timeframe: range } : range;
-  const queryRange =
-    overviewRange.mode === "preset" ? overviewRange.timeframe : overviewRange;
+  const queryRange = overviewRange.mode === "preset" ? overviewRange.timeframe : overviewRange;
   return useQuery({
     queryKey: ["dashboard", "overview", queryRange],
     queryFn: () => getDashboardOverview({ range: overviewRange }),

@@ -8,13 +8,34 @@ from typing import Protocol, cast
 import anyio
 
 from app.core.metrics.prometheus import PROMETHEUS_AVAILABLE, proxy_phase_latency_seconds
+from app.core.utils.time import utcnow
 from app.modules.api_keys.service import ApiKeyData
 from app.modules.proxy.affinity import _extract_model_class
 from app.modules.proxy.repo_bundle import ProxyRepoFactory
 
 logger = logging.getLogger("app.modules.proxy.service")
 
+# _background_cleanup_tasks also tracks non-persistence work (bridge session
+# close cleanups, security-work error forwards); the shutdown drain must not
+# spend its budget on those - they have their own teardown - so it only waits
+# on tasks whose names mark them as request-log or settlement persistence.
+_PERSISTENCE_TASK_NAME_PREFIXES = (
+    "proxy-request-log-",
+    "proxy-stream-api-key-settle-",
+    "proxy-release_stream_api_key_reservation",
+    "proxy-websocket-terminal-",
+    "proxy-websocket-transport-end-",
+    "proxy-websocket-finalization-",
+    "http-bridge-recovery-settlement-",
+)
+
+
+def _is_persistence_task(task: asyncio.Task[None], prefixes: tuple[str, ...] | None = None) -> bool:
+    return task.get_name().startswith(prefixes or _PERSISTENCE_TASK_NAME_PREFIXES)
+
+
 _REQUEST_TRANSPORT_HTTP = "http"
+_REQUEST_TRANSPORT_WEBSOCKET = "websocket"
 
 
 def _record_proxy_phase_latency(
@@ -42,6 +63,9 @@ def _record_proxy_phase_latency(
 class _RequestLogServiceProtocol(Protocol):
     _repo_factory: ProxyRepoFactory
     _request_log_tasks: set[asyncio.Task[None]]
+    _background_cleanup_tasks: set[asyncio.Task[None]]
+
+    def _remember_websocket_previous_response_owner(self, **kwargs: object) -> None: ...
 
 
 def _normalize_session_id(session_id: str | None) -> str | None:
@@ -63,32 +87,61 @@ class _RequestLogMixin:
         is known so dashboards and usage views surface the user-visible
         ``gpt-image-*`` model instead of the host (e.g. ``gpt-5.5``).
 
-        The upstream ``stream_responses`` generator writes its request_log
-        row from a ``finally`` block that runs after the last chunk is
-        yielded, which can race with the call site here. We therefore retry
-        a few times with short backoff while the row is still missing.
+        The rewrite is persistence, not response work: it runs as a tracked
+        background task (drained at shutdown alongside the log inserts), so
+        image responses never wait on log durability. Inside the task we
+        first await this request's pending detached insert, then retry with
+        short backoff while the row is still missing (the upstream
+        ``stream_responses`` generator writes its row from a ``finally``
+        block that can race with the call site here).
         """
         if not request_id or not model:
             return
+        task = asyncio.create_task(
+            self._rewrite_request_log_model_once(request_id, model),
+            name=f"proxy-request-log-rewrite-{request_id}",
+        )
+        self._track_request_log_task(task, account_id=None, request_id=request_id)
+
+    async def _rewrite_request_log_model_once(self, request_id: str, model: str) -> None:
         proxy = cast(_RequestLogServiceProtocol, self)
+        insert_task_name = f"proxy-request-log-{request_id}"
         with anyio.CancelScope(shield=True):
             try:
+                loop = asyncio.get_running_loop()
+                deadline = loop.time() + 30
                 rowcount = 0
-                # Total wait: 0 + 50 + 100 + 200 + 400 + 800 ms = 1550 ms.
-                for delay in (0.0, 0.05, 0.1, 0.2, 0.4, 0.8):
-                    if delay > 0:
-                        await asyncio.sleep(delay)
+                delay = 0.0
+                while True:
+                    # Re-check for this request's insert task every iteration:
+                    # the stream generator's finally can schedule the insert
+                    # on a later event-loop turn than this rewrite task, so a
+                    # one-time snapshot could miss it and fall back to blind
+                    # polling against a DB-gated insert.
+                    for pending_insert in [
+                        task
+                        for task in proxy._request_log_tasks
+                        if task.get_name() == insert_task_name and not task.done()
+                    ]:
+                        remaining = max(0.1, deadline - loop.time())
+                        try:
+                            await asyncio.wait_for(asyncio.shield(pending_insert), timeout=remaining)
+                        except Exception:  # insert failures surface via the update probe below
+                            pass
                     async with proxy._repo_factory() as repos:
                         rowcount = await repos.request_logs.update_model_for_request(request_id, model)
                     if rowcount:
                         break
-                if not rowcount:
-                    logger.warning(
-                        "rewrite_request_log_model: request_log row for %s never appeared; "
-                        "public effective model %s not recorded",
-                        request_id,
-                        model,
-                    )
+                    if loop.time() >= deadline:
+                        logger.warning(
+                            "rewrite_request_log_model: request_log row for %s never appeared; "
+                            "public effective model %s not recorded",
+                            request_id,
+                            model,
+                        )
+                        break
+                    delay = min(delay + 0.05, 0.8)
+                    await asyncio.sleep(delay)
             except Exception:
                 logger.warning(
                     "failed to rewrite request_log model request_id=%s model=%s",
@@ -107,14 +160,13 @@ class _RequestLogMixin:
         latency_ms: int,
         status: str,
         latency_first_token_ms: int | None = None,
+        latency_queue_ms: int | None = None,
         latency_response_created_ms: int | None = None,
         latency_first_upstream_event_ms: int | None = None,
         latency_response_create_gate_wait_ms: int | None = None,
         latency_bridge_queue_wait_ms: int | None = None,
         prewarm_status: str | None = None,
         prewarm_latency_ms: int | None = None,
-        prewarm_canary_bucket: str | None = None,
-        prewarm_eligible_reason: str | None = None,
         session_previous_gap_ms: int | None = None,
         error_code: str | None = None,
         error_message: str | None = None,
@@ -136,6 +188,7 @@ class _RequestLogMixin:
         upstream_error_code: str | None = None,
         bridge_stage: str | None = None,
         request_kind: str = "normal",
+        connection_request_kind: str | None = None,
         upstream_proxy_route_mode: str | None = None,
         upstream_proxy_pool_id: str | None = None,
         upstream_proxy_endpoint_id: str | None = None,
@@ -143,9 +196,27 @@ class _RequestLogMixin:
         upstream_proxy_fail_closed_reason: str | None = None,
         useragent: str | None = None,
         useragent_group: str | None = None,
+        conversation_id: str | None = None,
         client_ip: str | None = None,
         archive_request_id: str | None = None,
     ) -> None:
+        proxy = cast(_RequestLogServiceProtocol, self)
+        require_durable_provenance = bool(
+            status == "success"
+            and transport == _REQUEST_TRANSPORT_WEBSOCKET
+            and upstream_transport == _REQUEST_TRANSPORT_HTTP
+            and account_id is not None
+        )
+        if require_durable_provenance:
+            proxy._remember_websocket_previous_response_owner(
+                previous_response_id=request_id,
+                api_key_id=api_key.id if api_key is not None else None,
+                account_id=account_id,
+                session_id=session_id,
+                requested_at=utcnow(),
+                owner_session_id=session_id,
+                upstream_transport=upstream_transport,
+            )
         task = asyncio.create_task(
             self._persist_request_log(
                 account_id=account_id,
@@ -156,14 +227,13 @@ class _RequestLogMixin:
                 latency_ms=latency_ms,
                 status=status,
                 latency_first_token_ms=latency_first_token_ms,
+                latency_queue_ms=latency_queue_ms,
                 latency_response_created_ms=latency_response_created_ms,
                 latency_first_upstream_event_ms=latency_first_upstream_event_ms,
                 latency_response_create_gate_wait_ms=latency_response_create_gate_wait_ms,
                 latency_bridge_queue_wait_ms=latency_bridge_queue_wait_ms,
                 prewarm_status=prewarm_status,
                 prewarm_latency_ms=prewarm_latency_ms,
-                prewarm_canary_bucket=prewarm_canary_bucket,
-                prewarm_eligible_reason=prewarm_eligible_reason,
                 session_previous_gap_ms=session_previous_gap_ms,
                 error_code=error_code,
                 error_message=error_message,
@@ -185,6 +255,7 @@ class _RequestLogMixin:
                 upstream_error_code=upstream_error_code,
                 bridge_stage=bridge_stage,
                 request_kind=request_kind,
+                connection_request_kind=connection_request_kind,
                 upstream_proxy_route_mode=upstream_proxy_route_mode,
                 upstream_proxy_pool_id=upstream_proxy_pool_id,
                 upstream_proxy_endpoint_id=upstream_proxy_endpoint_id,
@@ -192,15 +263,26 @@ class _RequestLogMixin:
                 upstream_proxy_fail_closed_reason=upstream_proxy_fail_closed_reason,
                 useragent=useragent,
                 useragent_group=useragent_group,
+                conversation_id=conversation_id,
                 client_ip=client_ip,
             ),
             name=f"proxy-request-log-{request_id}",
         )
-        try:
+        # Detach by default: most rows are observational (dashboards, usage
+        # aggregation). The HTTP-origin WebSocket completion path opts into a
+        # shielded wait because its row is restart-safe continuity provenance.
+        # The one other post-hoc consumer, the images model
+        # rewrite, already retries while the row is missing. Awaiting the
+        # INSERT+COMMIT here made every stream's close wait on a DB write,
+        # and Codex CLI does not continue until the stream closes. Failures
+        # are logged by the tracking callback, and shutdown drains the task
+        # set (ProxyService.drain_persistence_tasks).
+        self._track_request_log_task(task, account_id=account_id, request_id=request_id)
+        if require_durable_provenance:
+            # HTTP-origin response ids need their transport provenance after a
+            # restart. Shield the tracked task so downstream cancellation leaves
+            # shutdown draining able to finish the correctness-critical commit.
             await asyncio.shield(task)
-        except asyncio.CancelledError:
-            self._track_request_log_task(task, account_id=account_id, request_id=request_id)
-            raise
         _record_proxy_phase_latency(
             phase="ttft",
             latency_ms=latency_first_token_ms,
@@ -241,6 +323,53 @@ class _RequestLogMixin:
             useragent_group=useragent_group,
             model=model,
         )
+
+    async def drain_persistence_tasks(
+        self,
+        timeout_seconds: float,
+        task_name_prefixes: tuple[str, ...] | None = None,
+    ) -> bool:
+        """Await detached request-log and settlement tasks, e.g. at shutdown.
+
+        Persistence runs detached from the response path, so a graceful
+        shutdown must flush whatever is still in flight or the final
+        requests' logs and reservation settlements would be lost. Task done
+        callbacks can schedule follow-up work (a failed settlement enqueues
+        its reservation release), so draining loops until the tracked sets
+        are stable rather than snapshotting once. Returns True when
+        everything drained within the timeout.
+        """
+        proxy = cast(_RequestLogServiceProtocol, self)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout_seconds
+        while True:
+            pending = {
+                task
+                for task in (proxy._request_log_tasks | proxy._background_cleanup_tasks)
+                if not task.done() and _is_persistence_task(task, task_name_prefixes)
+            }
+            if not pending:
+                # One scheduling tick so just-finished tasks' done callbacks
+                # (which may enqueue follow-up tasks) run before we re-check.
+                await asyncio.sleep(0)
+                if not any(
+                    _is_persistence_task(task, task_name_prefixes)
+                    for task in (proxy._request_log_tasks | proxy._background_cleanup_tasks)
+                    if not task.done()
+                ):
+                    return True
+                continue
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                for task in pending:
+                    logger.warning("Persistence task did not drain before shutdown: %s", task.get_name())
+                return False
+            done, still_pending = await asyncio.wait(pending, timeout=remaining)
+            del done
+            if still_pending:
+                for task in still_pending:
+                    logger.warning("Persistence task did not drain before shutdown: %s", task.get_name())
+                return False
 
     def _track_request_log_task(
         self,
@@ -283,14 +412,13 @@ class _RequestLogMixin:
         latency_ms: int,
         status: str,
         latency_first_token_ms: int | None = None,
+        latency_queue_ms: int | None = None,
         latency_response_created_ms: int | None = None,
         latency_first_upstream_event_ms: int | None = None,
         latency_response_create_gate_wait_ms: int | None = None,
         latency_bridge_queue_wait_ms: int | None = None,
         prewarm_status: str | None = None,
         prewarm_latency_ms: int | None = None,
-        prewarm_canary_bucket: str | None = None,
-        prewarm_eligible_reason: str | None = None,
         session_previous_gap_ms: int | None = None,
         error_code: str | None = None,
         error_message: str | None = None,
@@ -312,6 +440,7 @@ class _RequestLogMixin:
         upstream_error_code: str | None = None,
         bridge_stage: str | None = None,
         request_kind: str = "normal",
+        connection_request_kind: str | None = None,
         upstream_proxy_route_mode: str | None = None,
         upstream_proxy_pool_id: str | None = None,
         upstream_proxy_endpoint_id: str | None = None,
@@ -319,6 +448,7 @@ class _RequestLogMixin:
         upstream_proxy_fail_closed_reason: str | None = None,
         useragent: str | None = None,
         useragent_group: str | None = None,
+        conversation_id: str | None = None,
         client_ip: str | None = None,
     ) -> None:
         proxy = cast(_RequestLogServiceProtocol, self)
@@ -342,16 +472,16 @@ class _RequestLogMixin:
                     requested_service_tier=requested_service_tier,
                     actual_service_tier=actual_service_tier,
                     request_kind=request_kind,
+                    connection_request_kind=connection_request_kind,
                     latency_ms=latency_ms,
                     latency_first_token_ms=latency_first_token_ms,
+                    latency_queue_ms=latency_queue_ms,
                     latency_response_created_ms=latency_response_created_ms,
                     latency_first_upstream_event_ms=latency_first_upstream_event_ms,
                     latency_response_create_gate_wait_ms=latency_response_create_gate_wait_ms,
                     latency_bridge_queue_wait_ms=latency_bridge_queue_wait_ms,
                     prewarm_status=prewarm_status,
                     prewarm_latency_ms=prewarm_latency_ms,
-                    prewarm_canary_bucket=prewarm_canary_bucket,
-                    prewarm_eligible_reason=prewarm_eligible_reason,
                     session_previous_gap_ms=session_previous_gap_ms,
                     status=status,
                     error_code=error_code,
@@ -369,6 +499,7 @@ class _RequestLogMixin:
                     upstream_proxy_fail_closed_reason=upstream_proxy_fail_closed_reason,
                     useragent=useragent,
                     useragent_group=useragent_group,
+                    conversation_id=conversation_id,
                     client_ip=client_ip,
                 )
         except Exception:
@@ -396,6 +527,7 @@ class _RequestLogMixin:
         upstream_proxy_fail_closed_reason: str | None = None,
         useragent: str | None = None,
         useragent_group: str | None = None,
+        conversation_id: str | None = None,
         client_ip: str | None = None,
     ) -> None:
         await self._write_request_log(
@@ -415,5 +547,6 @@ class _RequestLogMixin:
             upstream_proxy_fail_closed_reason=upstream_proxy_fail_closed_reason,
             useragent=useragent,
             useragent_group=useragent_group,
+            conversation_id=conversation_id,
             client_ip=client_ip,
         )

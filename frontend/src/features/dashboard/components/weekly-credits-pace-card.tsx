@@ -1,4 +1,5 @@
 import { Gauge } from "lucide-react";
+import { useTranslation } from "react-i18next";
 
 import type { WeeklyCreditPace } from "@/features/dashboard/utils";
 import { cn } from "@/lib/utils";
@@ -33,51 +34,50 @@ function formatProAccountEquivalent(value: number): string {
   return value < 10 ? value.toFixed(1) : value.toFixed(0);
 }
 
-function currentGapLabel(pace: WeeklyCreditPace): string {
+function statusLabel(pace: WeeklyCreditPace, t: ReturnType<typeof useTranslation>["t"]): string {
   const deltaPercent = pace.smoothedDeltaPercent ?? pace.deltaPercent;
-  if (Math.abs(deltaPercent) < 0.5) {
-    return "On schedule";
-  }
+  if (pace.status === "on_track") return t("dashboard.weeklyPace.status.onPace");
   if (pace.status === "danger" && pace.projectedShortfallCredits > 0 && deltaPercent <= 0) {
-    return "Recent burn shortfall";
+    return t("dashboard.weeklyPace.status.recentBurnShortfall");
   }
-  const direction = deltaPercent > 0 ? "over schedule" : "under schedule";
-  return `${formatSignedPercent(deltaPercent)} ${direction}`;
+  return deltaPercent > 0
+    ? t("dashboard.weeklyPace.status.overPlanned", { percent: formatSignedPercent(deltaPercent) })
+    : t("dashboard.weeklyPace.status.belowPlanned", { percent: formatSignedPercent(deltaPercent) });
 }
 
-function scheduleGapLine(pace: WeeklyCreditPace): string {
+function scheduleGapLine(pace: WeeklyCreditPace, t: ReturnType<typeof useTranslation>["t"]): string {
   const scheduleGapCredits = pace.smoothedScheduleGapCredits ?? pace.scheduleGapCredits;
   const deltaPercent = pace.smoothedDeltaPercent ?? pace.deltaPercent;
   const smoothingMinutes = pace.paceGapSmoothingMinutes ?? 0;
-  const suffix = smoothingMinutes > 0 ? ` over ${formatDurationHours(smoothingMinutes / 60)}` : " now";
+  const window = smoothingMinutes > 0 ? formatDurationHours(smoothingMinutes / 60) : null;
   if (scheduleGapCredits > 0) {
-    return `${formatCompactNumber(scheduleGapCredits)} credits over scheduled spend${suffix}`;
+    return window
+      ? t("dashboard.weeklyPace.lines.overPlannedWindow", { credits: formatCompactNumber(scheduleGapCredits), window })
+      : t("dashboard.weeklyPace.lines.overPlannedNow", { credits: formatCompactNumber(scheduleGapCredits) });
   }
   if (deltaPercent < 0) {
-    const cushionCredits = Math.max(0, pace.totalActualRemainingCredits - pace.totalExpectedRemainingCredits);
-    if (cushionCredits > 0) {
-      return `${formatCompactNumber(cushionCredits)} credits more cushion than schedule${suffix}`;
-    }
-    return `${formatSignedPercent(deltaPercent)} under scheduled spend${suffix}`;
+    return window
+      ? t("dashboard.weeklyPace.lines.belowPlannedWindow", { percent: formatSignedPercent(deltaPercent), window })
+      : t("dashboard.weeklyPace.lines.belowPlannedNow", { percent: formatSignedPercent(deltaPercent) });
   }
-  return "On the current linear weekly schedule";
+  return t("dashboard.weeklyPace.lines.onSchedule");
 }
 
-function forecastLine(pace: WeeklyCreditPace): string {
-  const ratePrefix =
-    pace.paceMultiplier != null && pace.paceMultiplier > 0
-      ? `Recent burn is ${formatPaceMultiplier(pace.paceMultiplier)}; `
-      : "";
+function forecastLine(pace: WeeklyCreditPace, t: ReturnType<typeof useTranslation>["t"]): string {
   if (pace.projectedShortfallCredits > 0) {
-    return `${ratePrefix}${formatCompactNumber(pace.projectedShortfallCredits)} credits could run short before a reset if it continues`;
+    return t("dashboard.weeklyPace.lines.projectedShortfall", {
+      credits: formatCompactNumber(pace.projectedShortfallCredits),
+    });
   }
   if (pace.forecastBurnRateCreditsPerHour === 0) {
-    return "No weekly shortfall projected from recent burn";
+    return t("dashboard.weeklyPace.lines.noShortfall");
   }
   if (pace.projectedMinimumRemainingCredits != null) {
-    return `${ratePrefix}${formatCompactNumber(pace.projectedMinimumRemainingCredits)} credits projected low-water mark`;
+    return t("dashboard.weeklyPace.lines.lowWaterMark", {
+      credits: formatCompactNumber(pace.projectedMinimumRemainingCredits),
+    });
   }
-  return `${ratePrefix}pool covers recent burn through upcoming resets`;
+  return t("dashboard.weeklyPace.lines.poolCoversPace");
 }
 
 function formatDurationHours(hours: number): string {
@@ -95,18 +95,22 @@ function formatDurationHours(hours: number): string {
   return `${minutesPart}m`;
 }
 
-function breakEvenLine(pace: WeeklyCreditPace): string | null {
+function breakEvenLine(pace: WeeklyCreditPace, t: ReturnType<typeof useTranslation>["t"]): string | null {
   if (pace.projectedShortfallCredits <= 0) {
     return null;
   }
   if (pace.pauseForBreakEvenHours == null) {
-    return "Until the next reset";
+    return t("dashboard.weeklyPace.recommendations.untilReset");
   }
-  return `${formatDurationHours(pace.pauseForBreakEvenHours)} of active use`;
+  return t("dashboard.weeklyPace.recommendations.pauseUntilReset", {
+    duration: formatDurationHours(pace.pauseForBreakEvenHours),
+  });
 }
 
-function proAccountsLine(pace: WeeklyCreditPace): string | null {
-  const gapCredits = pace.projectedShortfallCredits > 0 ? pace.projectedShortfallCredits : 0;
+function proAccountsLine(pace: WeeklyCreditPace, t: ReturnType<typeof useTranslation>["t"]): string | null {
+  const scheduleGapCredits = pace.smoothedScheduleGapCredits ?? pace.scheduleGapCredits;
+  const gapCredits =
+    pace.projectedShortfallCredits > 0 ? pace.projectedShortfallCredits : Math.max(0, scheduleGapCredits);
   const equivalent =
     pace.proAccountEquivalentToCoverOverPlan ?? (gapCredits > 0 ? gapCredits / PRO_WEEKLY_CAPACITY_CREDITS : null);
   const accounts = pace.proAccountsToCoverOverPlan ?? (gapCredits > 0 ? Math.ceil(gapCredits / PRO_WEEKLY_CAPACITY_CREDITS) : null);
@@ -114,18 +118,23 @@ function proAccountsLine(pace: WeeklyCreditPace): string | null {
   if (!accounts || equivalent == null) {
     return null;
   }
-  const roundedLabel = accounts === 1 ? "account" : "accounts";
-  return `${formatProAccountEquivalent(equivalent)}x Pro weekly pool (~${accounts} ${roundedLabel})`;
+  return t("dashboard.weeklyPace.recommendations.proAccounts", {
+    equivalent: formatProAccountEquivalent(equivalent),
+    count: accounts,
+  });
 }
 
-function throttleLine(pace: WeeklyCreditPace): string | null {
+function throttleLine(pace: WeeklyCreditPace, t: ReturnType<typeof useTranslation>["t"]): string | null {
   if (pace.throttleToPercent == null || pace.reduceByPercent == null) {
     return null;
   }
-  return `Reduce ongoing weekly-credit load by ${formatApproxPercent(pace.reduceByPercent)}`;
+  return t("dashboard.weeklyPace.recommendations.throttle", {
+    percent: formatApproxPercent(pace.reduceByPercent),
+  });
 }
 
 export function WeeklyCreditsPaceCard({ pace }: WeeklyCreditsPaceCardProps) {
+  const { t } = useTranslation();
   if (!pace) {
     return null;
   }
@@ -144,14 +153,11 @@ export function WeeklyCreditsPaceCard({ pace }: WeeklyCreditsPaceCardProps) {
   const actualBarWidth = Math.max(0, Math.min(100, pace.actualUsedPercent));
   const scheduledMarkerLeft = Math.max(0, Math.min(100, pace.scheduledUsedPercent));
   const actualBarClass =
-    pace.status === "danger" && !forecastRiskWithCurrentCushion
-      ? "bg-red-500"
-      : pace.status === "ahead"
-        ? "bg-amber-500"
-        : "bg-primary";
-  const throttle = throttleLine(pace);
-  const proAccounts = proAccountsLine(pace);
-  const breakEven = breakEvenLine(pace);
+    pace.status === "danger" ? "bg-red-500" : pace.status === "ahead" ? "bg-amber-500" : "bg-primary";
+  const throttle = throttleLine(pace, t);
+  const proAccounts = proAccountsLine(pace, t);
+  const breakEven = breakEvenLine(pace, t);
+  const smoothedScheduleGapCredits = pace.smoothedScheduleGapCredits ?? pace.scheduleGapCredits;
   const showRecommendations =
     pace.projectedShortfallCredits > 0 ||
     Boolean(breakEven) ||
@@ -159,10 +165,10 @@ export function WeeklyCreditsPaceCard({ pace }: WeeklyCreditsPaceCardProps) {
     Boolean(proAccounts);
 
   return (
-    <section className="rounded-xl border bg-card p-5" aria-label="Weekly credits pace">
+    <section className="rounded-xl border bg-card p-5" aria-label={t("dashboard.weeklyPace.title")}>
       <div className="mb-4 flex justify-between gap-3">
         <div>
-          <h3 className="text-sm font-semibold">Weekly credits pace</h3>
+	          <h3 className="text-sm font-semibold">{t("dashboard.weeklyPace.title")}</h3>
         </div>
         <div className={cn("flex h-9 w-9 items-center justify-center rounded-lg", statusClass)}>
           <Gauge className="h-4 w-4" aria-hidden="true" />
@@ -173,16 +179,16 @@ export function WeeklyCreditsPaceCard({ pace }: WeeklyCreditsPaceCardProps) {
         <div className="space-y-3">
           <div className="grid grid-cols-3 gap-2 text-xs">
             <div className="min-w-0 rounded-md bg-muted/30 px-3 py-2">
-              <p className="text-muted-foreground">Used now</p>
+	              <p className="text-muted-foreground">{t("dashboard.weeklyPace.usedNow")}</p>
               <p className="mt-1 text-sm font-semibold tabular-nums">{formatPercent(pace.actualUsedPercent)}</p>
             </div>
             <div className="min-w-0 rounded-md bg-muted/30 px-3 py-2">
-              <p className="text-muted-foreground">Scheduled by now</p>
+	              <p className="text-muted-foreground">{t("dashboard.weeklyPace.scheduledByNow")}</p>
               <p className="mt-1 text-sm font-semibold tabular-nums">{formatPercent(pace.scheduledUsedPercent)}</p>
             </div>
             <div className="min-w-0 rounded-md bg-muted/30 px-3 py-2">
-              <p className="text-muted-foreground">Current gap</p>
-              <p className="mt-1 text-sm font-semibold tabular-nums">{currentGapLabel(pace)}</p>
+	              <p className="text-muted-foreground">{t("dashboard.weeklyPace.paceGap")}</p>
+	              <p className="mt-1 text-sm font-semibold tabular-nums">{statusLabel(pace, t)}</p>
             </div>
           </div>
           <div className="relative h-1.5 rounded-full bg-muted">
@@ -195,38 +201,38 @@ export function WeeklyCreditsPaceCard({ pace }: WeeklyCreditsPaceCardProps) {
           <div className="flex items-center justify-between gap-3 text-[11px] text-muted-foreground">
             <span className="flex items-center gap-1.5">
               <span className={cn("h-1.5 w-4 rounded-full", actualBarClass)} />
-              Actual
+	              {t("dashboard.weeklyPace.actual")}
             </span>
             <span className="flex items-center gap-1.5">
               <span className="h-3 w-0.5 rounded-full bg-foreground/70" />
-              Schedule marker
+	              {t("dashboard.weeklyPace.scheduleMarker")}
             </span>
           </div>
           <div className="rounded-lg border bg-background/60 px-3 py-2 text-xs text-muted-foreground">
-            <p>{scheduleGapLine(pace)}</p>
-            <p className="mt-1">{forecastLine(pace)}</p>
+	            <p>{scheduleGapLine(pace, t)}</p>
+	            <p className="mt-1">{forecastLine(pace, t)}</p>
           </div>
         </div>
 
         {showRecommendations ? (
           <div className="rounded-lg border bg-background/60 px-3 py-2 text-xs">
-            <p className="font-medium">If recent burn continues</p>
+	            <p className="font-medium">{t("dashboard.weeklyPace.recommendations.title")}</p>
             <div className="mt-2 grid gap-1.5">
               {breakEven ? (
                 <div className="flex items-baseline justify-between gap-3">
-                  <span className="shrink-0 text-muted-foreground">Pause active use</span>
+	                  <span className="shrink-0 text-muted-foreground">{t("dashboard.weeklyPace.recommendations.pause")}</span>
                   <span className="min-w-0 text-right tabular-nums">{breakEven}</span>
                 </div>
               ) : null}
               {throttle ? (
                 <div className="flex items-baseline justify-between gap-3">
-                  <span className="shrink-0 text-muted-foreground">Throttle</span>
+	                  <span className="shrink-0 text-muted-foreground">{t("dashboard.weeklyPace.recommendations.throttleLabel")}</span>
                   <span className="min-w-0 text-right tabular-nums">{throttle}</span>
                 </div>
               ) : null}
               {proAccounts ? (
                 <div className="flex items-baseline justify-between gap-3">
-                  <span className="shrink-0 text-muted-foreground">Add capacity</span>
+	                  <span className="shrink-0 text-muted-foreground">{t("dashboard.weeklyPace.recommendations.addCapacity")}</span>
                   <span className="min-w-0 text-right tabular-nums">{proAccounts}</span>
                 </div>
               ) : null}

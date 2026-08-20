@@ -1,10 +1,15 @@
 import { fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import i18n from "@/i18n";
 import { OverviewTimeframeSelect } from "./overview-timeframe-select";
 
 describe("OverviewTimeframeSelect", () => {
+  beforeEach(async () => {
+    await i18n.changeLanguage("en");
+  });
+
   afterEach(() => {
     vi.useRealTimers();
   });
@@ -83,5 +88,66 @@ describe("OverviewTimeframeSelect", () => {
       startDate: "2026-06-01",
       endDate: "2026-06-12",
     });
+  });
+
+  it("preserves an inverted start-date draft until the end date makes it valid", async () => {
+    const user = userEvent.setup();
+    const onCustomRangeChange = vi.fn();
+
+    render(
+      <OverviewTimeframeSelect
+        value={{ mode: "custom", startDate: "2026-06-01", endDate: "2026-06-07" }}
+        onPresetSelect={vi.fn()}
+        onCustomRangeChange={onCustomRangeChange}
+      />,
+    );
+
+    await user.click(screen.getByRole("button", { name: /Custom range/i }));
+    const startInput = screen.getByLabelText("Dashboard overview start date");
+    const endInput = screen.getByLabelText("Dashboard overview end date");
+
+    fireEvent.change(startInput, { target: { value: "2026-06-10" } });
+
+    expect(startInput).toHaveValue("2026-06-10");
+    expect(onCustomRangeChange).not.toHaveBeenCalled();
+
+    fireEvent.change(endInput, { target: { value: "2026-06-12" } });
+
+    expect(onCustomRangeChange).toHaveBeenCalledOnce();
+    expect(onCustomRangeChange).toHaveBeenCalledWith({
+      startDate: "2026-06-10",
+      endDate: "2026-06-12",
+    });
+  });
+
+  it.each([
+    {
+      language: "ko",
+      buttonName: /사용자 지정 기간: 2026-06-01부터 2026-06-07까지/,
+      startLabel: "Dashboard 개요 시작일",
+      endLabel: "Dashboard 개요 종료일",
+    },
+    {
+      language: "zh-CN",
+      buttonName: /自定义范围：2026-06-01 至 2026-06-07/,
+      startLabel: "仪表盘概览开始日期",
+      endLabel: "仪表盘概览结束日期",
+    },
+  ])("localizes custom-range controls in $language", async ({ language, buttonName, startLabel, endLabel }) => {
+    await i18n.changeLanguage(language);
+    const user = userEvent.setup();
+
+    render(
+      <OverviewTimeframeSelect
+        value={{ mode: "custom", startDate: "2026-06-01", endDate: "2026-06-07" }}
+        onPresetSelect={vi.fn()}
+        onCustomRangeChange={vi.fn()}
+      />,
+    );
+
+    await user.click(screen.getByRole("button", { name: buttonName }));
+
+    expect(screen.getByLabelText(startLabel)).toBeInTheDocument();
+    expect(screen.getByLabelText(endLabel)).toBeInTheDocument();
   });
 });

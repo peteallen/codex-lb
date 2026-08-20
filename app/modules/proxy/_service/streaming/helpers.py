@@ -7,14 +7,12 @@ from collections.abc import Callable
 from copy import deepcopy
 from typing import Any, AsyncIterator, Literal, Mapping, cast
 
-from app.core.auth.refresh import (
-    RefreshError,
-)
 from app.core.balancer import PERMANENT_FAILURE_CODES
 from app.core.balancer.types import ClassifiedFailure, UpstreamError
 from app.core.clients.files import create_file as core_create_file  # noqa: F401
 from app.core.clients.files import finalize_file as core_finalize_file  # noqa: F401
 from app.core.clients.http import lease_http_session as lease_http_session  # noqa: F401
+from app.core.clients.proxy import CodexControlRequestPrivacyPolicy as CodexControlRequestPrivacyPolicy
 from app.core.clients.proxy import CodexControlResponse as CodexControlResponse
 from app.core.clients.proxy import (  # noqa: F401  # noqa: F401
     ImageFetchSession,
@@ -36,13 +34,13 @@ from app.core.clients.proxy import codex_control_request as core_codex_control_r
 from app.core.clients.proxy import compact_responses as core_compact_responses  # noqa: F401
 from app.core.clients.proxy import transcribe_audio as core_transcribe_audio  # noqa: F401
 from app.core.clients.proxy_websocket import (
-    UpstreamResponsesWebSocket,
+    UpstreamWebSocket,
 )
 from app.core.errors import (
-    PREVIOUS_RESPONSE_STALE_CODE as PREVIOUS_RESPONSE_STALE_CODE,
+    PREVIOUS_RESPONSE_NOT_FOUND_CODE as PREVIOUS_RESPONSE_NOT_FOUND_CODE,
 )
 from app.core.errors import (
-    PREVIOUS_RESPONSE_STALE_MESSAGE as PREVIOUS_RESPONSE_STALE_MESSAGE,
+    PREVIOUS_RESPONSE_NOT_FOUND_MESSAGE as PREVIOUS_RESPONSE_NOT_FOUND_MESSAGE,
 )
 from app.core.errors import (
     PREVIOUS_RESPONSE_STREAM_INCOMPLETE_MESSAGE,
@@ -50,8 +48,12 @@ from app.core.errors import (
 )
 from app.core.openai.models import OpenAIEvent
 from app.core.openai.parsing import parse_sse_event
+from app.core.resilience.network_recovery import (
+    PROCESS_NETWORK_UNAVAILABLE_CODE,
+)
 from app.core.types import JsonValue
-from app.core.upstream_proxy import ResolvedUpstreamRoute
+from app.core.upstream_proxy import ResolvedUpstreamRoute, UpstreamProxyRouteError
+from app.core.upstream_proxy.cache import get_upstream_route_cache
 from app.core.utils.request_id import get_request_id
 from app.core.utils.sse import CODEX_KEEPALIVE_FRAME as CODEX_KEEPALIVE_FRAME  # noqa: F401
 from app.core.utils.sse import format_sse_event, parse_sse_data_json
@@ -277,6 +279,7 @@ from app.modules.proxy._service.support import (
     _WEBSOCKET_FULL_REPLAY_WAIT_POLL_SECONDS,  # noqa: F401
     _event_type_from_payload,
     _RequestLogFailureMetadata,
+    _signal_propagated_capacity_startup_ready,
     _StreamSettlement,
     _WebSocketRequestState,
 )
@@ -384,6 +387,7 @@ from app.modules.proxy.durable_bridge_coordinator import (
 from app.modules.proxy.helpers import (
     _normalize_error_code,
     classify_upstream_failure,
+    is_upstream_model_capacity_error,
 )
 from app.modules.proxy.http_bridge_forwarding import (
     HTTPBridgeForwardContext as HTTPBridgeForwardContext,
@@ -396,6 +400,14 @@ from app.modules.proxy.load_balancer import AccountSelection
 
 def _facade() -> Any:
     return sys.modules["app.modules.proxy.service"]
+
+
+def _stream_iterator_after_capacity_admission(
+    stream: AsyncIterator[str],
+) -> AsyncIterator[str]:
+    """Expose a slow stream once local response-create admission has succeeded."""
+    _signal_propagated_capacity_startup_ready()
+    return stream.__aiter__()
 
 
 _REQUEST_TRANSPORT_HTTP = "http"
@@ -413,10 +425,35 @@ def _should_penalize_stream_error(code: str | None) -> bool:
     return code in _facade()._ACCOUNT_RECOVERY_RETRY_CODES or code in _facade()._TRANSIENT_RETRY_CODES
 
 
-def _should_retry_transient_stream_error(code: str | None, message: str | None) -> bool:
+_MODEL_CAPACITY_LIMIT_CODES = {
+    "rate_limit_exceeded",
+    "usage_limit_reached",
+    "insufficient_quota",
+    "usage_not_included",
+    "quota_exceeded",
+}
+
+
+def _should_retry_transient_stream_error(
+    code: str | None,
+    message: str | None,
+    *,
+    response_id: str | None = None,
+) -> bool:
     if code is None or code == "stream_idle_timeout":
         return False
+    if code == PROCESS_NETWORK_UNAVAILABLE_CODE:
+        # Serialized terminal events arrive only after upstream dispatch. The
+        # stable code keeps settlement account-neutral, but cannot prove that
+        # replaying the POST is safe.
+        return False
+    if response_id is not None:
+        return False
     if code in _facade()._TRANSIENT_RETRY_CODES:
+        return True
+    if is_upstream_model_capacity_error(message):
+        if code in _MODEL_CAPACITY_LIMIT_CODES:
+            return False
         return True
     if code != "upstream_unavailable" or not message:
         return False
@@ -426,26 +463,17 @@ def _should_retry_transient_stream_error(code: str | None, message: str | None) 
     return any(marker in normalized_message for marker in _facade()._UPSTREAM_UNAVAILABLE_TRANSIENT_MESSAGE_MARKERS)
 
 
-def _refresh_upstream_proxy_fail_closed_reason(exc: RefreshError) -> str | None:
-    if exc.code != "upstream_proxy_unavailable":
-        return None
-    reason = exc.upstream_proxy_fail_closed_reason
-    if reason:
-        return reason
-    marker = "Upstream proxy route unavailable:"
-    if exc.message.startswith(marker):
-        parsed = exc.message.removeprefix(marker).strip()
-        return parsed or "unavailable"
-    return "unavailable"
-
-
 def _classify_upstream_close(
     close_code: int | None,
     *,
     response_events_seen: int,
-) -> Literal["transient", "rejected"]:
+) -> Literal["clean", "transient"]:
     if close_code == 1000 and response_events_seen == 0:
-        return "rejected"
+        # A clean websocket close before response.created does not prove that
+        # the request was invalid.  The upstream can close a socket during a
+        # handoff, so the caller may safely recreate the socket and replay the
+        # still-unstarted request once.
+        return "clean"
     return "transient"
 
 
@@ -694,10 +722,10 @@ def _call_stream_with_supported_optional_kwargs(
 
 
 def _stream_request_budget_seconds(settings: object, *, request_transport: str) -> float:
-    if request_transport == _REQUEST_TRANSPORT_HTTP:
-        budget = getattr(settings, "http_responses_stream_request_budget_seconds", None)
-        if budget is not None:
-            return float(budget)
+    del request_transport
+    budget = getattr(settings, "http_responses_stream_request_budget_seconds", None)
+    if budget is not None:
+        return float(budget)
     return float(getattr(settings, "proxy_request_budget_seconds"))
 
 
@@ -707,14 +735,28 @@ async def _resolve_upstream_route_for_account(
     *,
     operation: str,
 ) -> ResolvedUpstreamRoute | None:
+    # Outcomes (route / direct-egress None / fail-closed error) are cached
+    # verbatim, so a hit can never change the degradation path the resolver
+    # chose; errors re-raise with their original reason.
+    cache = get_upstream_route_cache()
+    cached = cache.get(account.id)
+    if cached is not None:
+        return cached.unwrap(account.id)
+    generation = cache.generation
     async with _facade().SessionLocal() as session:
-        return await _facade().resolve_upstream_route(
-            session,
-            account_id=account.id,
-            operation=operation,
-            scope="account",
-            encryptor=proxy._encryptor,
-        )
+        try:
+            route = await _facade().resolve_upstream_route(
+                session,
+                account_id=account.id,
+                operation=operation,
+                scope="account",
+                encryptor=proxy._encryptor,
+            )
+        except UpstreamProxyRouteError as exc:
+            cache.store_error(account.id, exc, generation=generation)
+            raise
+    cache.store_route(account.id, route, generation=generation)
+    return route
 
 
 async def _select_account_with_budget_for_stream(proxy: Any, deadline: float, **kwargs: Any) -> AccountSelection:
@@ -724,6 +766,9 @@ async def _select_account_with_budget_for_stream(proxy: Any, deadline: float, **
         "lease_kind",
         "estimated_lease_tokens",
         "fallback_on_preferred_account_unavailable",
+        "preferred_account_is_continuity_owner",
+        "spill_bare_session_on_account_cap",
+        "require_unambiguous_account",
     )
     if any(name in kwargs for name in optional_kwargs):
         try:
@@ -741,12 +786,40 @@ async def _select_account_with_budget_for_stream(proxy: Any, deadline: float, **
     return await selector(deadline, **kwargs)
 
 
+def _is_account_neutral_request_rejection(
+    *,
+    code: str,
+    http_status: int | None,
+    message: str | None,
+) -> bool:
+    """Return whether upstream rejected the request payload, not the account.
+
+    A payload-shape rejection reproduces identically on every account, so it
+    must never mutate one account's health: otherwise a single client looping
+    on a self-inconsistent conversation drives its serving accounts into
+    ``error_count`` backoff and starves unrelated tenants.
+
+    Keep this set narrow. Not every upstream ``invalid_request_error`` is
+    account neutral -- the model-entitlement rejection matched by
+    ``_is_account_model_unsupported_error`` is genuinely account scoped -- so
+    membership is decided by the specific classified message, never by the
+    ``invalid_request_error`` code alone.
+    """
+    if code != "invalid_request_error":
+        return False
+    if http_status is not None and http_status != 400:
+        return False
+    return bool(_facade()._is_missing_tool_output_message(message))
+
+
 async def _handle_stream_error(
     proxy: Any,
     account: Account,
     error: UpstreamError,
     code: str,
     http_status: int | None = None,
+    *,
+    privacy_policy: CodexControlRequestPrivacyPolicy = CodexControlRequestPrivacyPolicy.STANDARD,
 ) -> ClassifiedFailure:
     classified = classify_upstream_failure(
         error_code=code,
@@ -755,6 +828,18 @@ async def _handle_stream_error(
         phase="first_event",
     )
     if _facade()._is_account_neutral_error_code(code):
+        return classified
+    if _is_account_neutral_request_rejection(
+        code=code,
+        http_status=http_status,
+        message=error.get("message"),
+    ):
+        _facade().logger.info(
+            "Skipped account error penalty for account-neutral request rejection account_id=%s request_id=%s code=%s",
+            "<redacted>" if privacy_policy.redacts_sensitive_details else account.id,
+            get_request_id(),
+            code,
+        )
         return classified
     if classified["failure_class"] == "rate_limit":
         await proxy._load_balancer.mark_rate_limit(account, error)
@@ -766,7 +851,7 @@ async def _handle_stream_error(
         await proxy._load_balancer.record_error(account)
         _facade().logger.info(
             "Recorded transient account error account_id=%s request_id=%s code=%s",
-            account.id,
+            "<redacted>" if privacy_policy.redacts_sensitive_details else account.id,
             get_request_id(),
             code,
         )
@@ -787,7 +872,7 @@ def _should_retry_stream_error(code: str) -> bool:
     return code in _facade()._ACCOUNT_RECOVERY_RETRY_CODES
 
 
-def _upstream_turn_state_from_socket(upstream: UpstreamResponsesWebSocket | None) -> str | None:
+def _upstream_turn_state_from_socket(upstream: UpstreamWebSocket | None) -> str | None:
     if upstream is None:
         return None
     getter = getattr(upstream, "response_header", None)

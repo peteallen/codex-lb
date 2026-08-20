@@ -1,3 +1,7 @@
+# NOTE: This Compose file defines a SINGLE-REPLICA topology.
+# Do not use `docker compose up --scale server=N` — the SQLite default supports
+# only one writer and the published host ports collide. Multi-replica deployments
+# require the Helm chart with PostgreSQL and leader election (deploy/helm/codex-lb).
 services:
   server:
     build:
@@ -9,19 +13,22 @@ services:
       - "2455:2455"
       - "1455:1455"
     command:
-      - fastapi
-      - run
-      - app/main.py
+      # Keep development on the same pre-connection drain launcher as
+      # production. Compose watch restarts the service after source sync.
+      - python
+      - -m
+      - app.cli
       - --host
       - 0.0.0.0
       - --port
       - "2455"
-      - --reload
+      - --ws-max-size
+      - "134217728"
     volumes:
       - codex-lb-data:/var/lib/codex-lb
     develop:
       watch:
-        - action: sync
+        - action: sync+restart
           path: ./app
           target: /app/app
         - action: rebuild
@@ -101,7 +108,7 @@ services:
     restart: unless-stopped
 
   postgres-upgrade:
-    image: pgautoupgrade/pgautoupgrade:18-alpine@sha256:0f1caae0b3022abddae84b723381f33a31e4270ae33407896a1e59c1670a5338
+    image: pgautoupgrade/pgautoupgrade:18-alpine@sha256:5d287ede0df43f7f448b7e56f8c4f6a79197318b15d90254a9d6a85eb7686fb0
     profiles: ["postgres-upgrade"]
     environment:
       POSTGRES_USER: codex_lb
@@ -111,6 +118,10 @@ services:
     volumes:
       - codex-lb-postgres-data:/var/lib/postgresql
     restart: "no"
+
+networks:
+  default:
+    driver: bridge
 
 volumes:
   codex-lb-data:

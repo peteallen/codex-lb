@@ -21,6 +21,15 @@ export type DashboardOverviewRange =
   | { mode: "preset"; timeframe: OverviewTimeframe }
   | { mode: "custom"; startDate: string; endDate: string; timezone?: string };
 
+const ConversationTimeframeKeySchema = z.enum(["1d", "7d", "30d"]);
+export type ConversationTimeframe = z.infer<typeof ConversationTimeframeKeySchema>;
+export const DEFAULT_CONVERSATION_TIMEFRAME: ConversationTimeframe = "7d";
+
+export function parseConversationTimeframe(value: string | null | undefined): ConversationTimeframe {
+  const parsed = ConversationTimeframeKeySchema.safeParse(value);
+  return parsed.success ? parsed.data : DEFAULT_CONVERSATION_TIMEFRAME;
+}
+
 const UsageHistoryItemSchema = z.object({
   accountId: z.string(),
   remainingPercentAvg: z.number().nullable(),
@@ -61,6 +70,8 @@ const DashboardMetricsSchema = z.object({
   errorRate: z.number().nullable(),
   errorCount: z.number().nullable(),
   topError: z.string().nullable(),
+  conversations: z.number().int().nullable().optional().default(null),
+  conversationRequests: z.number().int().nonnegative().optional().default(0),
 });
 
 const DashboardMetricsComparisonPreviousSchema = z.object({
@@ -84,6 +95,7 @@ const MetricsTrendsSchema = z.object({
   tokens: z.array(TrendPointSchema),
   cost: z.array(TrendPointSchema),
   errorRate: z.array(TrendPointSchema),
+  conversations: z.array(TrendPointSchema).optional().default([]),
 });
 
 export const DepletionSchema = z.object({
@@ -168,7 +180,8 @@ export const RequestLogSchema = z.object({
   apiKeyId: z.string().nullable().optional().default(null),
   requestId: z.string(),
   archiveRequestId: z.string().nullable().optional(),
-  requestKind: z.enum(["normal", "warmup", "limit_warmup", "prewarm", "compaction"]).optional().default("normal"),
+  requestKind: z.enum(["normal", "warmup", "limit_warmup", "prewarm", "compaction", "realtime_live"]).optional().default("normal"),
+  connectionRequestKind: z.enum(["normal", "prewarm"]).nullable().optional(),
   model: z.string(),
   source: z.string().nullable().optional().default(null),
   modelSourceId: z.string().nullable().optional(),
@@ -178,6 +191,7 @@ export const RequestLogSchema = z.object({
   useragent: z.string().nullable().optional().default(null),
   useragentGroup: z.string().nullable().optional().default(null),
   clientIp: z.string().nullable().optional().default(null),
+  conversationId: z.string().nullable().optional().default(null),
   serviceTier: z.string().nullable().optional().default(null),
   requestedServiceTier: z.string().nullable().optional().default(null),
   actualServiceTier: z.string().nullable().optional().default(null),
@@ -193,17 +207,27 @@ export const RequestLogSchema = z.object({
   tokens: z.number().nullable(),
   inputTokens: z.number().nullable().optional().default(null),
   outputTokens: z.number().nullable().optional().default(null),
+  outputTokensRaw: z.number().nullable().optional().default(null),
+  reasoningTokens: z.number().nullable().optional(),
   cachedInputTokens: z.number().nullable(),
   reasoningEffort: z.string().nullable(),
   costUsd: z.number().nullable(),
   costBreakdown: RequestLogCostBreakdownSchema.nullable().optional().default(null),
   latencyMs: z.number().nullable(),
+  latencyFirstTokenMs: z.number().nullable().optional().default(null),
+  latencyFirstUpstreamEventMs: z.number().nullable().optional().default(null),
+  latencyResponseCreatedMs: z.number().nullable().optional().default(null),
+  latencyQueueMs: z.number().nullable().optional().default(null),
 });
 
 export const RequestLogsResponseSchema = z.object({
   requests: z.array(RequestLogSchema),
   total: z.number().int().nonnegative(),
   hasMore: z.boolean(),
+  conversation: z.object({
+    requestCount: z.number().int().nonnegative(),
+    aggregatedCostUsd: z.number(),
+  }).nullable().optional().default(null),
 });
 
 const RequestLogModelOptionSchema = z.object({
@@ -231,6 +255,7 @@ export const FilterStateSchema = z.object({
   apiKeyIds: z.array(z.string()),
   modelOptions: z.array(z.string()),
   statuses: z.array(z.string()),
+  conversationId: z.string().nullable().optional().default(null),
   limit: z.number().int().positive(),
   offset: z.number().int().nonnegative(),
 });
@@ -249,3 +274,73 @@ export type RequestLogFilterOptions = z.infer<typeof RequestLogFilterOptionsSche
 export type FilterState = z.infer<typeof FilterStateSchema>;
 export type Depletion = z.infer<typeof DepletionSchema>;
 export type ServerWeeklyCreditPace = z.infer<typeof WeeklyCreditPaceSchema>;
+
+export const DashboardViewSchema = z.enum(["request-logs", "conversations"]);
+export type DashboardView = z.infer<typeof DashboardViewSchema>;
+export const DEFAULT_DASHBOARD_VIEW: DashboardView = "request-logs";
+
+export function parseDashboardView(value: string | null | undefined): DashboardView {
+  const parsed = DashboardViewSchema.safeParse(value);
+  return parsed.success ? parsed.data : DEFAULT_DASHBOARD_VIEW;
+}
+
+const ConversationModelEffortSchema = z.object({
+  model: z.string(),
+  reasoningEffort: z.string().nullable().optional().default(null),
+});
+
+export const ConversationModelStatSchema = z.object({
+  modelEffort: ConversationModelEffortSchema,
+  reqs: z.number().int().nonnegative(),
+  totalElapsedTime: z.number().int().nonnegative(),
+  totalInputTokens: z.number().int().nonnegative(),
+  cachedInputTokens: z.number().int().nonnegative().nullable(),
+  totalOutputTokens: z.number().int().nonnegative(),
+  totalCostUsd: z.number(),
+});
+
+export const ConversationEntrySchema = z.object({
+  conversationId: z.string(),
+  firstRequest: z.iso.datetime({ offset: true }),
+  lastRequest: z.iso.datetime({ offset: true }),
+  requestCount: z.number().int().nonnegative(),
+  representativeAccount: z.string().nullable().optional().default(null),
+  remainingAccountCount: z.number().int().nonnegative(),
+  apiKeyId: z.string().nullable().optional().default(null),
+  apiKeyName: z.string().nullable().optional().default(null),
+  representativeModel: z.string().nullable().optional().default(null),
+  remainingModelCount: z.number().int().nonnegative(),
+  totalTokens: z.number().int().nonnegative(),
+  cachedInputTokens: z.number().int().nonnegative().nullable(),
+  totalCostUsd: z.number(),
+});
+
+export const ConversationsResponseSchema = z.object({
+  conversations: z.array(ConversationEntrySchema),
+  total: z.number().int().nonnegative(),
+  hasMore: z.boolean(),
+});
+
+export const ConversationDetailsSchema = z.object({
+  conversationId: z.string(),
+  start: z.iso.datetime({ offset: true }),
+  latest: z.iso.datetime({ offset: true }),
+  accountCount: z.number().int().nonnegative(),
+  totalElapsedTime: z.number().int().nonnegative(),
+  dominantUseragentGroup: z.string().nullable().optional().default(null),
+  modelStats: z.array(ConversationModelStatSchema).default([]),
+});
+
+export const ConversationFilterStateSchema = z.object({
+  search: z.string(),
+  limit: z.number().int().positive(),
+  offset: z.number().int().nonnegative(),
+  timeframe: ConversationTimeframeKeySchema,
+});
+
+export type ConversationModelEffort = z.infer<typeof ConversationModelEffortSchema>;
+export type ConversationModelStat = z.infer<typeof ConversationModelStatSchema>;
+export type ConversationEntry = z.infer<typeof ConversationEntrySchema>;
+export type ConversationsResponse = z.infer<typeof ConversationsResponseSchema>;
+export type ConversationDetails = z.infer<typeof ConversationDetailsSchema>;
+export type ConversationFilterState = z.infer<typeof ConversationFilterStateSchema>;

@@ -17,6 +17,7 @@ const DEFAULT_FILTER_STATE: FilterState = {
   apiKeyIds: [],
   modelOptions: [],
   statuses: [],
+  conversationId: null,
   limit: 25,
   offset: 0,
 };
@@ -28,6 +29,7 @@ const REQUEST_LOG_PARAM_KEYS = [
   "apiKeyId",
   "modelOption",
   "status",
+  "conversationId",
   "limit",
   "offset",
 ] as const;
@@ -48,6 +50,7 @@ function parseFilterState(params: URLSearchParams): FilterState {
     apiKeyIds: params.getAll("apiKeyId"),
     modelOptions: params.getAll("modelOption"),
     statuses: params.getAll("status"),
+    conversationId: params.get("conversationId") || null,
     limit: parseNumber(params.get("limit"), DEFAULT_FILTER_STATE.limit),
     offset: parseNumber(params.get("offset"), DEFAULT_FILTER_STATE.offset),
   };
@@ -81,6 +84,9 @@ function writeFilterState(state: FilterState, base?: URLSearchParams): URLSearch
   for (const value of state.statuses) {
     params.append("status", value);
   }
+  if (state.conversationId) {
+    params.set("conversationId", state.conversationId);
+  }
   params.set("limit", String(state.limit));
   params.set("offset", String(state.offset));
   return params;
@@ -99,7 +105,12 @@ function timeframeToSinceIso(timeframe: FilterState["timeframe"]): string | unde
   return new Date(now - lookup[timeframe]).toISOString();
 }
 
-export function useRequestLogs() {
+export type UseRequestLogsOptions = {
+  enabled?: boolean;
+};
+
+export function useRequestLogs(options: UseRequestLogsOptions = {}) {
+  const enabled = options.enabled ?? true;
   const [searchParams, setSearchParams] = useSearchParams();
 
   const filters = useMemo(() => parseFilterState(searchParams), [searchParams]);
@@ -114,6 +125,7 @@ export function useRequestLogs() {
       statuses: filters.statuses,
       modelOptions: filters.modelOptions,
       since,
+      conversationId: filters.conversationId ?? undefined,
     }),
     [filters, since],
   );
@@ -138,6 +150,7 @@ export function useRequestLogs() {
   } = useQuery({
     queryKey: ["dashboard", "request-logs", listFilters],
     queryFn: () => getRequestLogs(listFilters),
+    enabled,
     refetchInterval: 30_000,
     refetchIntervalInBackground: false,
     refetchOnWindowFocus: true,
@@ -164,6 +177,7 @@ export function useRequestLogs() {
   } = useQuery({
     queryKey: ["dashboard", "request-log-options", facetFilters],
     queryFn: () => getRequestLogOptions(facetFilters),
+    enabled,
     refetchInterval: 30_000,
     refetchIntervalInBackground: false,
     refetchOnWindowFocus: true,

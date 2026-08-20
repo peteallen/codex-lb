@@ -5,9 +5,10 @@ import contextlib
 import importlib
 import logging
 import time
+from collections.abc import Awaitable, Callable, Collection
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, AsyncIterator, Protocol, cast
+from typing import Any, AsyncIterator, Protocol, TypeVar, cast
 
 from app.core.config.settings import get_settings
 from app.core.usage import capacity_for_plan
@@ -31,8 +32,11 @@ logger = logging.getLogger(__name__)
 _RECOVERABLE_ACCOUNT_STATUSES = frozenset({AccountStatus.RATE_LIMITED, AccountStatus.QUOTA_EXCEEDED})
 
 
+_T = TypeVar("_T")
+
+
 class _LeaderElectionLike(Protocol):
-    async def try_acquire(self) -> bool: ...
+    async def run_if_leader(self, fn: Callable[[], Awaitable[_T]]) -> _T | None: ...
 
 
 class _RecoverableAccountsRepository(Protocol):
@@ -52,7 +56,12 @@ class _RecoverableAccountsRepository(Protocol):
 
 
 class _LatestUsageRepository(Protocol):
-    async def latest_by_account(self, window: str | None = None) -> dict[str, UsageHistory]: ...
+    async def latest_by_account(
+        self,
+        window: str | None = None,
+        *,
+        account_ids: Collection[str] | None = None,
+    ) -> dict[str, UsageHistory]: ...
 
 
 class _BackgroundLimitWarmupRepository:
@@ -71,6 +80,7 @@ class _BackgroundLimitWarmupRepository:
         model: str,
         attempted_at: datetime,
         status: str = "pending",
+        reset_at_tolerance_seconds: int = 0,
     ) -> AccountLimitWarmup | None:
         async with get_background_session() as session:
             attempt = await LimitWarmupRepository(session).try_create_attempt(
@@ -80,6 +90,7 @@ class _BackgroundLimitWarmupRepository:
                 model=model,
                 attempted_at=attempted_at,
                 status=status,
+                reset_at_tolerance_seconds=reset_at_tolerance_seconds,
             )
             detach_session_objects(session)
             return attempt
@@ -155,18 +166,34 @@ class UsageRefreshScheduler:
                 continue
 
     async def _refresh_once(self) -> float:
-        if not await _get_leader_election().try_acquire():
+        delay = await _get_leader_election().run_if_leader(self._refresh_as_leader)
+        if delay is None:
             return float(self.interval_seconds)
+        return delay
+
+    async def _refresh_as_leader(self) -> float:
         async with self._lock:
             account_count = 0
             try:
                 async with get_background_session() as session:
                     usage_repo = UsageRepository(session)
                     accounts_repo = AccountsRepository(session)
-                    before_primary = await usage_repo.latest_by_account(window="primary")
-                    before_secondary = await usage_repo.latest_by_account(window="secondary")
                     accounts = _ordered_usage_refresh_accounts(await accounts_repo.list_accounts())
                     selected_account, cycle_complete = self._select_next_account(accounts)
+                    if selected_account is not None:
+                        selected_account_ids = [selected_account.id]
+                        before_primary = await usage_repo.latest_by_account(
+                            window="primary",
+                            account_ids=selected_account_ids,
+                        )
+                        before_secondary = await usage_repo.latest_by_account(
+                            window="secondary",
+                            account_ids=selected_account_ids,
+                        )
+                        before_monthly = await usage_repo.latest_by_account(
+                            window="monthly",
+                            account_ids=selected_account_ids,
+                        )
                     detach_session_objects(session)
                 account_count = len(accounts)
                 if selected_account is None:
@@ -181,10 +208,23 @@ class UsageRefreshScheduler:
                         usage_repo = UsageRepository(session)
                         accounts_repo = AccountsRepository(session)
                         settings_repo = SettingsRepository(session)
-                        after_primary = await usage_repo.latest_by_account(window="primary")
-                        after_secondary = await usage_repo.latest_by_account(window="secondary")
+                        after_primary = await usage_repo.latest_by_account(
+                            window="primary",
+                            account_ids=selected_account_ids,
+                        )
+                        after_secondary = await usage_repo.latest_by_account(
+                            window="secondary",
+                            account_ids=selected_account_ids,
+                        )
+                        after_monthly = await usage_repo.latest_by_account(
+                            window="monthly",
+                            account_ids=selected_account_ids,
+                        )
                         dashboard_settings = await settings_repo.get_or_create()
                         refreshed_accounts = await accounts_repo.list_accounts(refresh_existing=True)
+                        refreshed_selected_accounts = [
+                            account for account in refreshed_accounts if account.id == selected_account.id
+                        ]
                         detach_session_objects(session)
                     warmup_service = LimitWarmupService(
                         cast(Any, _BackgroundLimitWarmupRepository()),
@@ -195,12 +235,21 @@ class UsageRefreshScheduler:
                         ),
                     )
                     await warmup_service.run_after_usage_refresh(
-                        accounts=refreshed_accounts,
+                        accounts=refreshed_selected_accounts,
+                        stagger_accounts=refreshed_accounts,
                         settings=dashboard_settings,
                         before_primary=before_primary,
-                        before_secondary=before_secondary,
+                        before_secondary=_select_long_window_entries(
+                            accounts=refreshed_selected_accounts,
+                            monthly_entries=before_monthly,
+                            secondary_entries=before_secondary,
+                        ),
                         after_primary=after_primary,
-                        after_secondary=after_secondary,
+                        after_secondary=_select_long_window_entries(
+                            accounts=refreshed_selected_accounts,
+                            monthly_entries=after_monthly,
+                            secondary_entries=after_secondary,
+                        ),
                         refresh_started_at=refresh_started_at,
                         usage_refresh_interval_seconds=self.interval_seconds,
                     )
@@ -210,7 +259,7 @@ class UsageRefreshScheduler:
                         await reconcile_recoverable_account_statuses(
                             accounts_repo=accounts_repo,
                             usage_repo=usage_repo,
-                            accounts=refreshed_accounts,
+                            accounts=refreshed_selected_accounts,
                         )
                 if cycle_complete:
                     await _invalidate_usage_refresh_caches()
@@ -275,9 +324,10 @@ async def reconcile_recoverable_account_statuses(
     if not candidates:
         return 0
 
-    latest_primary = await usage_repo.latest_by_account(window="primary")
-    latest_secondary = await usage_repo.latest_by_account(window="secondary")
-    latest_monthly = await usage_repo.latest_by_account(window="monthly")
+    candidate_ids = [account.id for account in candidates]
+    latest_primary = await usage_repo.latest_by_account(window="primary", account_ids=candidate_ids)
+    latest_secondary = await usage_repo.latest_by_account(window="secondary", account_ids=candidate_ids)
+    latest_monthly = await usage_repo.latest_by_account(window="monthly", account_ids=candidate_ids)
 
     recovered = 0
     for account in candidates:
@@ -332,3 +382,21 @@ def _select_long_window_entry(
     if monthly_entry is not None and capacity_for_plan(account.plan_type, "monthly") is not None:
         return monthly_entry
     return secondary_entry
+
+
+def _select_long_window_entries(
+    *,
+    accounts: list[Account],
+    monthly_entries: dict[str, UsageHistory],
+    secondary_entries: dict[str, UsageHistory],
+) -> dict[str, UsageHistory]:
+    selected: dict[str, UsageHistory] = {}
+    for account in accounts:
+        entry = _select_long_window_entry(
+            account=account,
+            monthly_entry=monthly_entries.get(account.id),
+            secondary_entry=secondary_entries.get(account.id),
+        )
+        if entry is not None:
+            selected[account.id] = entry
+    return selected

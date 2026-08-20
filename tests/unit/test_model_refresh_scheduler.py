@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import contextlib
+import errno
 import logging
+import socket
+from collections.abc import Awaitable, Callable
 from datetime import datetime
 from types import SimpleNamespace
 from typing import Any
@@ -9,6 +12,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import aiohttp
 import pytest
+from aiohttp.client_reqrep import ConnectionKey
 
 import app.core.auth.refresh as refresh_module
 import app.core.clients.model_fetcher as model_fetcher_module
@@ -112,9 +116,6 @@ async def test_refresh_access_token_marks_transport_errors(monkeypatch: pytest.M
         refresh_module,
         "get_settings",
         lambda: SimpleNamespace(
-            auth_base_url="https://auth.example.test",
-            oauth_client_id="client-id",
-            oauth_scope="openid profile",
             token_refresh_timeout_seconds=15.0,
         ),
     )
@@ -127,6 +128,100 @@ async def test_refresh_access_token_marks_transport_errors(monkeypatch: pytest.M
     assert exc.is_permanent is False
     assert exc.transport_error is True
     assert "dns failed" in exc.message
+
+
+@pytest.mark.asyncio
+async def test_refresh_access_token_preserves_transient_dns_classification(monkeypatch: pytest.MonkeyPatch) -> None:
+    session = MagicMock()
+    session.post.side_effect = socket.gaierror(socket.EAI_AGAIN, "Temporary failure in name resolution")
+    monkeypatch.setattr(
+        refresh_module,
+        "get_settings",
+        lambda: SimpleNamespace(
+            auth_base_url="https://auth.example.test",
+            oauth_client_id="client-id",
+            oauth_scope="openid profile",
+            token_refresh_timeout_seconds=15.0,
+        ),
+    )
+
+    with pytest.raises(refresh_module.RefreshError) as exc_info:
+        await refresh_module.refresh_access_token("refresh-token", session=session, allow_direct_egress=True)
+
+    assert exc_info.value.transport_error is True
+    assert exc_info.value.transport_error_code == "proxy_network_unavailable"
+    assert exc_info.value.retryable_same_contract is False
+    assert exc_info.value.failed_session is session
+
+
+@pytest.mark.asyncio
+async def test_refresh_access_token_marks_typed_connector_dns_failure_replay_safe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = MagicMock()
+    key = ConnectionKey("auth.example.test", 443, True, True, None, None, None)
+    session.post.side_effect = aiohttp.ClientConnectorError(
+        key,
+        socket.gaierror(socket.EAI_AGAIN, "Temporary failure in name resolution"),
+    )
+    monkeypatch.setattr(
+        refresh_module,
+        "get_settings",
+        lambda: SimpleNamespace(
+            auth_base_url="https://auth.example.test",
+            oauth_client_id="client-id",
+            oauth_scope="openid profile",
+            token_refresh_timeout_seconds=15.0,
+        ),
+    )
+
+    with pytest.raises(refresh_module.RefreshError) as exc_info:
+        await refresh_module.refresh_access_token("refresh-token", session=session, allow_direct_egress=True)
+
+    assert exc_info.value.transport_error_code == "proxy_network_unavailable"
+    assert exc_info.value.retryable_same_contract is True
+    assert exc_info.value.failed_session is session
+
+
+@pytest.mark.asyncio
+async def test_refresh_access_token_network_body_read_failure_is_not_replay_safe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _BodyReadFailureResponse:
+        status = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+        async def json(self, *, content_type=None):
+            del content_type
+            raise ValueError("invalid partial JSON")
+
+        async def text(self):
+            raise OSError(errno.ENETUNREACH, "Network is unreachable")
+
+    session = MagicMock()
+    session.post.return_value = _BodyReadFailureResponse()
+    monkeypatch.setattr(
+        refresh_module,
+        "get_settings",
+        lambda: SimpleNamespace(
+            auth_base_url="https://auth.example.test",
+            oauth_client_id="client-id",
+            oauth_scope="openid profile",
+            token_refresh_timeout_seconds=15.0,
+        ),
+    )
+
+    with pytest.raises(refresh_module.RefreshError) as exc_info:
+        await refresh_module.refresh_access_token("refresh-token", session=session, allow_direct_egress=True)
+
+    assert exc_info.value.transport_error_code == "proxy_network_unavailable"
+    assert exc_info.value.retryable_same_contract is False
+    assert exc_info.value.failed_session is session
 
 
 @pytest.mark.asyncio
@@ -265,6 +360,29 @@ async def test_fetch_with_failover_attempts_transport_recovery_once_when_retry_f
 
 
 @pytest.mark.asyncio
+async def test_fetch_with_failover_preserves_successful_empty_catalogs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    accounts = [_account("account-1"), _account("account-2")]
+    encryptor = MagicMock()
+    encryptor.decrypt.return_value = "access-token"
+    fetch_models_for_plan = AsyncMock(side_effect=[[], []])
+
+    monkeypatch.setattr(scheduler_module, "AuthManager", _StubAuthManager)
+    monkeypatch.setattr(scheduler_module, "fetch_models_for_plan", fetch_models_for_plan)
+
+    result = await scheduler_module._fetch_with_failover(accounts, encryptor, MagicMock())
+
+    assert result is not None
+    assert result.models == []
+    assert result.account_models == {
+        accounts[0].id: (accounts[0].plan_type, []),
+        accounts[1].id: (accounts[1].plan_type, []),
+    }
+    assert fetch_models_for_plan.await_count == 2
+
+
+@pytest.mark.asyncio
 async def test_fetch_with_failover_unions_same_plan_tiers(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -302,7 +420,7 @@ async def test_fetch_with_failover_unions_same_plan_tiers(
 
 
 @pytest.mark.asyncio
-async def test_fetch_with_failover_excludes_same_plan_private_model_slug(
+async def test_fetch_with_failover_unions_same_plan_account_specific_model_slug(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     accounts = [_account("account-1"), _account("account-2")]
@@ -319,7 +437,11 @@ async def test_fetch_with_failover_excludes_same_plan_private_model_slug(
     result = await scheduler_module._fetch_with_failover(accounts, encryptor, MagicMock())
 
     assert result is not None
-    assert [model.slug for model in result.models] == ["gpt-5.4"]
+    assert [model.slug for model in result.models] == ["gpt-5.4", "private-alpha"]
+    assert result.account_models == {
+        accounts[0].id: (accounts[0].plan_type, first_models),
+        accounts[1].id: (accounts[1].plan_type, second_models),
+    }
     assert fetch_models_for_plan.await_count == 2
 
 
@@ -361,8 +483,8 @@ async def test_refresh_once_closes_account_read_session_before_fetch_models(
     session_closed = False
 
     class _Leader:
-        async def try_acquire(self) -> bool:
-            return True
+        async def run_if_leader(self, fn: Callable[[], Awaitable[object]]) -> object:
+            return await fn()
 
     class _Session:
         def expunge_all(self) -> None:
@@ -418,3 +540,45 @@ async def test_refresh_once_closes_account_read_session_before_fetch_models(
 
     scheduler = scheduler_module.ModelRefreshScheduler(interval_seconds=60, enabled=True)
     await scheduler._refresh_once()
+
+
+@pytest.mark.asyncio
+async def test_refresh_once_clears_registry_when_no_active_accounts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Leader:
+        async def run_if_leader(self, fn: Callable[[], Awaitable[object]]) -> object:
+            return await fn()
+
+    class _Session:
+        def expunge_all(self) -> None:
+            return None
+
+    @contextlib.asynccontextmanager
+    async def _background_session():
+        yield _Session()
+
+    class _AccountsRepo:
+        def __init__(self, _session: object) -> None:
+            pass
+
+        async def list_accounts(self) -> list[Account]:
+            return []
+
+    clear = AsyncMock()
+    invalidate = MagicMock()
+    monkeypatch.setattr(scheduler_module, "_get_leader_election", lambda: _Leader())
+    monkeypatch.setattr(scheduler_module, "get_background_session", _background_session)
+    monkeypatch.setattr(scheduler_module, "AccountsRepository", _AccountsRepo)
+    monkeypatch.setattr(scheduler_module, "get_model_registry", lambda: SimpleNamespace(clear=clear))
+    monkeypatch.setattr(
+        scheduler_module,
+        "get_account_selection_cache",
+        lambda: SimpleNamespace(invalidate=invalidate),
+    )
+
+    scheduler = scheduler_module.ModelRefreshScheduler(interval_seconds=60, enabled=True)
+    await scheduler._refresh_once()
+
+    clear.assert_awaited_once_with()
+    invalidate.assert_called_once_with()

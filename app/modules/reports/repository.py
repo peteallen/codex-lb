@@ -9,6 +9,11 @@ from sqlalchemy import and_, case, func, literal, or_, select, union_all
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import Account, RequestLog
+from app.modules.accounts.usage_time_rollup import conversation_id_expr
+from app.modules.accounts.usage_time_rollup_read import (
+    conversation_labeled_presence_union,
+    conversation_presence_union,
+)
 
 _INTERNAL_LIMIT_WARMUP_SOURCE = "limit_warmup"
 _INTERNAL_WARMUP_REQUEST_KINDS = ("warmup", "limit_warmup")
@@ -32,6 +37,10 @@ class DailyReportAggregateRow:
     cost_usd: float
     active_accounts: int
     error_count: int
+    median_ttft_ms: float
+    median_tps: float
+    median_queue_ms: float
+    conversation_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -43,6 +52,7 @@ class SummaryAggregateRow:
     total_requests: int
     total_errors: int
     active_accounts: int
+    conversation_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -71,6 +81,10 @@ class ReportsRepository:
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
 
+    @staticmethod
+    def _conversation_id_expr():
+        return conversation_id_expr()
+
     async def aggregate_daily_rows(
         self,
         start_date: date,
@@ -79,6 +93,7 @@ class ReportsRepository:
         account_ids: list[str] | None = None,
         model: str | None = None,
         useragent_group: str | None = None,
+        api_key_ids: list[str] | None = None,
     ) -> list[DailyReportAggregateRow]:
         window_days = (end_date - start_date).days + 1
         if window_days > MAX_DAILY_REPORT_DAYS:
@@ -87,12 +102,49 @@ class ReportsRepository:
         if not day_ranges:
             return []
 
+        # Same filtered-vs-unfiltered split as `aggregate_summary`: only the
+        # unfiltered per-day conversation counts are served from the
+        # conversation satellite (one extra statement per batch, replacing
+        # the raw COUNT(DISTINCT ...) column in the main statement).
+        use_rollup = not (account_ids or api_key_ids or model or useragent_group)
         rows: list[DailyReportAggregateRow] = []
         # SQLite caps compound SELECTs at 500 terms, so long report ranges are
         # executed in chunks instead of building a single oversized UNION ALL.
         for day_ranges_batch in batched(day_ranges, _SQLITE_COMPOUND_SELECT_LIMIT):
-            stmt = _daily_rows_stmt(list(day_ranges_batch), account_ids, model, useragent_group)
-            result = await self._session.execute(stmt)
+            day_ranges_list = list(day_ranges_batch)
+            speed_result = await self._session.execute(
+                _daily_speed_medians_stmt(day_ranges_list, account_ids, model, useragent_group, api_key_ids)
+            )
+            speed_values = {
+                speed_row.report_date: (
+                    float(speed_row.median_ttft_ms or 0.0),
+                    float(speed_row.median_tps or 0.0),
+                    float(speed_row.median_queue_ms or 0.0),
+                )
+                for speed_row in speed_result.all()
+            }
+            conversation_values: dict[str, int] = {}
+            if use_rollup:
+                union = conversation_labeled_presence_union(
+                    self._session,
+                    day_ranges_list,
+                    raw_conditions=(_normal_traffic_clause(),),
+                ).subquery()
+                conversation_result = await self._session.execute(
+                    select(union.c.label, func.count(func.distinct(union.c.cid))).group_by(union.c.label)
+                )
+                conversation_values = {label: int(count) for label, count in conversation_result.all()}
+
+            result = await self._session.execute(
+                _daily_rows_stmt(
+                    day_ranges_list,
+                    account_ids,
+                    model,
+                    useragent_group,
+                    api_key_ids,
+                    include_conversations=not use_rollup,
+                )
+            )
             rows.extend(
                 DailyReportAggregateRow(
                     date=row.report_date,
@@ -103,6 +155,12 @@ class ReportsRepository:
                     cost_usd=float(row.cost_usd or 0.0),
                     active_accounts=int(row.active_accounts or 0),
                     error_count=int(row.error_count or 0),
+                    median_ttft_ms=speed_values.get(row.report_date, (0.0, 0.0, 0.0))[0],
+                    median_tps=speed_values.get(row.report_date, (0.0, 0.0, 0.0))[1],
+                    median_queue_ms=speed_values.get(row.report_date, (0.0, 0.0, 0.0))[2],
+                    conversation_count=(
+                        conversation_values.get(row.report_date, 0) if use_rollup else int(row.conversation_count or 0)
+                    ),
                 )
                 for row in result.all()
             )
@@ -115,24 +173,44 @@ class ReportsRepository:
         account_ids: list[str] | None = None,
         model: str | None = None,
         useragent_group: str | None = None,
+        api_key_ids: list[str] | None = None,
     ) -> SummaryAggregateRow:
-        conditions = _report_conditions(start_date, end_date, account_ids, model, useragent_group)
+        conditions = _report_conditions(start_date, end_date, account_ids, model, useragent_group, api_key_ids)
 
-        result = await self._session.execute(
-            select(
-                func.coalesce(func.sum(RequestLog.cost_usd), 0.0).label("total_cost_usd"),
-                func.coalesce(func.sum(RequestLog.input_tokens), 0).label("total_input_tokens"),
-                func.coalesce(func.sum(RequestLog.output_tokens), 0).label("total_output_tokens"),
-                func.coalesce(func.sum(RequestLog.cached_input_tokens), 0).label("total_cached_tokens"),
-                func.count().label("total_requests"),
-                func.coalesce(
-                    func.sum(case((RequestLog.status != "success", 1), else_=0)),
-                    0,
-                ).label("total_errors"),
-                func.count(func.distinct(RequestLog.account_id)).label("active_accounts"),
-            ).where(and_(*conditions))
-        )
-        row = result.one()
+        # The conversation satellite carries no model/useragent dimensions
+        # and pre-merges accounts, so only the unfiltered read is served from
+        # it (rollup + raw tail, split out of the single statement the same
+        # way the dashboard activity read splits its conversation metrics);
+        # filtered summaries keep the legacy raw single statement.
+        use_rollup = not (account_ids or api_key_ids or model or useragent_group)
+        columns = [
+            func.coalesce(func.sum(RequestLog.cost_usd), 0.0).label("total_cost_usd"),
+            func.coalesce(func.sum(RequestLog.input_tokens), 0).label("total_input_tokens"),
+            func.coalesce(func.sum(RequestLog.output_tokens), 0).label("total_output_tokens"),
+            func.coalesce(func.sum(RequestLog.cached_input_tokens), 0).label("total_cached_tokens"),
+            func.count().label("total_requests"),
+            func.coalesce(
+                func.sum(case((RequestLog.status != "success", 1), else_=0)),
+                0,
+            ).label("total_errors"),
+            func.count(func.distinct(RequestLog.account_id)).label("active_accounts"),
+        ]
+        if not use_rollup:
+            columns.append(func.count(func.distinct(self._conversation_id_expr())).label("conversation_count"))
+        row = (await self._session.execute(select(*columns).where(and_(*conditions)))).one()
+        if use_rollup:
+            union = conversation_presence_union(
+                self._session,
+                start_date,
+                end_date,
+                include_deleted=True,
+                raw_conditions=(_normal_traffic_clause(),),
+            ).subquery()
+            conversation_count = (
+                await self._session.execute(select(func.count(func.distinct(union.c.cid))))
+            ).scalar_one()
+        else:
+            conversation_count = row.conversation_count
         return SummaryAggregateRow(
             total_cost_usd=float(row.total_cost_usd),
             total_input_tokens=int(row.total_input_tokens),
@@ -141,6 +219,7 @@ class ReportsRepository:
             total_requests=int(row.total_requests),
             total_errors=int(row.total_errors),
             active_accounts=int(row.active_accounts),
+            conversation_count=int(conversation_count or 0),
         )
 
     async def aggregate_by_model(
@@ -150,9 +229,10 @@ class ReportsRepository:
         account_ids: list[str] | None = None,
         model: str | None = None,
         useragent_group: str | None = None,
+        api_key_ids: list[str] | None = None,
     ) -> list[ModelAggregateRow]:
         conditions = [
-            *_report_conditions(start_date, end_date, account_ids, model, useragent_group),
+            *_report_conditions(start_date, end_date, account_ids, model, useragent_group, api_key_ids),
             RequestLog.model.is_not(None),
         ]
 
@@ -183,8 +263,9 @@ class ReportsRepository:
         account_ids: list[str] | None = None,
         model: str | None = None,
         useragent_group: str | None = None,
+        api_key_ids: list[str] | None = None,
     ) -> list[AccountAggregateRow]:
-        conditions = _report_conditions(start_date, end_date, account_ids, model, useragent_group)
+        conditions = _report_conditions(start_date, end_date, account_ids, model, useragent_group, api_key_ids)
 
         stmt = (
             select(
@@ -224,10 +305,11 @@ class ReportsRepository:
         account_ids: list[str] | None = None,
         model: str | None = None,
         useragent_group: str | None = None,
+        api_key_ids: list[str] | None = None,
     ) -> list[UserAgentAggregateRow]:
         useragent_group_bucket = _useragent_group_bucket_expr()
         conditions = [
-            *_report_conditions(start_date, end_date, account_ids, model, useragent_group),
+            *_report_conditions(start_date, end_date, account_ids, model, useragent_group, api_key_ids),
             or_(RequestLog.useragent_group.is_(None), func.trim(RequestLog.useragent_group) != ""),
         ]
 
@@ -258,9 +340,10 @@ class ReportsRepository:
         account_ids: list[str] | None = None,
         model: str | None = None,
         useragent_group: str | None = None,
+        api_key_ids: list[str] | None = None,
     ) -> int:
         conditions = [
-            *_report_conditions(start_date, end_date, account_ids, model, useragent_group),
+            *_report_conditions(start_date, end_date, account_ids, model, useragent_group, api_key_ids),
             RequestLog.account_id.is_not(None),
         ]
 
@@ -274,10 +357,13 @@ class ReportsRepository:
         account_ids: list[str] | None = None,
         model: str | None = None,
         useragent_group: str | None = None,
+        api_key_ids: list[str] | None = None,
     ) -> datetime | None:
         conditions = [_normal_traffic_clause()]
         if account_ids:
             conditions.append(RequestLog.account_id.in_(account_ids))
+        if api_key_ids:
+            conditions.append(RequestLog.api_key_id.in_(api_key_ids))
         if model:
             conditions.append(RequestLog.model == model)
         useragent_group_clause = _useragent_group_filter_clause(useragent_group)
@@ -295,6 +381,7 @@ def _report_conditions(
     account_ids: list[str] | None,
     model: str | None,
     useragent_group: str | None,
+    api_key_ids: list[str] | None = None,
 ) -> list:
     conditions = [
         RequestLog.requested_at >= start_date,
@@ -303,6 +390,8 @@ def _report_conditions(
     ]
     if account_ids:
         conditions.append(RequestLog.account_id.in_(account_ids))
+    if api_key_ids:
+        conditions.append(RequestLog.api_key_id.in_(api_key_ids))
     if model:
         conditions.append(RequestLog.model == model)
     useragent_group_clause = _useragent_group_filter_clause(useragent_group)
@@ -336,13 +425,7 @@ def _normal_traffic_clause():
     )
 
 
-def _daily_rows_stmt(
-    day_ranges: list[tuple[str, datetime, datetime]],
-    account_ids: list[str] | None,
-    model: str | None,
-    useragent_group: str | None,
-):
-    useragent_group_clause = _useragent_group_filter_clause(useragent_group)
+def _day_ranges_cte(day_ranges: list[tuple[str, datetime, datetime]]):
     day_range_rows = [
         select(
             literal(report_date).label("report_date"),
@@ -352,21 +435,191 @@ def _daily_rows_stmt(
         for report_date, day_start, day_end in day_ranges
     ]
     day_ranges_query = day_range_rows[0] if len(day_range_rows) == 1 else union_all(*day_range_rows)
-    day_ranges_cte = day_ranges_query.cte("report_days")
+    return day_ranges_query.cte("report_days")
+
+
+def _daily_speed_medians_stmt(
+    day_ranges: list[tuple[str, datetime, datetime]],
+    account_ids: list[str] | None,
+    model: str | None,
+    useragent_group: str | None,
+    api_key_ids: list[str] | None = None,
+):
+    useragent_group_clause = _useragent_group_filter_clause(useragent_group)
+    day_ranges_cte = _day_ranges_cte(day_ranges)
+    traffic_join = day_ranges_cte.join(
+        RequestLog,
+        and_(
+            RequestLog.requested_at >= day_ranges_cte.c.day_start,
+            RequestLog.requested_at < day_ranges_cte.c.day_end,
+            _normal_traffic_clause(),
+            *([RequestLog.account_id.in_(account_ids)] if account_ids else []),
+            *([RequestLog.api_key_id.in_(api_key_ids)] if api_key_ids else []),
+            *([RequestLog.model == model] if model else []),
+            *([useragent_group_clause] if useragent_group_clause is not None else []),
+        ),
+    )
+    # TTFT remains the canonical generation anchor whenever a client-visible
+    # token exists. Tool-only turns have no TTFT, so response.created is their
+    # closest persisted output boundary. Transport-level upstream activity can
+    # precede response creation and must not shorten the generation interval.
+    generation_anchor_ms = func.coalesce(
+        RequestLog.latency_first_token_ms,
+        RequestLog.latency_response_created_ms,
+    )
+    generation_token_count = RequestLog.output_tokens
+    ttft_values_cte = (
+        select(
+            day_ranges_cte.c.report_date,
+            RequestLog.latency_first_token_ms.label("ttft_ms"),
+        )
+        .select_from(traffic_join)
+        .where(RequestLog.latency_first_token_ms.is_not(None))
+        .cte("daily_ttft_values")
+    )
+    tps_values_cte = (
+        select(
+            day_ranges_cte.c.report_date,
+            (generation_token_count * 1000.0 / (RequestLog.latency_ms - generation_anchor_ms)).label("tps"),
+        )
+        .select_from(traffic_join)
+        .where(
+            generation_token_count.is_not(None),
+            generation_token_count > 0,
+            RequestLog.latency_ms.is_not(None),
+            generation_anchor_ms.is_not(None),
+            RequestLog.latency_ms > generation_anchor_ms,
+        )
+        .cte("daily_tps_values")
+    )
+    queue_values_cte = (
+        select(
+            day_ranges_cte.c.report_date,
+            RequestLog.latency_queue_ms.label("queue_ms"),
+        )
+        .select_from(traffic_join)
+        .where(RequestLog.latency_queue_ms.is_not(None))
+        .cte("daily_queue_values")
+    )
+    ttft_count = func.count().over(partition_by=ttft_values_cte.c.report_date)
+    ttft_ranked_cte = select(
+        ttft_values_cte.c.report_date,
+        ttft_values_cte.c.ttft_ms,
+        ttft_count.label("sample_count"),
+        func.row_number()
+        .over(partition_by=ttft_values_cte.c.report_date, order_by=ttft_values_cte.c.ttft_ms)
+        .label("ttft_rank"),
+    ).cte("daily_ttft_ranks")
+    tps_count = func.count().over(partition_by=tps_values_cte.c.report_date)
+    tps_ranked_cte = select(
+        tps_values_cte.c.report_date,
+        tps_values_cte.c.tps,
+        tps_count.label("sample_count"),
+        func.row_number()
+        .over(partition_by=tps_values_cte.c.report_date, order_by=tps_values_cte.c.tps)
+        .label("tps_rank"),
+    ).cte("daily_tps_ranks")
+    queue_count = func.count().over(partition_by=queue_values_cte.c.report_date)
+    queue_ranked_cte = select(
+        queue_values_cte.c.report_date,
+        queue_values_cte.c.queue_ms,
+        queue_count.label("sample_count"),
+        func.row_number()
+        .over(partition_by=queue_values_cte.c.report_date, order_by=queue_values_cte.c.queue_ms)
+        .label("queue_rank"),
+    ).cte("daily_queue_ranks")
+
+    # A median contains the one center row for odd samples and both center rows
+    # for even samples. Multiplication avoids dialect-specific integer division.
+    ttft_is_middle = and_(
+        ttft_ranked_cte.c.ttft_rank * 2 >= ttft_ranked_cte.c.sample_count,
+        ttft_ranked_cte.c.ttft_rank * 2 <= ttft_ranked_cte.c.sample_count + 2,
+    )
+    tps_is_middle = and_(
+        tps_ranked_cte.c.tps_rank * 2 >= tps_ranked_cte.c.sample_count,
+        tps_ranked_cte.c.tps_rank * 2 <= tps_ranked_cte.c.sample_count + 2,
+    )
+    queue_is_middle = and_(
+        queue_ranked_cte.c.queue_rank * 2 >= queue_ranked_cte.c.sample_count,
+        queue_ranked_cte.c.queue_rank * 2 <= queue_ranked_cte.c.sample_count + 2,
+    )
+    ttft_medians_cte = (
+        select(
+            ttft_ranked_cte.c.report_date,
+            func.avg(case((ttft_is_middle, ttft_ranked_cte.c.ttft_ms), else_=None)).label("median_ttft_ms"),
+        )
+        .group_by(ttft_ranked_cte.c.report_date)
+        .cte("daily_ttft_medians")
+    )
+    tps_medians_cte = (
+        select(
+            tps_ranked_cte.c.report_date,
+            func.avg(case((tps_is_middle, tps_ranked_cte.c.tps), else_=None)).label("median_tps"),
+        )
+        .group_by(tps_ranked_cte.c.report_date)
+        .cte("daily_tps_medians")
+    )
+    queue_medians_cte = (
+        select(
+            queue_ranked_cte.c.report_date,
+            func.avg(case((queue_is_middle, queue_ranked_cte.c.queue_ms), else_=None)).label("median_queue_ms"),
+        )
+        .group_by(queue_ranked_cte.c.report_date)
+        .cte("daily_queue_medians")
+    )
     return (
         select(
             day_ranges_cte.c.report_date,
-            func.count(RequestLog.id).label("requests"),
-            func.coalesce(func.sum(RequestLog.input_tokens), 0).label("input_tokens"),
-            func.coalesce(func.sum(RequestLog.output_tokens), 0).label("output_tokens"),
-            func.coalesce(func.sum(RequestLog.cached_input_tokens), 0).label("cached_input_tokens"),
-            func.coalesce(func.sum(RequestLog.cost_usd), 0.0).label("cost_usd"),
-            func.count(func.distinct(RequestLog.account_id)).label("active_accounts"),
-            func.coalesce(
-                func.sum(case((RequestLog.status != "success", 1), else_=0)),
-                0,
-            ).label("error_count"),
+            func.coalesce(ttft_medians_cte.c.median_ttft_ms, 0.0).label("median_ttft_ms"),
+            func.coalesce(tps_medians_cte.c.median_tps, 0.0).label("median_tps"),
+            func.coalesce(queue_medians_cte.c.median_queue_ms, 0.0).label("median_queue_ms"),
         )
+        .select_from(
+            day_ranges_cte.outerjoin(
+                ttft_medians_cte,
+                ttft_medians_cte.c.report_date == day_ranges_cte.c.report_date,
+            )
+            .outerjoin(
+                tps_medians_cte,
+                tps_medians_cte.c.report_date == day_ranges_cte.c.report_date,
+            )
+            .outerjoin(
+                queue_medians_cte,
+                queue_medians_cte.c.report_date == day_ranges_cte.c.report_date,
+            )
+        )
+        .order_by(day_ranges_cte.c.report_date)
+    )
+
+
+def _daily_rows_stmt(
+    day_ranges: list[tuple[str, datetime, datetime]],
+    account_ids: list[str] | None,
+    model: str | None,
+    useragent_group: str | None,
+    api_key_ids: list[str] | None = None,
+    *,
+    include_conversations: bool = True,
+):
+    useragent_group_clause = _useragent_group_filter_clause(useragent_group)
+    day_ranges_cte = _day_ranges_cte(day_ranges)
+    columns = [
+        day_ranges_cte.c.report_date,
+        func.count(RequestLog.id).label("requests"),
+        func.coalesce(func.sum(RequestLog.input_tokens), 0).label("input_tokens"),
+        func.coalesce(func.sum(RequestLog.output_tokens), 0).label("output_tokens"),
+        func.coalesce(func.sum(RequestLog.cached_input_tokens), 0).label("cached_input_tokens"),
+        func.coalesce(func.sum(RequestLog.cost_usd), 0.0).label("cost_usd"),
+        func.count(func.distinct(RequestLog.account_id)).label("active_accounts"),
+        func.coalesce(
+            func.sum(case((RequestLog.status != "success", 1), else_=0)),
+            0,
+        ).label("error_count"),
+    ]
+    if include_conversations:
+        columns.append(func.count(func.distinct(ReportsRepository._conversation_id_expr())).label("conversation_count"))
+    return (
+        select(*columns)
         .select_from(
             day_ranges_cte.join(
                 RequestLog,
@@ -375,6 +628,7 @@ def _daily_rows_stmt(
                     RequestLog.requested_at < day_ranges_cte.c.day_end,
                     _normal_traffic_clause(),
                     *([RequestLog.account_id.in_(account_ids)] if account_ids else []),
+                    *([RequestLog.api_key_id.in_(api_key_ids)] if api_key_ids else []),
                     *([RequestLog.model == model] if model else []),
                     *([useragent_group_clause] if useragent_group_clause is not None else []),
                 ),

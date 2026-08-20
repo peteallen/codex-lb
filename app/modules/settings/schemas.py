@@ -34,11 +34,19 @@ class AdditionalQuotaPolicy(DashboardModel):
 class DashboardSettingsResponse(DashboardModel):
     sticky_threads_enabled: bool
     upstream_stream_transport: str = Field(pattern=r"^(default|auto|http|websocket)$")
+    prohibit_fast_mode: bool
     http_downstream_transport_policy: str = Field(pattern=_HTTP_DOWNSTREAM_TRANSPORT_POLICY_PATTERN)
+    proxy_account_response_create_limit: int = Field(ge=0)
+    proxy_account_stream_limit: int = Field(ge=0)
+    proxy_account_stream_recovery_reserve: int = Field(ge=0)
+    proxy_api_key_fair_share_congestion_threshold_pct: int = Field(ge=0, le=100)
     upstream_proxy_routing_enabled: bool
     upstream_proxy_default_pool_id: str | None = None
     prefer_earlier_reset_accounts: bool
     prefer_earlier_reset_window: str = Field(pattern=r"^(primary|secondary)$")
+    show_reset_credit_badges: bool
+    auto_redeem_reset_credits_before_expiry: bool
+    show_reset_credit_expiry_badge: bool
     routing_strategy: str = Field(
         pattern=r"^(usage_weighted|round_robin|capacity_weighted|relative_availability|fill_first|sequential_drain|reset_drain|single_account)$"
     )
@@ -64,30 +72,45 @@ class DashboardSettingsResponse(DashboardModel):
     limit_warmup_prompt: str = Field(min_length=1, max_length=512)
     limit_warmup_cooldown_seconds: int = Field(ge=60)
     limit_warmup_exhausted_threshold_percent: float = Field(gt=0.0, le=100.0)
+    limit_warmup_idle_threshold_percent: float = Field(gt=0.0, le=100.0)
     limit_warmup_min_available_percent: float = Field(gt=0.0, le=100.0)
     weekly_pace_working_days: str = _DEFAULT_WEEKLY_PACE_WORKING_DAYS
     weekly_pace_smoothing_minutes: int = Field(default=30)
     limit_warmup_staggered_idle_enabled: bool
+    request_log_retention_days: int = Field(ge=0, le=3650)
+    usage_history_retention_days: int = Field(ge=0, le=3650)
+    request_log_retention_override_days: int | None = Field(default=None, ge=0, le=3650)
+    usage_history_retention_override_days: int | None = Field(default=None, ge=0, le=3650)
     additional_quota_routing_policies: dict[str, str] = Field(default_factory=dict)
     additional_quota_policies: list[AdditionalQuotaPolicy] = Field(default_factory=list)
     guest_access_enabled: bool
     guest_password_configured: bool
+    version: int = Field(ge=1)
 
 
 class DashboardSettingsUpdateRequest(DashboardModel):
+    expected_version: int | None = Field(default=None, ge=1)
     sticky_threads_enabled: bool | None = None
     upstream_stream_transport: str | None = Field(
         default=None,
         pattern=r"^(default|auto|http|websocket)$",
     )
+    prohibit_fast_mode: bool | None = None
     http_downstream_transport_policy: str | None = Field(
         default=None,
         pattern=_HTTP_DOWNSTREAM_TRANSPORT_POLICY_PATTERN,
     )
+    proxy_account_response_create_limit: int | None = Field(default=None, ge=0)
+    proxy_account_stream_limit: int | None = Field(default=None, ge=0)
+    proxy_account_stream_recovery_reserve: int | None = Field(default=None, ge=0)
+    proxy_api_key_fair_share_congestion_threshold_pct: int | None = Field(default=None, ge=0, le=100)
     upstream_proxy_routing_enabled: bool | None = None
     upstream_proxy_default_pool_id: str | None = None
     prefer_earlier_reset_accounts: bool | None = None
     prefer_earlier_reset_window: str | None = Field(default=None, pattern=r"^(primary|secondary)$")
+    show_reset_credit_badges: bool | None = None
+    auto_redeem_reset_credits_before_expiry: bool | None = None
+    show_reset_credit_expiry_badge: bool | None = None
     routing_strategy: str | None = Field(
         default=None,
         pattern=r"^(usage_weighted|round_robin|capacity_weighted|relative_availability|fill_first|sequential_drain|reset_drain|single_account)$",
@@ -114,11 +137,31 @@ class DashboardSettingsUpdateRequest(DashboardModel):
     limit_warmup_prompt: str | None = Field(default=None, min_length=1, max_length=512)
     limit_warmup_cooldown_seconds: int | None = Field(default=None, ge=60)
     limit_warmup_exhausted_threshold_percent: float | None = Field(default=None, gt=0.0, le=100.0)
+    limit_warmup_idle_threshold_percent: float | None = Field(default=None, gt=0.0, le=100.0)
     limit_warmup_min_available_percent: float | None = Field(default=None, gt=0.0, le=100.0)
     weekly_pace_working_days: str | None = None
     weekly_pace_smoothing_minutes: int | None = None
     guest_access_enabled: bool | None = None
     limit_warmup_staggered_idle_enabled: bool | None = None
+    # Tri-state retention overrides: absent = unchanged, present null = clear
+    # the override (back to inheriting the deprecated env alias), present
+    # value = store the override.
+    request_log_retention_override_days: int | None = Field(default=None, ge=0, le=3650)
+    usage_history_retention_override_days: int | None = Field(default=None, ge=0, le=3650)
+
+    @field_validator("request_log_retention_override_days")
+    @classmethod
+    def _validate_request_log_retention_override(cls, value: int | None) -> int | None:
+        if value is not None and value != 0 and value < 30:
+            raise ValueError("request_log_retention_override_days must be 0 (disabled) or >= 30")
+        return value
+
+    @field_validator("usage_history_retention_override_days")
+    @classmethod
+    def _validate_usage_history_retention_override(cls, value: int | None) -> int | None:
+        if value is not None and value != 0 and value < 45:
+            raise ValueError("usage_history_retention_override_days must be 0 (disabled) or >= 45")
+        return value
 
     @field_validator("warmup_model")
     @classmethod

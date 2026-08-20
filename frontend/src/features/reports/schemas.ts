@@ -3,12 +3,16 @@ import { z } from "zod";
 const DailyReportRowSchema = z.object({
   date: z.string(),
   requests: z.number(),
+  conversations: z.number(),
   inputTokens: z.number(),
   outputTokens: z.number(),
   cachedInputTokens: z.number(),
   costUsd: z.number(),
   activeAccounts: z.number(),
   errorCount: z.number(),
+  medianTtftMs: z.number().optional().default(0),
+  medianTps: z.number().optional().default(0),
+  medianQueueMs: z.number().optional().default(0),
 });
 
 const ModelCostEntrySchema = z.object({
@@ -39,6 +43,7 @@ const ReportSummarySchema = z.object({
   totalCachedTokens: z.number(),
   totalRequests: z.number(),
   totalErrors: z.number(),
+  totalConversations: z.number(),
   activeAccounts: z.number(),
   avgCostPerDay: z.number(),
   avgRequestsPerDay: z.number(),
@@ -64,7 +69,7 @@ export const ReportsResponseSchema = z.object({
   byAccount: z.array(AccountCostEntrySchema),
 });
 
-export type DailyReportRow = z.infer<typeof DailyReportRowSchema>;
+export type DailyReportRow = z.input<typeof DailyReportRowSchema>;
 export type ModelCostEntry = z.infer<typeof ModelCostEntrySchema>;
 export type UseragentCostEntry = z.infer<typeof UseragentCostEntrySchema>;
 export type AccountCostEntry = z.infer<typeof AccountCostEntrySchema>;

@@ -39,6 +39,15 @@ vi.mock("@/features/accounts/hooks/use-oauth", () => ({
 }));
 
 vi.mock("@/features/settings/hooks/use-settings", () => ({
+  useSettings: vi.fn(() => ({
+    settingsQuery: {
+      data: {
+        showResetCreditBadges: true,
+        showResetCreditExpiryBadge: true,
+      },
+      error: null,
+    },
+  })),
   useUpstreamProxyAdmin: vi.fn(() => ({
     upstreamProxyQuery: { data: null, error: null },
     accountBindingMutation: {
@@ -181,8 +190,10 @@ describe("AccountsPage", () => {
     expect(screen.getByTestId("accounts-list-panel")).toHaveClass(
       "min-w-0",
       "min-h-0",
-      "h-full",
+      "self-start",
     );
+    expect(screen.getByTestId("accounts-list-panel")).not.toHaveClass("h-full");
+    expect(screen.getByTestId("accounts-list-card")).not.toHaveClass("h-full");
     expect(screen.getByRole("heading", { name: /very\.long\.account/i })).toHaveClass(
       "min-w-0",
       "truncate",

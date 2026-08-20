@@ -72,10 +72,13 @@ behavior can set the threshold to `100.0`.
 - Wait first. The next request through that account usually wakes the upstream
   rate limiter; codex-lb auto-recovers on the next refresh tick after the
   upstream payload changes.
-- A force-probe action is planned in
-  [#677](https://github.com/Soju06/codex-lb/issues/677). The dashboard should
-  expose a per-account button that fires one minimal `responses.create` against
-  the affected account to nudge the upstream limiter to re-evaluate the window.
+- The dashboard Force Probe action fires one minimal `responses.create` against
+  the selected account and immediately refreshes its usage. An accepted 2xx
+  probe also contributes to that replica's probing-health recovery streak;
+  non-2xx results do not restore routing health. Settlement reloads and
+  normalizes weekly/monthly and zero-primary-capacity usage like ordinary
+  routing and is discarded when newer replica-local runtime activity arrives
+  during that snapshot load.
 - Do not manually flip the codex-lb account state to `ACTIVE` while
   `/wham/usage` still reports the account as fully used. That only masks the
   upstream state and can route traffic back to an account that the upstream
@@ -98,10 +101,24 @@ curl -s https://chatgpt.com/backend-api/wham/usage \
 
 If `primary_window.used_percent` is still `100` here while Settings -> Account
 shows the account as reset, codex-lb has nothing fresher to mirror. The account
-is inside the upstream propagation window, and the practical fix is to wait or,
-once #677 lands, use the Probe action.
+is inside the upstream propagation window, and the practical fix is to wait or
+use the Force Probe action. Check its `probe_status_code`: a non-2xx response
+does not count as evidence that the account is healthy.
 
 ## Related Work
 
 - [#676 - initial bug report on `/wham/usage` vs. Settings UI divergence](https://github.com/Soju06/codex-lb/issues/676)
 - [#677 - dashboard per-account force-probe action](https://github.com/Soju06/codex-lb/issues/677)
+
+## Working-day weekly forecast
+
+The weekly pace schedule already defines which weekdays can consume quota.
+Forecast simulation applies that same calendar to burnable intervals, then
+maps the resulting burn duration back to wall-clock time. A Friday forecast
+that needs two working days to deplete therefore lands on Tuesday rather than
+Sunday when Saturday and Sunday are excluded.
+
+Non-working days do not add projected burn, but they remain part of the
+operator-visible elapsed depletion time. An empty working-day set intentionally
+preserves the earlier all-days behavior, so this fork customization adds no
+required configuration or migration.
