@@ -57,7 +57,6 @@ export function DashboardPage() {
   const [searchParams, setSearchParams] = useSearchParams();
   const queryClient = useQueryClient();
   const isDark = useThemeStore((s) => s.theme === "dark");
-  const showAccountBurnrate = useDashboardPreferencesStore((s) => s.accountBurnrateEnabled);
   const accountViewMode = useDashboardPreferencesStore((s) => s.accountViewMode);
   const accountListSort = useDashboardPreferencesStore((s) => s.accountListSort);
   const setAccountViewMode = useDashboardPreferencesStore((s) => s.setAccountViewMode);
@@ -228,11 +227,10 @@ export function DashboardPage() {
       logPage?.requests ?? [],
       {
         isDark,
-        showAccountBurnrate,
       },
       projectionsQuery.data,
     );
-  }, [overview, logPage, isDark, showAccountBurnrate, projectionsQuery.data, resolvedLanguage]);
+  }, [overview, logPage, isDark, projectionsQuery.data, resolvedLanguage]);
 
   const accountOptions = useMemo(() => {
     const entries = new Map<string, { label: string; isEmail: boolean }>();

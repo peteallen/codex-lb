@@ -906,81 +906,13 @@ describe("buildDashboardView", () => {
     expect(overview.summary.primaryWindow.capacityCredits).toBe(225);
   });
 
-  it("adds account burn rate from per-account window consumption", () => {
-    const overview = createDashboardOverview({
-      accounts: [
-        account({
-          accountId: "acc-1",
-          email: "one@example.com",
-          usage: {
-            primaryRemainingPercent: 50,
-            secondaryRemainingPercent: 25,
-          },
-          resetAtPrimary: null,
-          resetAtSecondary: null,
-          windowMinutesPrimary: 300,
-          windowMinutesSecondary: 10080,
-        }),
-        account({
-          accountId: "acc-2",
-          email: "two@example.com",
-          usage: {
-            primaryRemainingPercent: 80,
-            secondaryRemainingPercent: 100,
-          },
-          resetAtPrimary: null,
-          resetAtSecondary: null,
-          windowMinutesPrimary: 300,
-          windowMinutesSecondary: 10080,
-        }),
-      ],
-    });
-
-    const view = buildDashboardView(overview, createDefaultRequestLogs(), false);
-    const burn = view.stats[3];
-
-    expect(burn.label).toBe("Account burn projection (5h/7d)");
-    expect(burn.value).toBe("0.7 / 0.8");
-    expect(burn.meta).toBe("Projected account-equivalents: 0.7/5h · 0.8/7d");
-    expect(view.stats[4]?.label).toBe("Error rate (7d)");
-  });
-
-  it("can hide the account burn rate card", () => {
+  it("omits the account burn projection card", () => {
     const overview = createDashboardOverview();
 
-    const view = buildDashboardView(overview, createDefaultRequestLogs(), {
-      isDark: false,
-      showAccountBurnrate: false,
-    });
+    const view = buildDashboardView(overview, createDefaultRequestLogs(), false);
 
     expect(view.stats.map((stat) => stat.label)).not.toContain("Account burn projection (5h/7d)");
     expect(view.stats).toHaveLength(4);
-  });
-
-  it("counts quota-exceeded secondary windows as fully burned", () => {
-    const overview = createDashboardOverview({
-      accounts: [
-        account({
-          accountId: "acc-1",
-          email: "one@example.com",
-          status: "quota_exceeded",
-          usage: {
-            primaryRemainingPercent: 100,
-            secondaryRemainingPercent: 80,
-          },
-          resetAtPrimary: null,
-          resetAtSecondary: null,
-          windowMinutesPrimary: 300,
-          windowMinutesSecondary: 10080,
-        }),
-      ],
-    });
-
-    const view = buildDashboardView(overview, createDefaultRequestLogs(), false);
-    const burn = view.stats[3];
-
-    expect(burn.value).toBe("0.0 / 1.0");
-    expect(burn.meta).toBe("Projected account-equivalents: 0.0/5h · 1.0/7d");
   });
 
   it("shows only the averaged cost text on the estimated cost card", () => {
@@ -1201,7 +1133,7 @@ describe("buildDashboardView", () => {
     expect(zeroPreviousView.stats[2]?.comparison).toBeUndefined();
   });
 
-  it("places Conversations stat after Est. API Cost and before optional burn-rate/Error Rate", () => {
+  it("places Conversations stat after Est. API Cost and before Error Rate", () => {
     const overview = createDashboardOverview({
       summary: {
         primaryWindow: {
@@ -1226,27 +1158,15 @@ describe("buildDashboardView", () => {
       },
     });
 
-    const viewWithoutBurn = buildDashboardView(overview, createDefaultRequestLogs(), false);
+    const view = buildDashboardView(overview, createDefaultRequestLogs(), false);
 
-    const costIdx = viewWithoutBurn.stats.findIndex((s) => s.label.includes("Est. API Cost"));
-    const convIdx = viewWithoutBurn.stats.findIndex((s) => s.label.includes("Conversations"));
-    const errorIdx = viewWithoutBurn.stats.findIndex((s) => s.label.includes("Error rate"));
+    const costIdx = view.stats.findIndex((s) => s.label.includes("Est. API Cost"));
+    const convIdx = view.stats.findIndex((s) => s.label.includes("Conversations"));
+    const errorIdx = view.stats.findIndex((s) => s.label.includes("Error rate"));
 
     expect(convIdx).toBeGreaterThan(costIdx);
     expect(convIdx).toBeGreaterThan(-1);
     expect(errorIdx).toBeGreaterThan(convIdx);
-
-    // With burn-rate enabled, conversation should still be between cost and burn-rate
-    const viewWithBurn = buildDashboardView(overview, createDefaultRequestLogs(), { isDark: false, showAccountBurnrate: true });
-
-    const costIdxB = viewWithBurn.stats.findIndex((s) => s.label.includes("Est. API Cost"));
-    const convIdxB = viewWithBurn.stats.findIndex((s) => s.label.includes("Conversations"));
-    const burnIdxB = viewWithBurn.stats.findIndex((s) => s.label.includes("Account burn"));
-    const errorIdxB = viewWithBurn.stats.findIndex((s) => s.label.includes("Error rate"));
-
-    expect(convIdxB).toBeGreaterThan(costIdxB);
-    expect(burnIdxB).toBeGreaterThan(convIdxB);
-    expect(errorIdxB).toBeGreaterThan(burnIdxB);
   });
 
   it("omits Conversations stat when metrics.conversations is null/undefined", () => {

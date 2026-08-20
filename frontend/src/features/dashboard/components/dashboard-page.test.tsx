@@ -168,7 +168,6 @@ describe("DashboardPage", () => {
     useConversationsMock.mockReset();
     buildDashboardViewMock.mockReset();
     useDashboardPreferencesStore.setState({
-      accountBurnrateEnabled: true,
       accountViewMode: "cards",
       accountListSort: null,
       initialized: true,
@@ -523,7 +522,6 @@ describe("DashboardPage", () => {
     const user = userEvent.setup();
     const overview = mockReadyDashboard();
     useDashboardPreferencesStore.setState({
-      accountBurnrateEnabled: true,
       accountViewMode: "list",
       accountListSort: { key: "quota", direction: "asc" },
       initialized: true,

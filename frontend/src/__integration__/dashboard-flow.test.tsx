@@ -212,6 +212,7 @@ describe("dashboard flow integration", () => {
       }),
     );
 
+    window.localStorage.setItem("codex-lb-account-burnrate-enabled", "true");
     window.history.pushState({}, "", "/dashboard");
     const { container } = render(
       <QueryClientProvider client={queryClient}>
@@ -239,8 +240,7 @@ describe("dashboard flow integration", () => {
     const expectHealthySurfaces = () => {
       expect(screen.getByText("Requests (7d)")).toBeInTheDocument();
       expect(screen.getByText("424.24K")).toBeInTheDocument();
-      expect(screen.getByText("Account burn projection (5h/7d)")).toBeInTheDocument();
-      expect(screen.getByText("0.4 / 0.1")).toBeInTheDocument();
+      expect(screen.queryByText("Account burn projection (5h/7d)")).not.toBeInTheDocument();
       expect(screen.getByRole("heading", { name: "5-Hour Credits" })).toBeInTheDocument();
       expect(screen.getByText("6,055")).toBeInTheDocument();
       expect(

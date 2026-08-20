@@ -1,9 +1,7 @@
 import { Monitor, Moon, Palette, Sun } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
-import { Switch } from "@/components/ui/switch";
 import { useAccountQuotaDisplayStore, type AccountQuotaDisplayPreference } from "@/hooks/use-account-quota-display";
-import { useDashboardPreferencesStore } from "@/hooks/use-dashboard-preferences";
 import { useThemeStore, type ThemePreference } from "@/hooks/use-theme";
 import { useTimeFormatStore, type TimeFormatPreference } from "@/hooks/use-time-format";
 import { useDateDisplayFormatStore, type DateDisplayFormat } from "@/hooks/use-date-format";
@@ -55,8 +53,6 @@ export function AppearanceSettings() {
   const setTimeFormat = useTimeFormatStore((s) => s.setTimeFormat);
   const quotaDisplay = useAccountQuotaDisplayStore((s) => s.quotaDisplay);
   const setQuotaDisplay = useAccountQuotaDisplayStore((s) => s.setQuotaDisplay);
-  const accountBurnrateEnabled = useDashboardPreferencesStore((s) => s.accountBurnrateEnabled);
-  const setAccountBurnrateEnabled = useDashboardPreferencesStore((s) => s.setAccountBurnrateEnabled);
   const dateDisplayFormat = useDateDisplayFormatStore((s) => s.dateDisplayFormat);
   const setDateDisplayFormat = useDateDisplayFormatStore((s) => s.setDateDisplayFormat);
 
@@ -176,18 +172,6 @@ export function AppearanceSettings() {
                 </button>
               ))}
             </div>
-          </div>
-
-          <div className="flex flex-col gap-3 p-3 sm:flex-row sm:items-center sm:justify-between">
-            <div>
-              <p className="text-sm font-medium">{t("settings.appearance.burnProjection.label")}</p>
-              <p className="text-xs text-muted-foreground">{t("settings.appearance.burnProjection.description")}</p>
-            </div>
-            <Switch
-              aria-label={t("settings.appearance.burnProjection.ariaLabel")}
-              checked={accountBurnrateEnabled}
-              onCheckedChange={setAccountBurnrateEnabled}
-            />
           </div>
         </div>
       </div>

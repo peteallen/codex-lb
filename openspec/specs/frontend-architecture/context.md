@@ -97,3 +97,17 @@ last valid URL/query untouched until the end date makes the pair valid. This
 avoids a surprising reset to the 7-day preset during normal start-then-end
 editing. Labels and accessibility text use the English, Korean, and Simplified
 Chinese catalogs.
+
+## Hidden account burn projection
+
+The dashboard intentionally omits the five-hour/seven-day account burn
+projection from its top metric grid. The card is removed unconditionally,
+rather than merely defaulted off, because older browsers may retain an enabled
+visibility preference. Appearance settings therefore do not expose a toggle
+that could restore it.
+
+This is a presentation boundary, not a backend projection rollback. The
+dashboard keeps loading projection data for depletion indicators and the
+separate weekly credits pace surface. A stale
+`codex-lb-account-burnrate-enabled` local-storage value is harmless because the
+frontend no longer reads it.

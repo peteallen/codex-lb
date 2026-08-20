@@ -1124,11 +1124,28 @@ The summary SHALL render in the `Accounts` section header row and SHALL use the 
 - **AND** the active count uses the dashboard positive green styling
 - **AND** the unavailable count uses the dashboard negative red styling
 
+### Requirement: Dashboard omits the account burn projection card
+
+The dashboard overview MUST NOT render the `Account burn projection` summary card. Appearance settings MUST NOT expose a control that can re-enable the card, and a previously persisted card-visibility preference MUST NOT make the card appear. The dashboard MUST preserve other projection-backed surfaces and their data access.
+
+#### Scenario: Previously enabled preference does not restore the card
+
+- **GIVEN** a browser previously persisted the account burn projection preference as enabled
+- **WHEN** the operator opens the dashboard
+- **THEN** the top summary grid does not render `Account burn projection (5h/7d)`
+- **AND** Appearance settings do not offer an account burn projection control
+
+#### Scenario: Other projection-backed surfaces remain available
+
+- **WHEN** the dashboard renders without the account burn projection card
+- **THEN** it continues loading the dashboard projection data used by depletion indicators and weekly credits pace
+- **AND** those surfaces retain their existing behavior
+
 ### Requirement: Dashboard overview summary cards show previous-window usage deltas
 
 The dashboard overview API SHALL expose previous-window comparison data for the existing `Requests`, `Tokens`, and `Est. API Cost` summary cards returned by `GET /api/dashboard/overview`. The comparison SHALL be tied to the selected overview timeframe so that `1d` compares the current 1-day window with the immediately preceding 1-day window, `7d` compares the current 7-day window with the immediately preceding 7-day window, and `30d` compares the current 30-day window with the immediately preceding 30-day window.
 
-The overview response SHALL include a comparison block that exposes whether previous-window comparison is allowed and the previous-window totals for requests, tokens, and estimated API cost. The dashboard SHALL use that block to render a compact percentage-change indicator on the existing `Requests`, `Tokens`, and `Est. API Cost` cards only. The dashboard MUST NOT add this indicator to `Error rate` or `Account burn projection`.
+The overview response SHALL include a comparison block that exposes whether previous-window comparison is allowed and the previous-window totals for requests, tokens, and estimated API cost. The dashboard SHALL use that block to render a compact percentage-change indicator on the existing `Requests`, `Tokens`, and `Est. API Cost` cards only. The dashboard MUST NOT add this indicator to `Error rate`.
 
 If the immediately preceding window is not fully covered by eligible request-log history for the selected timeframe, the overview response SHALL mark the comparison as unavailable and the dashboard SHALL hide the percentage-change indicator for those cards.
 
@@ -1154,10 +1171,10 @@ If previous-window comparison is available and the previous total for a card is 
 - **THEN** the overview response marks the comparison as unavailable
 - **AND** the dashboard does not render percentage-change indicators on the `Requests`, `Tokens`, or `Est. API Cost` cards
 
-#### Scenario: Non-comparison cards remain unchanged
+#### Scenario: Error rate remains unchanged
 
 - **WHEN** the dashboard renders overview cards from `GET /api/dashboard/overview` with or without comparison data
-- **THEN** `Error rate` and `Account burn projection` do not render previous-window percentage-change indicators
+- **THEN** `Error rate` does not render a previous-window percentage-change indicator
 
 ### Requirement: Dashboard estimated cost card meta avoids duplicate estimate and cache copy
 
