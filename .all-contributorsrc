@@ -1213,6 +1213,17 @@
         "code",
         "test"
       ]
+    },
+    {
+      "login": "peteallen",
+      "name": "Pete Allen",
+      "avatar_url": "https://avatars.githubusercontent.com/u/3686835?v=4",
+      "profile": "https://github.com/peteallen",
+      "contributions": [
+        "code",
+        "test",
+        "maintenance"
+      ]
     }
   ],
   "contributorsPerLine": 7,

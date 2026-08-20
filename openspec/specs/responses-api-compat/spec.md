@@ -65,6 +65,41 @@ When `upstream_stream_transport` is `"auto"` and the serialized request payload 
 - **THEN** the bridge MUST be bypassed for that request and the request MUST be sent over raw HTTP
 - **AND** subsequent smaller requests MUST continue to use the bridge normally
 
+### Requirement: HTTP fallback preserves capability routing and lineage
+
+An oversized WebSocket `response.create` request MUST preserve its Trusted
+Cyber authorization requirement through HTTP fallback account selection. The
+fallback MUST persist the capability lineage aliases for the generated
+response ID before forwarding `response.created` downstream.
+
+#### Scenario: capability-aware fallback
+
+- **WHEN** an oversized fallback requires Trusted Cyber authorization
+- **THEN** ordinary accounts are not eligible for its upstream selection
+- **AND** the generated response ID is persisted in the capability lineage
+  before `response.created` is exposed
+
+### Requirement: HTTP fallback participates in drain and cancellation
+
+Graceful WebSocket drain MUST treat an active HTTP fallback relay as active
+work. If fallback setup is cancelled before a relay task takes ownership of
+the API-key reservation, the service MUST release that reservation and the
+response-create admission exactly once.
+
+#### Scenario: active fallback drains
+
+- **WHEN** graceful shutdown begins while an HTTP fallback is the only active
+  turn on a downstream WebSocket
+- **THEN** the downstream socket remains open until the fallback reaches a
+  terminal event or the drain deadline expires
+
+#### Scenario: setup cancellation cleans up
+
+- **WHEN** fallback setup is cancelled while waiting for response-create
+  admission, before its relay task starts
+- **THEN** the API-key reservation and response-create admission are released
+  exactly once
+
 ### Requirement: Clean upstream close before any response event fails fast
 
 When the HTTP responses bridge observes an upstream websocket close with `close_code = 1000` before any `response.*` event has been surfaced for the pending request, the proxy MUST classify the close as rejected input, surface HTTP 502 `upstream_rejected_input`, and MUST NOT trigger `retry_precreated` or `retry_fresh_upstream`.
