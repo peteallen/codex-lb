@@ -398,6 +398,58 @@ describe("RecentRequestsTable", () => {
     expect(within(row as HTMLElement).queryByText("250.0")).not.toBeInTheDocument();
   });
 
+  it("does not show approximate first output for a zero-output row", () => {
+    render(
+      <RecentRequestsTable
+        {...PAGINATION_PROPS}
+        accounts={[]}
+        requests={[
+          {
+            requestedAt: ISO,
+            accountId: "acc-reasoning-only",
+            planType: "plus",
+            apiKeyName: "Key Reasoning",
+            apiKeyId: "key-reasoning",
+            requestId: "req-reasoning-only",
+            conversationId: null,
+            requestKind: "normal",
+            model: "gpt-5.6-reasoning-only",
+            source: null,
+            serviceTier: null,
+            requestedServiceTier: null,
+            actualServiceTier: null,
+            transport: "http",
+            ...NULL_USERAGENT_METADATA,
+            status: "ok",
+            errorCode: null,
+            errorMessage: null,
+            ...NULL_FAILURE_METADATA,
+            tokens: 1000,
+            inputTokens: 1000,
+            outputTokens: 0,
+            outputTokensRaw: 0,
+            reasoningTokens: 200,
+            cachedInputTokens: 0,
+            reasoningEffort: null,
+            costUsd: 0,
+            costBreakdown: null,
+            latencyMs: 1000,
+            ...NULL_LATENCY_METADATA,
+            latencyFirstTokenMs: null,
+            latencyResponseCreatedMs: 200,
+            latencyQueueMs: null,
+          },
+        ]}
+      />,
+    );
+
+    const row = screen.getByText("gpt-5.6-reasoning-only").closest("tr");
+
+    expect(row).not.toBeNull();
+    expect(within(row as HTMLElement).queryByText("~200ms")).not.toBeInTheDocument();
+    expect(within(row as HTMLElement).queryByText("250.0")).not.toBeInTheDocument();
+  });
+
   it("renders empty state", () => {
     render(<RecentRequestsTable {...PAGINATION_PROPS} total={0} accounts={[]} requests={[]} />);
     expect(screen.getByText("No request logs match the current filters.")).toBeInTheDocument();

@@ -167,6 +167,9 @@ function firstTokenDisplay(request: RequestLog): { text: string; approximate: bo
   if (exact != null) {
     return { text: exact, approximate: false };
   }
+  if (request.outputTokensRaw == null || request.outputTokensRaw <= 0) {
+    return null;
+  }
   const fallback = formatCompactElapsed(generationAnchorMs(request));
   return fallback == null ? null : { text: fallback, approximate: true };
 }

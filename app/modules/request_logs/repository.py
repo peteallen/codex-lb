@@ -597,8 +597,10 @@ class RequestLogsRepository:
         # Folded history comes from the hourly rollups; only the un-folded
         # complement scans raw request_logs. Every display bucket the
         # dashboard uses (3600/21600/86400) is a whole multiple of the rollup
-        # hour, so a folded bucket is never split across the merge; any other
-        # granularity degrades to the full raw scan.
+        # hour. The display origin must also align to a UTC hour: local-day
+        # origins in zones such as Asia/Kathmandu split a folded UTC-hour row,
+        # which cannot be assigned exactly. Any unsupported granularity or
+        # origin therefore degrades to the full raw scan.
         merged: dict[tuple[int, str, str | None], list[float]] = {}
 
         def _add(key: tuple[int, str, str | None], values: tuple[int, int, int, int, int, int, float]) -> None:
@@ -607,7 +609,11 @@ class RequestLogsRepository:
                 entry[index] += value
 
         raw_windows: list[RawWindow] = [(since, until)]
-        if bucket_seconds > 0 and bucket_seconds % HOURLY_BUCKET_SECONDS == 0:
+        if (
+            bucket_seconds > 0
+            and bucket_seconds % HOURLY_BUCKET_SECONDS == 0
+            and bucket_origin_epoch % HOURLY_BUCKET_SECONDS == 0
+        ):
             rollup_rows, raw_windows = await read_hourly_window(
                 self._session,
                 since,

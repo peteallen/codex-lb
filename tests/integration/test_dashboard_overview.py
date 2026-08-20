@@ -12,6 +12,7 @@ from app.db.models import Account, AccountStatus, RequestLog
 from app.db.session import SessionLocal
 from app.modules.accounts.repository import AccountsRepository
 from app.modules.accounts.schemas import AccountSummary
+from app.modules.accounts.usage_time_rollup import run_hourly_fold_pass
 from app.modules.dashboard.weekly_pace import _weekly_timing
 from app.modules.request_logs.repository import RequestLogsRepository
 from app.modules.usage.repository import UsageRepository
@@ -1294,6 +1295,10 @@ async def test_dashboard_custom_range_separates_non_hour_offset_local_days(
             conversation_id="conv-kathmandu-after",
             requested_at=datetime(2026, 6, 1, 18, 20, 0),
         )
+
+    # Both rows share one folded UTC-hour row even though the local midnight
+    # between them requires separate Dashboard days.
+    await run_hourly_fold_pass(now=datetime(2026, 6, 3, 12, 0, 0))
 
     response = await async_client.get(
         "/api/dashboard/overview",
