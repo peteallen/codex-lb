@@ -1058,7 +1058,10 @@ async def _websocket_has_active_drain_work(
     *,
     pending_lock: anyio.Lock,
     upstream_control: _WebSocketUpstreamControl | None,
+    http_fallback_tasks: Mapping[asyncio.Task[None], _WebSocketRequestState] | None = None,
 ) -> bool:
+    if http_fallback_tasks is not None and any(not task.done() for task in http_fallback_tasks):
+        return True
     if upstream_control is not None and upstream_control.replay_request_state is not None:
         return True
     terminal_task = upstream_control.terminal_message_task if upstream_control is not None else None
@@ -1510,12 +1513,14 @@ class _WebSocketMixin:
                         pending_requests,
                         pending_lock=pending_lock,
                         upstream_control=upstream_control,
+                        http_fallback_tasks=http_fallback_tasks,
                     ):
                         async with client_send_lock:
                             if not await _websocket_has_active_drain_work(
                                 pending_requests,
                                 pending_lock=pending_lock,
                                 upstream_control=upstream_control,
+                                http_fallback_tasks=http_fallback_tasks,
                             ):
                                 try:
                                     await websocket.close(code=1012, reason="Server is draining")
@@ -2095,6 +2100,7 @@ class _WebSocketMixin:
                     # so relay exactly this turn over upstream HTTP. It stays out
                     # of pending_requests: nothing about it belongs to the shared
                     # upstream websocket's correlation state.
+                    fallback_task: asyncio.Task[None] | None = None
                     try:
                         request_state.upstream_transport = _REQUEST_TRANSPORT_HTTP
                         proxy._start_request_state_api_key_reservation_heartbeat(
@@ -2128,6 +2134,15 @@ class _WebSocketMixin:
                         http_fallback_tasks[fallback_task] = request_state
                         fallback_task.add_done_callback(retire_http_fallback_task)
                         await fallback_started.wait()
+                    except asyncio.CancelledError:
+                        # Before the relay task is registered it cannot own the
+                        # reservation.  Release setup state here; once it is
+                        # registered, scope finalization owns cancellation and
+                        # cleanup so the reservation is released only once.
+                        if fallback_task is None:
+                            await proxy._release_websocket_request_state_reservation(request_state)
+                            await _release_websocket_response_create_gate(request_state, response_create_gate)
+                        raise
                     except ProxyResponseError as exc:
                         error = _parse_openai_error(exc.payload)
                         error_code = (
@@ -2889,6 +2904,7 @@ class _WebSocketMixin:
                     upstream_stream_transport_override=_REQUEST_TRANSPORT_HTTP,
                     client_ip=client_ip,
                     enforce_openai_sdk_contract=not codex_session_affinity,
+                    require_security_work_authorized=request_state.require_security_work_authorized,
                     resolved_previous_response_owner_account_id=(
                         request_state.preferred_account_id if request_state.previous_response_id is not None else None
                     ),
@@ -2934,6 +2950,25 @@ class _WebSocketMixin:
 
                     if event_type == "response.created":
                         request_state.response_id = response_id
+                        if request_state.durable_capability_lineage_required and response_id is not None:
+                            capability_api_key = request_state.api_key
+                            try:
+                                if capability_api_key is None:
+                                    raise _capability_lineage_unavailable_error()
+                                await proxy._capability_router.route(
+                                    RoutingIntent.requiring(RoutingCapability.TRUSTED_CYBER),
+                                    api_key_id=capability_api_key.id,
+                                    aliases=capability_lineage_aliases(
+                                        {},
+                                        previous_response_ids=_websocket_continuity_response_ids(
+                                            request_state,
+                                            response_id,
+                                        ),
+                                    ),
+                                )
+                            except ProxyResponseError as exc:
+                                request_state.response_id = None
+                                raise _CapabilityLineagePropagationError(exc) from exc
                         request_state.awaiting_response_created = False
                         if continuity_state is not None:
                             _record_websocket_responses_lite_acceptance(
