@@ -61,6 +61,7 @@ from app.core.clients.proxy_websocket import (
     filter_inbound_websocket_headers,
 )
 from app.core.errors import (
+    PREVIOUS_RESPONSE_STALE_CODE,
     OpenAIErrorEnvelope,
     openai_error,
     response_failed_event,
@@ -374,7 +375,9 @@ from app.modules.proxy._service.warmup import (
 from app.modules.proxy._service.websocket.helpers import (
     _app_error_to_websocket_event,
     _assign_websocket_response_id,
+    _clear_websocket_continuity_completion_if_matches,
     _find_websocket_request_state_by_response_id,
+    _invalidate_rejected_proxy_websocket_continuity_anchor,
     _is_websocket_response_create,
     _match_websocket_request_state_for_anonymous_event,
     _matching_websocket_request_states_for_missing_tool_output_error,
@@ -390,6 +393,7 @@ from app.modules.proxy._service.websocket.helpers import (
     _record_websocket_responses_lite_acceptance,
     _record_websocket_stale_anchor_failure,
     _release_websocket_response_create_gate,
+    _revalidate_websocket_proxy_anchor_before_send,
     _rewrite_websocket_continuity_corruption_event,
     _rewrite_websocket_downstream_response_id,
     _rewrite_websocket_previous_response_owner_unavailable_event,
@@ -466,6 +470,7 @@ from app.modules.proxy.tool_call_dedupe import (
 from app.modules.proxy.tool_call_dedupe import (
     response_id_from_payload as tool_call_response_id_from_payload,
 )
+from app.modules.request_logs.repository import PreviousResponseOwnerRecord
 
 
 def _facade() -> Any:
@@ -696,44 +701,54 @@ def _websocket_response_create_http_fallback_payload(
     text_data: str,
     *,
     allow_anchored_tool_output_fallback: bool,
+    require_http_continuation: bool = False,
 ) -> ResponsesRequest | None:
-    """Return an anchored current tool-output body when the WS frame cannot fit.
+    """Return a complete HTTP body when the websocket frame cannot fit.
 
     The upstream websocket rejects a ``response.create`` above its byte budget,
-    which strands a legitimate turn whose only oversized part is the *current*
-    tool output -- there is no historical context left to slim. Upstream HTTP has
-    no such frame budget, so exactly this shape is eligible to be relayed over
-    HTTP for one turn:
+    while upstream HTTP has no such frame budget. Two shapes are safe to relay
+    over HTTP for one turn before any websocket dispatch:
 
-    * a client-supplied ``previous_response_id`` (so the conversation state lives
-      upstream and the body is a pure delta), and
-    * an input list containing only current tool outputs.
+    * a continuation of the response this session just created over HTTP;
+    * a complete resend with no ``previous_response_id``; and
+    * a client-anchored delta whose input contains only current tool outputs.
 
-    A proxy-injected anchor is excluded by the caller: its body was rewritten
-    against a durable anchor the client never sent, so it is not a delta the
-    client could reproduce. Returning ``None`` keeps the ordinary oversized
-    rejection.
+    A proxy-injected anchor is excluded from the second shape by the caller: its
+    body was rewritten against a durable anchor the client never sent, so it is
+    not a delta the client could reproduce. Returning ``None`` keeps the ordinary
+    oversized rejection.
     """
-    if not allow_anchored_tool_output_fallback:
-        return None
     raw_payload = json.loads(text_data)
     if not isinstance(raw_payload, dict):
         return None
     previous_response_id = raw_payload.get("previous_response_id")
+    known_http_continuation = (
+        require_http_continuation and isinstance(previous_response_id, str) and bool(previous_response_id.strip())
+    )
+    conversation = raw_payload.get("conversation")
     input_value = raw_payload.get("input")
-    if not isinstance(previous_response_id, str) or not previous_response_id.strip():
+    unanchored_full_resend = (
+        previous_response_id is None
+        and not (isinstance(conversation, str) and bool(conversation.strip()))
+        and isinstance(input_value, list)
+        and bool(input_value)
+    )
+    anchored_current_tool_output = (
+        allow_anchored_tool_output_fallback
+        and isinstance(previous_response_id, str)
+        and bool(previous_response_id.strip())
+        and isinstance(input_value, list)
+        and bool(input_value)
+        and all(isinstance(item, dict) and item.get("type") in _HTTP_FALLBACK_TOOL_OUTPUT_TYPES for item in input_value)
+    )
+    if not known_http_continuation and not unanchored_full_resend and not anchored_current_tool_output:
         return None
-    if not isinstance(input_value, list) or not input_value:
-        return None
-    if any(
-        not isinstance(item, dict) or item.get("type") not in _HTTP_FALLBACK_TOOL_OUTPUT_TYPES for item in input_value
-    ):
-        return None
-    projected_payload = cast(dict[str, JsonValue], dict(raw_payload))
-    apply_codex_installation_metadata(projected_payload, _PROJECTED_CODEX_INSTALLATION_ID)
-    projected_text = json.dumps(projected_payload, ensure_ascii=True, separators=(",", ":"))
-    if len(projected_text.encode("utf-8")) <= int(_facade()._UPSTREAM_RESPONSE_CREATE_MAX_BYTES):
-        return None
+    if not known_http_continuation:
+        projected_payload = cast(dict[str, JsonValue], dict(raw_payload))
+        apply_codex_installation_metadata(projected_payload, _PROJECTED_CODEX_INSTALLATION_ID)
+        projected_text = json.dumps(projected_payload, ensure_ascii=True, separators=(",", ":"))
+        if len(projected_text.encode("utf-8")) <= int(_facade()._UPSTREAM_RESPONSE_CREATE_MAX_BYTES):
+            return None
 
     http_payload = cast(dict[str, JsonValue], dict(raw_payload))
     http_payload.pop("type", None)
@@ -837,6 +852,23 @@ class _WebSocketMixin:
         downstream_activity = _DownstreamWebSocketActivity()
         replay_request_state: _WebSocketRequestState | None = None
         http_fallback_tasks: dict[asyncio.Task[None], _WebSocketRequestState] = {}
+
+        def retire_http_fallback_task(task: asyncio.Task[None]) -> None:
+            completed_state = http_fallback_tasks.pop(task, None)
+            try:
+                task.result()
+            except asyncio.CancelledError:
+                return
+            except Exception as exc:
+                _facade().logger.error(
+                    "WebSocket HTTP fallback task failed request_id=%s",
+                    (
+                        completed_state.request_log_id or completed_state.request_id
+                        if completed_state is not None
+                        else None
+                    ),
+                    exc_info=(type(exc), exc, exc.__traceback__),
+                )
 
         async def release_current_account_lease() -> None:
             nonlocal account_lease
@@ -999,13 +1031,28 @@ class _WebSocketMixin:
                     if text_data is not None:
                         payload = _parse_websocket_payload(text_data)
                         if payload is not None and payload.get("type") == "response.cancel":
-                            active_fallback_tasks = [task for task in http_fallback_tasks if not task.done()]
-                            if active_fallback_tasks:
+                            active_fallback_entries = [
+                                (task, state) for task, state in http_fallback_tasks.items() if not task.done()
+                            ]
+                            latest_fallback: tuple[asyncio.Task[None], _WebSocketRequestState] | None = (
+                                max(active_fallback_entries, key=lambda entry: entry[1].started_at)
+                                if active_fallback_entries
+                                else None
+                            )
+                            async with pending_lock:
+                                latest_websocket_started_at = max(
+                                    (state.started_at for state in pending_requests),
+                                    default=None,
+                                )
+                            if latest_fallback is not None and (
+                                latest_websocket_started_at is None
+                                or latest_fallback[1].started_at >= latest_websocket_started_at
+                            ):
                                 # The cancelled turn is streaming over HTTP, not
                                 # over this websocket, so there is no upstream
                                 # frame to forward the cancel to.
                                 await _facade()._await_cancelled_task(
-                                    active_fallback_tasks[-1],
+                                    latest_fallback[0],
                                     label="websocket HTTP fallback relay",
                                 )
                                 continue
@@ -1191,12 +1238,51 @@ class _WebSocketMixin:
                             ("turn state", turn_state_owner_account_id),
                             ("previous response", previous_response_owner_account_id),
                         )
+                        if (
+                            request_state.previous_response_id is not None
+                            and not request_state.proxy_injected_previous_response_id
+                            and http_fallback_payload is None
+                            and text_data is not None
+                        ):
+                            # Preparation cannot reject or dispatch a client-
+                            # anchored frame until the exact response record has
+                            # supplied its upstream transport. HTTP-created
+                            # response IDs are not valid WebSocket continuity,
+                            # including when this continuation is below the
+                            # WebSocket frame limit or survives a process restart.
+                            http_fallback_payload = _websocket_response_create_http_fallback_payload(
+                                text_data,
+                                allow_anchored_tool_output_fallback=True,
+                                require_http_continuation=(
+                                    request_state.previous_response_owner_upstream_transport == _REQUEST_TRANSPORT_HTTP
+                                ),
+                            )
+                            if http_fallback_payload is None:
+                                _facade()._enforce_response_create_size_limit(request_state)
                     except ProxyResponseError as exc:
                         error = _parse_openai_error(exc.payload)
                         error_code = _normalize_error_code(
                             error.code if error else None,
                             error.type if error else None,
                         )
+                        if error_code == "payload_too_large":
+                            # Client-anchored requests defer their size verdict
+                            # until exact transport provenance is resolved. Keep
+                            # that deferred rejection byte-for-byte compatible
+                            # with the preparation-time status-400 WebSocket
+                            # error contract rather than turning it into a
+                            # response.failed terminal event.
+                            await proxy._release_websocket_request_state_reservation(request_state)
+                            async with client_send_lock:
+                                await websocket.send_text(
+                                    _serialize_websocket_error_event(
+                                        _wrapped_websocket_error_event(exc.status_code, exc.payload)
+                                    )
+                                )
+                            request_state = None
+                            text_data = None
+                            payload = None
+                            continue
                         error_message = error.message if error and error.message else "Upstream error"
                         error_type = error.type if error and error.type else "server_error"
                         error_param = error.param if error else None
@@ -1223,14 +1309,33 @@ class _WebSocketMixin:
                         payload = None
                         continue
 
-                if request_state is not None and await _websocket_full_resend_conflicts_with_visible_pending(
-                    request_state,
-                    pending_requests,
-                    pending_lock=pending_lock,
-                    codex_session_affinity=codex_session_affinity,
+                active_http_fallback_conflict = bool(
+                    request_state is not None
+                    and codex_session_affinity
+                    # Classify the client frame, not the prepared request.
+                    # Preparation may have injected an older websocket
+                    # continuity anchor into an otherwise unanchored resend;
+                    # that rewrite must not let the resend overtake an active
+                    # HTTP fallback for the same Codex session.
+                    and isinstance(payload, dict)
+                    and payload.get("previous_response_id") is None
+                    and not (
+                        isinstance(payload.get("conversation"), str)
+                        and bool(cast(str, payload["conversation"]).strip())
+                    )
+                    and any(not task.done() for task in tuple(http_fallback_tasks))
+                )
+                if request_state is not None and (
+                    active_http_fallback_conflict
+                    or await _websocket_full_resend_conflicts_with_visible_pending(
+                        request_state,
+                        pending_requests,
+                        pending_lock=pending_lock,
+                        codex_session_affinity=codex_session_affinity,
+                    )
                 ):
                     _facade().logger.warning(
-                        "Rejecting websocket full resend while prior response is visible request_id=%s input_items=%s",
+                        "Rejecting websocket full resend while prior response is active request_id=%s input_items=%s",
                         request_state.request_log_id or request_state.request_id,
                         request_state.input_item_count,
                     )
@@ -1288,9 +1393,10 @@ class _WebSocketMixin:
 
                 if request_state is not None and http_fallback_payload is not None:
                     # This turn is too large for the upstream websocket frame
-                    # budget but is a self-contained anchored tool-output delta,
-                    # so relay exactly this turn over upstream HTTP. It stays out
-                    # of pending_requests: nothing about it belongs to the shared
+                    # budget but is either a complete unanchored resend or a
+                    # self-contained anchored tool-output delta, so relay exactly
+                    # this turn over upstream HTTP. It stays out of
+                    # pending_requests: nothing about it belongs to the shared
                     # upstream websocket's correlation state.
                     try:
                         request_state.upstream_transport = _REQUEST_TRANSPORT_HTTP
@@ -1318,11 +1424,12 @@ class _WebSocketMixin:
                                 codex_session_affinity=codex_session_affinity,
                                 openai_cache_affinity=openai_cache_affinity,
                                 client_ip=client_ip,
+                                synthesized_turn_state=synthesized_turn_state,
                                 started=fallback_started,
                             )
                         )
                         http_fallback_tasks[fallback_task] = request_state
-                        fallback_task.add_done_callback(http_fallback_tasks.pop)
+                        fallback_task.add_done_callback(retire_http_fallback_task)
                         await fallback_started.wait()
                     except ProxyResponseError as exc:
                         error = _parse_openai_error(exc.payload)
@@ -1601,6 +1708,11 @@ class _WebSocketMixin:
                         and account is not None
                         and _is_websocket_response_create(payload)
                     ):
+                        text_data = _revalidate_websocket_proxy_anchor_before_send(
+                            request_state,
+                            continuity_state,
+                            text_data=text_data,
+                        )
                         text_data = _websocket_text_with_account_installation_id(text_data, account)
                         if request_state.fresh_upstream_request_text is not None:
                             fresh_upstream_request_text = _websocket_text_with_account_installation_id(
@@ -1753,45 +1865,90 @@ class _WebSocketMixin:
                     account = None
                     continue
         finally:
+            active_exception = sys.exception()
+            cleanup_error: BaseException | None = None
+
+            async def run_cleanup_step(label: str, awaitable: Any) -> None:
+                nonlocal cleanup_error
+                with anyio.CancelScope(shield=True):
+                    try:
+                        await awaitable
+                    except BaseException as exc:
+                        if cleanup_error is None:
+                            cleanup_error = exc
+                        _facade().logger.error(
+                            "WebSocket cleanup step failed label=%s",
+                            label,
+                            exc_info=(type(exc), exc, exc.__traceback__),
+                        )
+
             for fallback_task, fallback_request_state in list(http_fallback_tasks.items()):
-                await _facade()._await_cancelled_task(
-                    fallback_task,
-                    label="websocket HTTP fallback relay",
+                await run_cleanup_step(
+                    "HTTP fallback task",
+                    _facade()._await_cancelled_task(
+                        fallback_task,
+                        label="websocket HTTP fallback relay",
+                    ),
                 )
-                await proxy._release_websocket_request_state_reservation(fallback_request_state)
-                await _release_websocket_response_create_gate(fallback_request_state, response_create_gate)
+                await run_cleanup_step(
+                    "HTTP fallback reservation",
+                    proxy._release_websocket_request_state_reservation(fallback_request_state),
+                )
+                await run_cleanup_step(
+                    "HTTP fallback response-create gate",
+                    _release_websocket_response_create_gate(fallback_request_state, response_create_gate),
+                )
             if upstream_reader is not None:
-                await _facade()._await_cancelled_task(upstream_reader, label="proxy websocket upstream reader")
+                await run_cleanup_step(
+                    "upstream reader",
+                    _facade()._await_cancelled_task(upstream_reader, label="proxy websocket upstream reader"),
+                )
             if upstream is not None:
-                try:
-                    await upstream.close()
-                except Exception:
-                    _facade().logger.debug("Failed to close upstream websocket", exc_info=True)
-            await release_current_account_lease()
+                upstream_to_close = upstream
+
+                async def close_upstream_websocket() -> None:
+                    try:
+                        await upstream_to_close.close()
+                    except Exception:
+                        _facade().logger.debug("Failed to close upstream websocket", exc_info=True)
+
+                await run_cleanup_step("upstream websocket", close_upstream_websocket())
+            await run_cleanup_step("stream account lease", release_current_account_lease())
             if replay_request_state is not None:
-                await proxy._release_websocket_request_state_reservation(replay_request_state)
+                await run_cleanup_step(
+                    "replay reservation",
+                    proxy._release_websocket_request_state_reservation(replay_request_state),
+                )
                 replay_request_state.api_key_reservation = None
-                await _release_websocket_response_create_gate(replay_request_state, response_create_gate)
+                await run_cleanup_step(
+                    "replay response-create gate",
+                    _release_websocket_response_create_gate(replay_request_state, response_create_gate),
+                )
             client_disconnected = downstream_activity.disconnected
-            await proxy._fail_pending_websocket_requests(
-                account=None if client_disconnected else account,
-                account_id_value=account.id if account else None,
-                pending_requests=pending_requests,
-                pending_lock=pending_lock,
-                error_code="client_disconnected" if client_disconnected else "stream_incomplete",
-                error_message=(
-                    "Downstream websocket disconnected before response.completed"
-                    if client_disconnected
-                    else "Upstream websocket closed before response.completed"
+            await run_cleanup_step(
+                "pending requests",
+                proxy._fail_pending_websocket_requests(
+                    account=None if client_disconnected else account,
+                    account_id_value=account.id if account else None,
+                    pending_requests=pending_requests,
+                    pending_lock=pending_lock,
+                    error_code="client_disconnected" if client_disconnected else "stream_incomplete",
+                    error_message=(
+                        "Downstream websocket disconnected before response.completed"
+                        if client_disconnected
+                        else "Upstream websocket closed before response.completed"
+                    ),
+                    api_key=api_key,
+                    websocket=None if client_disconnected else websocket,
+                    client_send_lock=None if client_disconnected else client_send_lock,
+                    response_create_gate=response_create_gate,
+                    downstream_activity=downstream_activity,
+                    status="cancelled" if client_disconnected else "error",
+                    penalize_account=not client_disconnected,
                 ),
-                api_key=api_key,
-                websocket=None if client_disconnected else websocket,
-                client_send_lock=None if client_disconnected else client_send_lock,
-                response_create_gate=response_create_gate,
-                downstream_activity=downstream_activity,
-                status="cancelled" if client_disconnected else "error",
-                penalize_account=not client_disconnected,
             )
+            if cleanup_error is not None and active_exception is None:
+                raise cleanup_error
 
     async def _relay_websocket_response_create_over_http(
         self,
@@ -1807,21 +1964,25 @@ class _WebSocketMixin:
         codex_session_affinity: bool,
         openai_cache_affinity: bool,
         client_ip: str | None,
+        synthesized_turn_state: str | None,
         started: asyncio.Event,
     ) -> None:
         """Relay one oversized downstream WebSocket turn through HTTP/SSE.
 
         The turn keeps its websocket identity downstream (same socket, same event
-        shapes, same terminal frame) while its upstream leg is HTTP. Owner and
+        shapes, same terminal frame) while its upstream leg is HTTP. Any owner and
         session context resolved on the websocket path is handed to the HTTP
-        streamer rather than re-derived from headers, so the continuation stays on
-        its owner account and its request log stays attached to its conversation.
+        streamer rather than re-derived from headers, so an anchored continuation
+        stays on its owner account and every request log stays attached to its
+        conversation.
         """
         proxy = cast(_WebSocketServiceProtocol, self)
         http_headers = filter_inbound_websocket_headers(dict(headers))
-        started.set()
         reservation = request_state.api_key_reservation
+        proxy._cancel_request_state_api_key_reservation_heartbeat(request_state)
         request_state.api_key_reservation = None
+        reservation_settlement_started = asyncio.Event()
+        started.set()
         terminal_seen = False
         terminal_payload: dict[str, JsonValue] | None = None
         try:
@@ -1839,10 +2000,17 @@ class _WebSocketMixin:
                     upstream_stream_transport_override=_REQUEST_TRANSPORT_HTTP,
                     client_ip=client_ip,
                     enforce_openai_sdk_contract=not codex_session_affinity,
-                    resolved_previous_response_owner_account_id=request_state.preferred_account_id,
+                    resolved_previous_response_owner_account_id=(
+                        request_state.preferred_account_id if request_state.previous_response_id is not None else None
+                    ),
                     previous_response_owner_resolved=True,
+                    rewritten_file_account_id=(
+                        request_state.preferred_account_id if request_state.file_required_preferred_account else None
+                    ),
                     request_session_id=request_state.session_id,
                     request_session_id_resolved=True,
+                    synthesized_turn_state=synthesized_turn_state,
+                    api_key_reservation_settlement_started=reservation_settlement_started,
                 ):
                     event_payload = parse_sse_data_json(event_block)
                     if event_payload is None:
@@ -1874,6 +2042,14 @@ class _WebSocketMixin:
                     event = parse_sse_event(format_sse_event(event_payload))
                     event_type = _event_type_from_payload(event, event_payload)
                     response_id = _websocket_response_id(event, event_payload)
+                    if (
+                        _websocket_event_error_code(event_type, event_payload) == PREVIOUS_RESPONSE_STALE_CODE
+                        and request_state.previous_response_id is not None
+                    ):
+                        _clear_websocket_continuity_completion_if_matches(
+                            continuity_state,
+                            response_id=request_state.previous_response_id,
+                        )
 
                     if event_type == "response.created":
                         request_state.response_id = response_id
@@ -1987,7 +2163,16 @@ class _WebSocketMixin:
             )
             terminal_seen = True
         finally:
-            await _release_websocket_response_create_gate(request_state, response_create_gate)
+            # The stream owns settlement only after its routing preflight. If it
+            # is cancelled or raises before reaching that guard, ownership stays
+            # here and this relay must release the reservation. Once transferred,
+            # a detached usage finalizer may still be running, so do not race it
+            # with an unconditional release.
+            try:
+                if not reservation_settlement_started.is_set():
+                    await proxy._release_websocket_reservation(reservation)
+            finally:
+                await _release_websocket_response_create_gate(request_state, response_create_gate)
             if not terminal_seen and not downstream_activity.disconnected:
                 _facade().logger.info(
                     "WebSocket HTTP fallback ended without terminal event request_id=%s",
@@ -2011,6 +2196,7 @@ class _WebSocketMixin:
         conversation_id: str | None = None,
         client_ip: str | None = None,
         synthesized_turn_state: str | None = None,
+        _continuity_reprepare_attempted: bool = False,
     ) -> _PreparedWebSocketRequest:
         proxy = cast(_WebSocketServiceProtocol, self)
         _ = proxy
@@ -2027,6 +2213,12 @@ class _WebSocketMixin:
         apply_enforced_service_tier_model_fallback(
             responses_payload,
             service_tier_was_enforced=service_tier_was_enforced,
+        )
+        client_continues_http_completion = bool(
+            continuity_state is not None
+            and continuity_state.last_completed_upstream_transport == _REQUEST_TRANSPORT_HTTP
+            and responses_payload.previous_response_id is not None
+            and responses_payload.previous_response_id == continuity_state.last_completed_response_id
         )
         normalized_payload = responses_payload.to_payload()
         body_uses_responses_lite = _payload_uses_responses_lite(normalized_payload)
@@ -2278,14 +2470,21 @@ class _WebSocketMixin:
         request_state.affinity_policy = affinity_policy
 
         # Decide the oversized-turn disposition once the wire text is final. A
-        # proxy-injected anchor is never eligible: its body was rewritten against
-        # a durable anchor the client never sent.
+        # complete unanchored resend can move to HTTP without losing continuity.
+        # A proxy-injected anchor is never eligible: its body was rewritten
+        # against a durable anchor the client never sent.
         try:
             http_fallback_payload = _websocket_response_create_http_fallback_payload(
                 text_data,
                 allow_anchored_tool_output_fallback=not request_state.proxy_injected_previous_response_id,
+                require_http_continuation=client_continues_http_completion,
             )
-            if http_fallback_payload is None:
+            defer_client_anchor_transport_resolution = bool(
+                request_state.previous_response_id is not None
+                and not request_state.proxy_injected_previous_response_id
+                and not client_continues_http_completion
+            )
+            if http_fallback_payload is None and not defer_client_anchor_transport_resolution:
                 _facade()._enforce_response_create_size_limit(request_state)
         except ProxyResponseError:
             # The size check moved after request-state construction, so it now
@@ -2326,6 +2525,36 @@ class _WebSocketMixin:
             request_state.fresh_upstream_request_text = text_data
             request_state.fresh_upstream_request_is_retry_safe = True
             request_state.fresh_upstream_request_responses_lite_model = next_responses_lite_model
+
+        if session_anchor is not None and (
+            continuity_state is None
+            or continuity_state.last_completed_response_id != session_anchor.previous_response_id
+            or continuity_state.last_completed_upstream_transport != _REQUEST_TRANSPORT_WEBSOCKET
+        ):
+            # File-owner lookup and API-key reservation both yield after the
+            # continuity slot is sampled. A concurrent stale-anchor failure can
+            # invalidate that slot while this request is being prepared. Never
+            # return the now-rejected proxy-injected anchor. Re-prepare once
+            # against the latest slot; if it changes again, preserve the
+            # client's original unanchored full resend without optimization.
+            await proxy._release_websocket_reservation(reservation)
+            return await proxy._prepare_websocket_response_create_request(
+                payload,
+                headers=headers,
+                codex_session_affinity=codex_session_affinity,
+                openai_cache_affinity=openai_cache_affinity,
+                sticky_threads_enabled=sticky_threads_enabled,
+                openai_cache_affinity_max_age_seconds=openai_cache_affinity_max_age_seconds,
+                api_key=api_key,
+                prohibit_fast_mode=prohibit_fast_mode,
+                continuity_state=None if _continuity_reprepare_attempted else continuity_state,
+                useragent=useragent,
+                useragent_group=useragent_group,
+                conversation_id=conversation_id,
+                client_ip=client_ip,
+                synthesized_turn_state=synthesized_turn_state,
+                _continuity_reprepare_attempted=True,
+            )
 
         return _PreparedWebSocketRequest(
             text_data=text_data,
@@ -3395,6 +3624,9 @@ class _WebSocketMixin:
         api_key_id: str | None,
         account_id: str | None,
         session_id: str | None = None,
+        requested_at: datetime | None = None,
+        owner_session_id: str | None = None,
+        upstream_transport: str | None = None,
     ) -> None:
         proxy = cast(_WebSocketServiceProtocol, self)
         _ = proxy
@@ -3410,9 +3642,21 @@ class _WebSocketMixin:
         normalized_session_id = _facade()._normalize_session_id(session_id)
         if normalized_session_id is not None:
             cache_keys.append((response_id, api_key_id, normalized_session_id))
+        normalized_owner_session_id = _facade()._normalize_session_id(owner_session_id)
+        normalized_upstream_transport = (
+            upstream_transport.strip().lower()
+            if isinstance(upstream_transport, str) and upstream_transport.strip()
+            else None
+        )
+        cache_entry = PreviousResponseOwnerRecord(
+            account_id=account_id_value,
+            requested_at=requested_at,
+            session_id=normalized_owner_session_id,
+            upstream_transport=normalized_upstream_transport,
+        )
         for cache_key in cache_keys:
             proxy._websocket_previous_response_account_index.pop(cache_key, None)
-            proxy._websocket_previous_response_account_index[cache_key] = account_id_value
+            proxy._websocket_previous_response_account_index[cache_key] = cache_entry
         while (
             len(proxy._websocket_previous_response_account_index)
             > _facade()._WEBSOCKET_PREVIOUS_RESPONSE_ACCOUNT_CACHE_LIMIT
@@ -3452,6 +3696,7 @@ class _WebSocketMixin:
             outcome: str,
             requested_at: datetime | None = None,
             owner_session_id: str | None = None,
+            upstream_transport: str | None = None,
         ) -> None:
             if request_state is None:
                 return
@@ -3459,6 +3704,7 @@ class _WebSocketMixin:
             request_state.previous_response_owner_lookup_outcome = outcome
             request_state.previous_response_owner_requested_at = requested_at
             request_state.previous_response_owner_session_id = owner_session_id
+            request_state.previous_response_owner_upstream_transport = upstream_transport
 
         if previous_response_id is None:
             return None
@@ -3468,9 +3714,15 @@ class _WebSocketMixin:
         api_key_id = api_key.id if api_key is not None else None
         session_id_value = _facade()._normalize_session_id(session_id)
         cache_key = (response_id, api_key_id, session_id_value)
-        cached_account_id = proxy._websocket_previous_response_account_index.get(cache_key)
-        if cached_account_id is not None:
-            _record_lookup_metadata(source="request_cache", outcome="hit")
+        cached_owner = proxy._websocket_previous_response_account_index.get(cache_key)
+        if cached_owner is not None:
+            _record_lookup_metadata(
+                source="request_cache",
+                outcome="hit",
+                requested_at=cached_owner.requested_at,
+                owner_session_id=cached_owner.session_id,
+                upstream_transport=cached_owner.upstream_transport,
+            )
             _record_continuity_owner_resolution(
                 surface=surface,
                 source="request_cache",
@@ -3478,8 +3730,8 @@ class _WebSocketMixin:
                 previous_response_id=response_id,
                 session_id=session_id_value,
             )
-            return cached_account_id
-        fallback_account_id = (
+            return cached_owner.account_id
+        fallback_owner = (
             proxy._websocket_previous_response_account_index.get((response_id, api_key_id, None))
             if session_id_value is not None
             else None
@@ -3492,8 +3744,14 @@ class _WebSocketMixin:
                     session_id=session_id_value,
                 )
         except Exception as exc:
-            if fallback_account_id is not None:
-                _record_lookup_metadata(source="request_cache_fallback", outcome="hit")
+            if fallback_owner is not None:
+                _record_lookup_metadata(
+                    source="request_cache_fallback",
+                    outcome="hit",
+                    requested_at=fallback_owner.requested_at,
+                    owner_session_id=fallback_owner.session_id,
+                    upstream_transport=fallback_owner.upstream_transport,
+                )
                 _record_continuity_owner_resolution(
                     surface=surface,
                     source="request_cache_fallback",
@@ -3505,7 +3763,7 @@ class _WebSocketMixin:
                     "Previous response owner lookup failed; using cached owner pin",
                     exc_info=True,
                 )
-                return fallback_account_id
+                return fallback_owner.account_id
             _record_lookup_metadata(source="request_logs", outcome="fail_closed")
             _record_continuity_owner_resolution(
                 surface=surface,
@@ -3526,8 +3784,14 @@ class _WebSocketMixin:
                 _facade()._previous_response_owner_lookup_failed_error_envelope(),
             ) from exc
         if owner_record is None:
-            if fallback_account_id is not None:
-                _record_lookup_metadata(source="request_cache_fallback", outcome="hit")
+            if fallback_owner is not None:
+                _record_lookup_metadata(
+                    source="request_cache_fallback",
+                    outcome="hit",
+                    requested_at=fallback_owner.requested_at,
+                    owner_session_id=fallback_owner.session_id,
+                    upstream_transport=fallback_owner.upstream_transport,
+                )
                 _record_continuity_owner_resolution(
                     surface=surface,
                     source="request_cache_fallback",
@@ -3544,18 +3808,22 @@ class _WebSocketMixin:
                     previous_response_id=response_id,
                     session_id=session_id_value,
                 )
-            return fallback_account_id
+            return fallback_owner.account_id if fallback_owner is not None else None
         proxy._remember_websocket_previous_response_owner(
             previous_response_id=response_id,
             api_key_id=api_key_id,
             account_id=owner_record.account_id,
             session_id=session_id_value,
+            requested_at=owner_record.requested_at,
+            owner_session_id=owner_record.session_id,
+            upstream_transport=owner_record.upstream_transport,
         )
         _record_lookup_metadata(
             source="request_logs",
             outcome="hit",
             requested_at=owner_record.requested_at,
             owner_session_id=owner_record.session_id,
+            upstream_transport=owner_record.upstream_transport,
         )
         _record_continuity_owner_resolution(
             surface=surface,
@@ -4179,6 +4447,20 @@ class _WebSocketMixin:
 
         if event_type == "response.created" and release_create_gate and created_request_state is not None:
             await _release_websocket_response_create_gate(created_request_state, response_create_gate)
+
+        if is_previous_response_not_found_event:
+            stale_request_states = (
+                grouped_previous_response_request_states
+                if grouped_previous_response_request_states
+                else [request_state]
+                if request_state is not None
+                else []
+            )
+            for stale_request_state in stale_request_states:
+                _invalidate_rejected_proxy_websocket_continuity_anchor(
+                    continuity_state,
+                    request_state=stale_request_state,
+                )
 
         if len(grouped_previous_response_request_states) > 1:
             upstream_control.reconnect_requested = True
@@ -4821,6 +5103,7 @@ class _WebSocketMixin:
                     api_key_id=api_key.id if api_key is not None else None,
                     account_id=account_id_value,
                     session_id=request_state.session_id,
+                    upstream_transport=request_state.upstream_transport,
                 )
 
         latency_ms = int((time.monotonic() - request_state.started_at) * 1000)

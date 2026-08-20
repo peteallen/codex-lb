@@ -273,6 +273,7 @@ from app.modules.proxy._service.observability import (
 from app.modules.proxy._service.support import (
     _ACCOUNT_MODEL_UNSUPPORTED_ERROR_CODE,
     _HARD_HTTP_BRIDGE_AFFINITY_KINDS,  # noqa: F401
+    _REQUEST_TRANSPORT_WEBSOCKET,
     _WEBSOCKET_FULL_REPLAY_WAIT_MIN_ITEMS,
     _WEBSOCKET_FULL_REPLAY_WAIT_POLL_SECONDS,  # noqa: F401
     _clear_websocket_request_error_overrides,
@@ -420,6 +421,8 @@ def _websocket_continuity_anchor_for_payload(
         return None
     if responses_payload.previous_response_id is not None:
         return None
+    if continuity_state.last_completed_upstream_transport != _REQUEST_TRANSPORT_WEBSOCKET:
+        return None
     previous_response_id = continuity_state.last_completed_response_id
     if previous_response_id is None:
         return None
@@ -503,6 +506,7 @@ def _record_websocket_continuity_completion(
         continuity_state.last_completed_response_id = None
         continuity_state.last_completed_input_count = 0
         continuity_state.last_completed_input_prefix_fingerprint = None
+        continuity_state.last_completed_upstream_transport = None
         continuity_state.last_pending_function_call_ids = []
         continuity_state.last_pending_tool_call_types = {}
         return
@@ -514,6 +518,7 @@ def _record_websocket_continuity_completion(
     # is cleared rather than left stale when the completed turn cannot
     # provide one.
     continuity_state.last_completed_response_id = response_id
+    continuity_state.last_completed_upstream_transport = request_state.upstream_transport
     if request_state.input_item_count > 0 and request_state.input_full_fingerprint is not None:
         continuity_state.last_completed_input_count = request_state.input_item_count
         continuity_state.last_completed_input_prefix_fingerprint = request_state.input_full_fingerprint
@@ -522,6 +527,84 @@ def _record_websocket_continuity_completion(
         continuity_state.last_completed_input_prefix_fingerprint = None
     continuity_state.last_pending_function_call_ids = list(request_state.pending_function_call_ids)
     continuity_state.last_pending_tool_call_types = dict(request_state.pending_tool_call_types)
+
+
+def _clear_websocket_continuity_completion_if_matches(
+    continuity_state: _WebSocketContinuityState | None,
+    *,
+    response_id: str,
+) -> bool:
+    """Clear the current completion only when its response ID still matches."""
+    if continuity_state is None or continuity_state.last_completed_response_id != response_id:
+        return False
+    continuity_state.last_completed_response_id = None
+    continuity_state.last_completed_input_count = 0
+    continuity_state.last_completed_input_prefix_fingerprint = None
+    continuity_state.last_completed_upstream_transport = None
+    continuity_state.last_pending_function_call_ids = []
+    continuity_state.last_pending_tool_call_types = {}
+    if continuity_state.responses_lite_response_id == response_id:
+        continuity_state.responses_lite_response_id = None
+    return True
+
+
+def _invalidate_rejected_proxy_websocket_continuity_anchor(
+    continuity_state: _WebSocketContinuityState | None,
+    *,
+    request_state: _WebSocketRequestState,
+) -> bool:
+    """Compare-and-clear a rejected anchor that the proxy itself injected."""
+    rejected_response_id = request_state.previous_response_id
+    if not request_state.proxy_injected_previous_response_id or rejected_response_id is None:
+        return False
+    return _clear_websocket_continuity_completion_if_matches(
+        continuity_state,
+        response_id=rejected_response_id,
+    )
+
+
+def _revalidate_websocket_proxy_anchor_before_send(
+    request_state: _WebSocketRequestState,
+    continuity_state: _WebSocketContinuityState | None,
+    *,
+    text_data: str,
+) -> str:
+    """Never dispatch a proxy-injected anchor after its continuity slot changed."""
+    if not request_state.proxy_injected_previous_response_id:
+        return text_data
+    previous_response_id = request_state.previous_response_id
+    if (
+        previous_response_id is not None
+        and continuity_state is not None
+        and continuity_state.last_completed_response_id == previous_response_id
+        and continuity_state.last_completed_upstream_transport == _REQUEST_TRANSPORT_WEBSOCKET
+    ):
+        return text_data
+    if request_state.fresh_upstream_request_is_retry_safe and request_state.fresh_upstream_request_text:
+        request_state.request_text = request_state.fresh_upstream_request_text
+        request_state.previous_response_id = None
+        request_state.proxy_injected_previous_response_id = False
+        request_state.fresh_upstream_request_is_retry_safe = False
+        request_state.responses_lite_model = request_state.fresh_upstream_request_responses_lite_model
+        _refresh_websocket_request_input_fingerprint_from_text(request_state)
+        _facade().logger.info(
+            "websocket_proxy_anchor_invalidated_before_send request_id=%s action=fresh_replay",
+            request_state.request_log_id or request_state.request_id,
+        )
+        return request_state.request_text
+    _record_websocket_stale_anchor_failure(
+        request_state,
+        surface="websocket_send",
+        upstream_error_code="previous_response_not_found",
+    )
+    raise ProxyResponseError(
+        502,
+        openai_error(
+            PREVIOUS_RESPONSE_STALE_CODE,
+            PREVIOUS_RESPONSE_STALE_MESSAGE,
+            error_type="server_error",
+        ),
+    )
 
 
 def _record_websocket_responses_lite_acceptance(

@@ -25,10 +25,11 @@ Two adjacent defects surface on the same path:
 
 ## What Changes
 
-- Relay one oversized turn over upstream HTTP when, and only when, it carries a
-  client-supplied `previous_response_id` and its input is entirely current tool
-  outputs, and the projected wire frame really exceeds the websocket budget.
-  Every other oversized turn keeps the existing `payload_too_large` rejection.
+- Relay one oversized anchored turn over upstream HTTP when, and only when, it
+  carries a client-supplied `previous_response_id`, its input is entirely
+  current tool outputs, and the projected wire frame really exceeds the
+  websocket budget. Every other oversized anchored turn keeps the existing
+  `payload_too_large` rejection.
 - A proxy-injected reattach anchor is never eligible: that body was rewritten
   against a durable anchor the client never sent, so it is not a delta the client
   could reproduce.

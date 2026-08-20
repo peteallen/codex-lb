@@ -248,6 +248,8 @@ class _StreamingRetryMixin:
         previous_response_owner_resolved: bool = False,
         request_session_id: str | None = None,
         request_session_id_resolved: bool = False,
+        synthesized_turn_state: str | None = None,
+        api_key_reservation_settlement_started: asyncio.Event | None = None,
     ) -> AsyncIterator[str]:
         proxy = cast(_StreamingServiceProtocol, self)
         useragent, useragent_group, conversation_id = _request_log_client_fields(headers)
@@ -321,10 +323,11 @@ class _StreamingRetryMixin:
             openai_cache_affinity_max_age_seconds=settings.openai_cache_affinity_max_age_seconds,
             sticky_threads_enabled=settings.sticky_threads_enabled,
             api_key=api_key,
+            synthesized_turn_state=synthesized_turn_state,
         )
         turn_state_owner_account_id: str | None = None
         turn_state = _sticky_key_from_turn_state_header(headers)
-        if turn_state is not None:
+        if turn_state is not None and turn_state != synthesized_turn_state:
             # HTTP and WebSocket transports share the bridge turn-state index;
             # treating this as ordinary sticky input would cross replicas or
             # accounts when the token was minted by an HTTP bridge session.
@@ -822,12 +825,17 @@ class _StreamingRetryMixin:
             return True
 
         previous_response_lookup_session_id: str | None = None
+        if api_key_reservation_settlement_started is not None:
+            api_key_reservation_settlement_started.set()
         try:
             if payload.previous_response_id is not None:
                 previous_response_lookup_session_id = (
                     request_session_id
                     if request_session_id_resolved
-                    else _owner_lookup_session_id_from_headers(headers)
+                    else _owner_lookup_session_id_from_headers(
+                        headers,
+                        synthesized_turn_state=synthesized_turn_state,
+                    )
                 )
                 if not previous_response_owner_resolved:
                     preferred_account_id = await proxy._resolve_websocket_previous_response_owner(

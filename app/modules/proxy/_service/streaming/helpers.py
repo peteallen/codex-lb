@@ -56,7 +56,6 @@ from app.core.upstream_proxy.cache import get_upstream_route_cache
 from app.core.utils.request_id import get_request_id
 from app.core.utils.sse import CODEX_KEEPALIVE_FRAME as CODEX_KEEPALIVE_FRAME  # noqa: F401
 from app.core.utils.sse import format_sse_event, parse_sse_data_json
-from app.core.utils.time import utcnow as utcnow
 from app.db.models import (
     Account,
     AccountStatus,  # noqa: F401
@@ -488,6 +487,7 @@ def _rewrite_previous_response_stream_error(
     error_type: str | None,
     error_message: str | None,
     error_param: str | None,
+    expose_stale_previous_response_classifier: bool = False,
 ) -> tuple[str, str, str | None] | None:
     if previous_response_id is None:
         return None
@@ -503,8 +503,12 @@ def _rewrite_previous_response_stream_error(
             upstream_error_code=error_code,
         )
         return (
-            "stream_incomplete",
-            PREVIOUS_RESPONSE_STREAM_INCOMPLETE_MESSAGE,
+            PREVIOUS_RESPONSE_STALE_CODE if expose_stale_previous_response_classifier else "stream_incomplete",
+            (
+                PREVIOUS_RESPONSE_STALE_MESSAGE
+                if expose_stale_previous_response_classifier
+                else PREVIOUS_RESPONSE_STREAM_INCOMPLETE_MESSAGE
+            ),
             None,
         )
     if _facade()._is_missing_tool_output_error(

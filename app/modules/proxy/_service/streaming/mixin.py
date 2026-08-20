@@ -493,6 +493,7 @@ class _StreamingMixin(_StreamingRetryMixin):
         request_session_id_resolved: bool = False,
     ) -> AsyncIterator[str]:
         proxy = cast(_StreamingServiceProtocol, self)
+        expose_stale_classifier = request_transport == "websocket" and not enforce_openai_sdk_contract
         account_id_value = account.id
         access_token = proxy._encryptor.decrypt(account.access_token_encrypted)
         account_id = _header_account_id(account.chatgpt_account_id)
@@ -501,9 +502,6 @@ class _StreamingMixin(_StreamingRetryMixin):
         service_tier = requested_service_tier
         actual_service_tier: str | None = None
         reasoning_effort = payload.reasoning.effort if payload.reasoning else None
-        # A websocket-originated turn already resolved its owner-lookup session id
-        # from the downstream frame; header-only rederivation would lose it and
-        # detach the request log from its conversation.
         session_id = (
             request_session_id if request_session_id_resolved else _owner_lookup_session_id_from_headers(headers)
         )
@@ -672,6 +670,7 @@ class _StreamingMixin(_StreamingRetryMixin):
                     error_type=raw_error_type,
                     error_message=raw_error_message,
                     error_param=raw_error_param,
+                    expose_stale_previous_response_classifier=expose_stale_classifier,
                 )
                 status = "error"
                 if not (preserve_raw_sse_line and error is None):
@@ -850,6 +849,7 @@ class _StreamingMixin(_StreamingRetryMixin):
                             error_type=error.type if error else None,
                             error_message=error.message if error else None,
                             error_param=error.param if error else None,
+                            expose_stale_previous_response_classifier=expose_stale_classifier,
                         )
                         if rewritten_error is not None:
                             response_id = (
@@ -964,6 +964,7 @@ class _StreamingMixin(_StreamingRetryMixin):
                 error_type=error.type if error else None,
                 error_message=error.message if error else None,
                 error_param=error.param if error else None,
+                expose_stale_previous_response_classifier=expose_stale_classifier,
             )
             if rewritten_error is not None:
                 rewritten_code, rewritten_message, upstream_error_code = rewritten_error
@@ -1012,7 +1013,8 @@ class _StreamingMixin(_StreamingRetryMixin):
         except _TerminalStreamError:
             raise
         except (asyncio.CancelledError, GeneratorExit):
-            status, error_code, error_message, failure_metadata = _mark_downstream_stream_cancelled(settlement)
+            if not terminal_event_seen or status != "success":
+                status, error_code, error_message, failure_metadata = _mark_downstream_stream_cancelled(settlement)
             raise
         except Exception:
             if settlement.downstream_visible:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import threading
 from collections import deque
 from datetime import timedelta
 from types import SimpleNamespace
@@ -7523,10 +7524,20 @@ def test_backend_responses_websocket_emits_terminal_failure_when_upstream_send_b
     assert log_calls[0]["status"] == "error"
 
 
-def test_backend_responses_websocket_rejects_oversized_response_create_before_upstream(
+@pytest.mark.parametrize(
+    ("anchor_field", "anchor_value"),
+    [
+        ("previous_response_id", "resp_anchored_non_tool"),
+        ("conversation", "conv_anchored_non_tool"),
+    ],
+    ids=["previous-response", "conversation"],
+)
+def test_backend_responses_websocket_rejects_oversized_owner_bound_non_tool_request_before_upstream(
     app_instance,
     monkeypatch,
     tmp_path,
+    anchor_field,
+    anchor_value,
 ):
     class _FakeSettingsCache:
         async def get(self):
@@ -7573,6 +7584,11 @@ def test_backend_responses_websocket_rejects_oversized_response_create_before_up
         )
         raise AssertionError("oversized response.create must fail before upstream websocket connect")
 
+    async def fail_stream_with_retry(self, *args, **kwargs):
+        del self, args, kwargs
+        raise AssertionError("owner-bound oversized response.create must not use HTTP fallback")
+        yield ""  # pragma: no cover
+
     monkeypatch.setattr(proxy_api_module, "_websocket_firewall_denial_response", allow_firewall)
     monkeypatch.setattr(proxy_api_module, "validate_proxy_api_key_authorization", allow_proxy_api_key)
     monkeypatch.setattr(proxy_module, "get_settings_cache", lambda: _FakeSettingsCache())
@@ -7580,11 +7596,13 @@ def test_backend_responses_websocket_rejects_oversized_response_create_before_up
     monkeypatch.setattr(proxy_module, "_UPSTREAM_RESPONSE_CREATE_MAX_BYTES", 128)
     monkeypatch.setattr(proxy_module, "_OVERSIZED_RESPONSE_CREATE_DUMP_DIR", tmp_path)
     monkeypatch.setattr(proxy_module.ProxyService, "_connect_proxy_websocket", fail_connect_proxy_websocket)
+    monkeypatch.setattr(proxy_module.ProxyService, "_stream_with_retry", fail_stream_with_retry)
 
     request_payload = {
         "type": "response.create",
         "model": "gpt-5.4",
         "instructions": "",
+        anchor_field: anchor_value,
         "input": [{"role": "user", "content": [{"type": "input_text", "text": "x" * 256}]}],
         "stream": True,
     }
@@ -7711,7 +7729,9 @@ def test_backend_responses_websocket_slims_historical_inline_artifacts_and_succe
     monkeypatch.setattr(proxy_api_module, "validate_proxy_api_key_authorization", allow_proxy_api_key)
     monkeypatch.setattr(proxy_module, "get_settings_cache", lambda: _FakeSettingsCache())
     monkeypatch.setattr(proxy_module, "_UPSTREAM_RESPONSE_CREATE_WARN_BYTES", 64)
-    monkeypatch.setattr(proxy_module, "_UPSTREAM_RESPONSE_CREATE_MAX_BYTES", 512)
+    # Leave room for projected per-account installation metadata after the
+    # historical artifact is slimmed to roughly 450 bytes.
+    monkeypatch.setattr(proxy_module, "_UPSTREAM_RESPONSE_CREATE_MAX_BYTES", 1024)
     monkeypatch.setattr(proxy_module.ProxyService, "_connect_proxy_websocket", fake_connect_proxy_websocket)
 
     request_payload = {
@@ -9738,12 +9758,35 @@ def test_backend_responses_websocket_logs_proxy_injected_stale_anchor_metadata(
                     ),
                 )
             ],
+            [
+                _FakeUpstreamMessage(
+                    "text",
+                    text=json.dumps(
+                        {
+                            "type": "response.created",
+                            "response": {"id": "resp_ws_after_stale_anchor", "status": "in_progress"},
+                        },
+                        separators=(",", ":"),
+                    ),
+                ),
+                _FakeUpstreamMessage(
+                    "text",
+                    text=json.dumps(
+                        {
+                            "type": "response.completed",
+                            "response": {"id": "resp_ws_after_stale_anchor", "status": "completed"},
+                        },
+                        separators=(",", ":"),
+                    ),
+                ),
+            ],
         ],
     )
     connect_count = 0
     log_calls: list[dict[str, object]] = []
     historical_input = {"role": "user", "content": [{"type": "input_text", "text": "first"}]}
     next_input = {"role": "user", "content": [{"type": "input_text", "text": "continue"}]}
+    retry_input = {"role": "user", "content": [{"type": "input_text", "text": "retry without anchor"}]}
 
     class _FakeSettingsCache:
         async def get(self):
@@ -9843,16 +9886,37 @@ def test_backend_responses_websocket_logs_proxy_injected_stale_anchor_metadata(
             while failed_event["type"] == "codex.keepalive":
                 failed_event = json.loads(websocket.receive_text())
 
+            websocket.send_text(
+                json.dumps(
+                    {
+                        "type": "response.create",
+                        "model": "gpt-5.4",
+                        "instructions": "",
+                        "input": [historical_input, next_input, retry_input],
+                        "stream": True,
+                    }
+                )
+            )
+            recovered_created = json.loads(websocket.receive_text())
+            while recovered_created["type"] == "codex.keepalive":
+                recovered_created = json.loads(websocket.receive_text())
+            recovered_completed = json.loads(websocket.receive_text())
+
     assert first_created["type"] == "response.created"
     assert first_completed["type"] == "response.completed"
     assert failed_event["type"] == "response.failed"
     _assert_codex_previous_response_stale_error(failed_event["response"]["error"])
-    assert connect_count == 1
+    assert recovered_created["type"] == "response.created"
+    assert recovered_completed["type"] == "response.completed"
+    assert connect_count == 2
     first_payload = json.loads(upstream_socket.sent_text[0])
     second_payload = json.loads(upstream_socket.sent_text[1])
+    recovered_payload = json.loads(upstream_socket.sent_text[2])
     assert "previous_response_id" not in first_payload
     assert second_payload["previous_response_id"] == "resp_ws_proxy_injected_anchor"
     assert second_payload["input"] == [next_input]
+    assert "previous_response_id" not in recovered_payload
+    assert recovered_payload["input"] == [historical_input, next_input, retry_input]
     error_logs = [call for call in log_calls if call.get("status") == "error"]
     assert len(error_logs) == 1
     failure_detail = error_logs[0]["failure_detail"]
@@ -9873,6 +9937,136 @@ def test_backend_responses_websocket_logs_proxy_injected_stale_anchor_metadata(
     assert "previous_response_age_seconds=unknown" in caplog.text
     assert "same_session=unknown" in caplog.text
     assert "resp_ws_proxy_injected_anchor" not in caplog.text
+
+
+def test_backend_responses_websocket_revalidates_proxy_anchor_after_late_account_cap_wait(
+    app_instance,
+    monkeypatch,
+):
+    """A late invalidation swaps the unsent optimized frame back to its full body."""
+    anchor_id = "resp_ws_late_anchor"
+    recovered_id = "resp_ws_late_anchor_recovered"
+    upstream_socket = _SequencedUpstreamWebSocket(
+        [],
+        deferred_message_batches=[
+            [
+                _FakeUpstreamMessage(
+                    "text",
+                    text=json.dumps(
+                        {"type": "response.created", "response": {"id": anchor_id, "status": "in_progress"}},
+                        separators=(",", ":"),
+                    ),
+                ),
+                _FakeUpstreamMessage(
+                    "text",
+                    text=json.dumps(
+                        {"type": "response.completed", "response": {"id": anchor_id, "status": "completed"}},
+                        separators=(",", ":"),
+                    ),
+                ),
+            ],
+            [
+                _FakeUpstreamMessage(
+                    "text",
+                    text=json.dumps(
+                        {"type": "response.created", "response": {"id": recovered_id, "status": "in_progress"}},
+                        separators=(",", ":"),
+                    ),
+                ),
+                _FakeUpstreamMessage(
+                    "text",
+                    text=json.dumps(
+                        {"type": "response.completed", "response": {"id": recovered_id, "status": "completed"}},
+                        separators=(",", ":"),
+                    ),
+                ),
+            ],
+        ],
+    )
+    cap_calls = 0
+
+    class _FakeSettingsCache:
+        async def get(self):
+            return _websocket_settings()
+
+    async def allow_firewall(_websocket):
+        return None
+
+    async def allow_proxy_api_key(_authorization: str | None, *, request: object | None = None):
+        return None
+
+    async def fake_connect_proxy_websocket(self, *args, **kwargs):
+        del self, args, kwargs
+        return SimpleNamespace(id="acct_ws_late_anchor"), upstream_socket
+
+    async def acquire_account_cap(self, **kwargs):
+        nonlocal cap_calls
+        del kwargs
+        cap_calls += 1
+        if cap_calls == 2:
+            matching_states = {
+                id(state): state
+                for state in self._websocket_continuity_index.values()
+                if state.last_completed_response_id == anchor_id
+            }
+            assert len(matching_states) == 1
+            continuity_state = next(iter(matching_states.values()))
+            assert proxy_module._clear_websocket_continuity_completion_if_matches(
+                continuity_state,
+                response_id=anchor_id,
+            )
+            await asyncio.sleep(0)
+        return None
+
+    async def fake_write_request_log(self, **kwargs):
+        del self, kwargs
+
+    monkeypatch.setattr(proxy_api_module, "_websocket_firewall_denial_response", allow_firewall)
+    monkeypatch.setattr(proxy_api_module, "validate_proxy_api_key_authorization", allow_proxy_api_key)
+    monkeypatch.setattr(proxy_module, "get_settings_cache", lambda: _FakeSettingsCache())
+    monkeypatch.setattr(proxy_module.ProxyService, "_connect_proxy_websocket", fake_connect_proxy_websocket)
+    monkeypatch.setattr(
+        proxy_module.ProxyService,
+        "_acquire_account_response_create_lease_or_overload",
+        acquire_account_cap,
+    )
+    monkeypatch.setattr(proxy_module.ProxyService, "_write_request_log", fake_write_request_log)
+
+    historical_input = {"role": "user", "content": [{"type": "input_text", "text": "history"}]}
+    next_input = {"role": "user", "content": [{"type": "input_text", "text": "continue"}]}
+    payloads = [
+        {
+            "type": "response.create",
+            "model": "gpt-5.4",
+            "instructions": "",
+            "input": [historical_input],
+            "stream": True,
+        },
+        {
+            "type": "response.create",
+            "model": "gpt-5.4",
+            "instructions": "",
+            "input": [historical_input, next_input],
+            "stream": True,
+        },
+    ]
+
+    with TestClient(app_instance) as client:
+        with client.websocket_connect(
+            "/backend-api/codex/responses",
+            headers={"Authorization": "Bearer external-token", "session_id": "sid-late-anchor"},
+        ) as websocket:
+            for request_payload in payloads:
+                websocket.send_text(json.dumps(request_payload))
+                assert json.loads(websocket.receive_text())["type"] == "response.created"
+                assert json.loads(websocket.receive_text())["type"] == "response.completed"
+
+    assert cap_calls == 2
+    assert len(upstream_socket.sent_text) == 2
+    first_payload, second_payload = map(json.loads, upstream_socket.sent_text)
+    assert "previous_response_id" not in first_payload
+    assert "previous_response_id" not in second_payload
+    assert second_payload["input"] == [historical_input, next_input]
 
 
 def test_backend_responses_websocket_grouped_anonymous_stale_anchor_persists_diagnostics(
@@ -10133,6 +10327,7 @@ def test_backend_responses_websocket_falls_back_to_http_for_oversized_current_to
 
     async def fake_stream_with_retry(self, payload, headers, **kwargs):
         del self, headers
+        kwargs["api_key_reservation_settlement_started"].set()
         seen_stream_calls.append({"payload": payload.to_payload(), "kwargs": kwargs})
         for event_payload in (
             {"type": "response.created", "response": {"id": "resp_http_fallback"}},
@@ -10199,6 +10394,1158 @@ def test_backend_responses_websocket_falls_back_to_http_for_oversized_current_to
     assert list(tmp_path.glob("*.meta.json")) == []
 
 
+@pytest.mark.parametrize(
+    ("include_file", "expected_file_owner"),
+    [(False, None), (True, "acct_full_resend_file_owner")],
+    ids=["session-routed", "file-pinned"],
+)
+def test_backend_responses_websocket_falls_back_to_http_for_oversized_unanchored_full_resend(
+    app_instance,
+    monkeypatch,
+    tmp_path,
+    include_file,
+    expected_file_owner,
+):
+    """An oversized complete resend preserves recent inline images over HTTP."""
+
+    class _FakeSettingsCache:
+        async def get(self):
+            return _websocket_settings()
+
+    async def allow_firewall(_websocket):
+        return None
+
+    async def allow_proxy_api_key(_authorization: str | None, *, request: object | None = None):
+        return None
+
+    async def fail_connect_proxy_websocket(self, *args, **kwargs):
+        del self, args, kwargs
+        raise AssertionError("oversized unanchored full resend must not open an upstream websocket")
+
+    file_owner_lookups = 0
+
+    async def resolve_file_account(self, payload, headers):
+        nonlocal file_owner_lookups
+        del self, payload, headers
+        file_owner_lookups += 1
+        return expected_file_owner
+
+    seen_stream_calls: list[dict[str, Any]] = []
+    reservation = SimpleNamespace(reservation_id=f"reservation-{include_file}")
+    released_reservations: list[object] = []
+    heartbeat_transfers: list[bool] = []
+
+    async def reserve_usage(self, *args, **kwargs):
+        del self, args, kwargs
+        return reservation
+
+    async def release_reservation(self, value):
+        del self
+        released_reservations.append(value)
+
+    original_cancel_heartbeat = proxy_module.ProxyService._cancel_request_state_api_key_reservation_heartbeat
+
+    def cancel_heartbeat(self, request_state):
+        heartbeat_transfers.append(request_state.api_key_reservation_heartbeat_task is not None)
+        original_cancel_heartbeat(self, request_state)
+
+    async def fake_stream_with_retry(self, payload, headers, **kwargs):
+        del self
+        kwargs["api_key_reservation_settlement_started"].set()
+        seen_stream_calls.append({"payload": payload.to_payload(), "headers": headers, "kwargs": kwargs})
+        for event_payload in (
+            {"type": "response.created", "response": {"id": "resp_http_full_resend"}},
+            {
+                "type": "response.output_text.delta",
+                "response_id": "resp_http_full_resend",
+                "delta": "ok",
+            },
+            {
+                "type": "response.completed",
+                "response": {"id": "resp_http_full_resend", "status": "completed"},
+            },
+        ):
+            yield format_sse_event(event_payload)
+
+    monkeypatch.setattr(proxy_api_module, "_websocket_firewall_denial_response", allow_firewall)
+    monkeypatch.setattr(proxy_api_module, "validate_proxy_api_key_authorization", allow_proxy_api_key)
+    monkeypatch.setattr(proxy_module, "get_settings_cache", lambda: _FakeSettingsCache())
+    monkeypatch.setattr(proxy_module, "_UPSTREAM_RESPONSE_CREATE_WARN_BYTES", 256)
+    monkeypatch.setattr(proxy_module, "_UPSTREAM_RESPONSE_CREATE_MAX_BYTES", 512)
+    monkeypatch.setattr(proxy_module, "_OVERSIZED_RESPONSE_CREATE_DUMP_DIR", tmp_path)
+    monkeypatch.setattr(proxy_module.ProxyService, "_connect_proxy_websocket", fail_connect_proxy_websocket)
+    monkeypatch.setattr(proxy_module.ProxyService, "_resolve_file_account_for_responses", resolve_file_account)
+    monkeypatch.setattr(proxy_module.ProxyService, "_reserve_websocket_api_key_usage", reserve_usage)
+    monkeypatch.setattr(proxy_module.ProxyService, "_release_websocket_reservation", release_reservation)
+    monkeypatch.setattr(
+        proxy_module.ProxyService,
+        "_cancel_request_state_api_key_reservation_heartbeat",
+        cancel_heartbeat,
+    )
+    monkeypatch.setattr(proxy_module.ProxyService, "_stream_with_retry", fake_stream_with_retry)
+
+    user_content: list[dict[str, str]] = [{"type": "input_text", "text": "Inspect these frames"}]
+    if include_file:
+        user_content.append({"type": "input_file", "file_id": "file_full_resend"})
+    request_payload = {
+        "type": "response.create",
+        "model": "gpt-5.4",
+        "instructions": "",
+        "input": [
+            {
+                "role": "user",
+                "content": user_content,
+            },
+            {
+                "type": "custom_tool_call",
+                "call_id": "call-view-image",
+                "name": "view_image",
+                "input": "{}",
+            },
+            {
+                "type": "custom_tool_call_output",
+                "call_id": "call-view-image",
+                "output": [
+                    {"type": "input_text", "text": "PAGE 1"},
+                    {
+                        "type": "input_image",
+                        "image_url": "data:image/jpeg;base64," + ("A" * 4096),
+                    },
+                ],
+            },
+        ],
+        "stream": True,
+    }
+
+    with TestClient(app_instance) as client:
+        with client.websocket_connect(
+            "/backend-api/codex/responses",
+            headers={"session_id": "sid-full-resend"},
+        ) as websocket:
+            websocket.send_text(json.dumps(request_payload))
+            events = [json.loads(websocket.receive_text()) for _ in range(3)]
+
+    assert [event["type"] for event in events] == [
+        "response.created",
+        "response.output_text.delta",
+        "response.completed",
+    ]
+    assert len(seen_stream_calls) == 1
+    relayed_payload = seen_stream_calls[0]["payload"]
+    assert relayed_payload.get("previous_response_id") is None
+    assert relayed_payload["input"] == request_payload["input"]
+    assert "data:image/jpeg;base64," in json.dumps(relayed_payload["input"])
+    relayed_headers = seen_stream_calls[0]["headers"]
+    kwargs = seen_stream_calls[0]["kwargs"]
+    assert kwargs["request_transport"] == "websocket"
+    assert kwargs["upstream_stream_transport_override"] == "http"
+    assert kwargs["resolved_previous_response_owner_account_id"] is None
+    assert kwargs["previous_response_owner_resolved"] is True
+    assert kwargs["rewritten_file_account_id"] == expected_file_owner
+    assert kwargs["synthesized_turn_state"] == relayed_headers["x-codex-turn-state"]
+    assert kwargs["request_session_id"] == "sid-full-resend"
+    assert file_owner_lookups == 1
+    assert kwargs["api_key_reservation"] is reservation
+    assert heartbeat_transfers == [True]
+    assert released_reservations == []
+    assert list(tmp_path.glob("*.meta.json")) == []
+
+
+def test_backend_responses_websocket_does_not_inject_http_completion_as_websocket_anchor(
+    app_instance,
+    monkeypatch,
+    tmp_path,
+):
+    """HTTP completions keep HTTP continuity and never become websocket anchors."""
+
+    class _FakeSettingsCache:
+        async def get(self):
+            return _websocket_settings()
+
+    async def allow_firewall(_websocket):
+        return None
+
+    async def allow_proxy_api_key(_authorization: str | None, *, request: object | None = None):
+        return None
+
+    websocket_connect_attempts: list[dict[str, Any]] = []
+
+    async def fail_connect_proxy_websocket(self, *args, **kwargs):
+        del self, args
+        websocket_connect_attempts.append(kwargs)
+        raise AssertionError("an HTTP-created response id must not be injected into an upstream websocket request")
+
+    seen_stream_calls: list[dict[str, Any]] = []
+
+    async def fake_stream_with_retry(self, payload, headers, **kwargs):
+        del self, headers
+        kwargs["api_key_reservation_settlement_started"].set()
+        seen_stream_calls.append({"payload": payload.to_payload(), "kwargs": kwargs})
+        response_id = f"resp_http_full_resend_{len(seen_stream_calls)}"
+        yield format_sse_event({"type": "response.created", "response": {"id": response_id, "status": "in_progress"}})
+        yield format_sse_event({"type": "response.completed", "response": {"id": response_id, "status": "completed"}})
+
+    monkeypatch.setattr(proxy_api_module, "_websocket_firewall_denial_response", allow_firewall)
+    monkeypatch.setattr(proxy_api_module, "validate_proxy_api_key_authorization", allow_proxy_api_key)
+    monkeypatch.setattr(proxy_module, "get_settings_cache", lambda: _FakeSettingsCache())
+    monkeypatch.setattr(proxy_module, "_UPSTREAM_RESPONSE_CREATE_WARN_BYTES", 256)
+    monkeypatch.setattr(proxy_module, "_UPSTREAM_RESPONSE_CREATE_MAX_BYTES", 512)
+    monkeypatch.setattr(proxy_module, "_OVERSIZED_RESPONSE_CREATE_DUMP_DIR", tmp_path)
+    monkeypatch.setattr(proxy_module.ProxyService, "_connect_proxy_websocket", fail_connect_proxy_websocket)
+    monkeypatch.setattr(proxy_module.ProxyService, "_stream_with_retry", fake_stream_with_retry)
+
+    historical_input = {
+        "role": "user",
+        "content": [{"type": "input_text", "text": "A" * 4096}],
+    }
+    next_input = {
+        "role": "user",
+        "content": [{"type": "input_text", "text": "continue"}],
+    }
+    anchored_delta = {
+        "role": "user",
+        "content": [{"type": "input_text", "text": "small anchored follow-up"}],
+    }
+    request_payloads = [
+        {
+            "type": "response.create",
+            "model": "gpt-5.4",
+            "instructions": "",
+            "input": [historical_input],
+            "stream": True,
+        },
+        {
+            "type": "response.create",
+            "model": "gpt-5.4",
+            "instructions": "",
+            "input": [historical_input, next_input],
+            "stream": True,
+        },
+        {
+            "type": "response.create",
+            "model": "gpt-5.4",
+            "instructions": "",
+            "previous_response_id": "resp_http_full_resend_2",
+            "input": [anchored_delta],
+            "stream": True,
+        },
+    ]
+
+    with TestClient(app_instance) as client:
+        for request_payload in request_payloads:
+            with client.websocket_connect(
+                "/backend-api/codex/responses",
+                headers={"session_id": "sid-http-completion-provenance"},
+            ) as websocket:
+                websocket.send_text(json.dumps(request_payload))
+                created = json.loads(websocket.receive_text())
+                completed = json.loads(websocket.receive_text())
+                assert created["type"] == "response.created"
+                assert completed["type"] == "response.completed"
+
+    assert websocket_connect_attempts == []
+    assert len(seen_stream_calls) == 3
+    assert seen_stream_calls[1]["payload"].get("previous_response_id") is None
+    assert seen_stream_calls[1]["payload"]["input"] == [historical_input, next_input]
+    assert seen_stream_calls[1]["kwargs"]["upstream_stream_transport_override"] == "http"
+    assert seen_stream_calls[2]["payload"]["previous_response_id"] == "resp_http_full_resend_2"
+    assert seen_stream_calls[2]["payload"]["input"] == [anchored_delta]
+    assert seen_stream_calls[2]["kwargs"]["upstream_stream_transport_override"] == "http"
+    assert list(tmp_path.glob("*.meta.json")) == []
+
+
+@pytest.mark.parametrize(
+    ("origin_transport", "continuation_kind"),
+    [
+        ("http", "mismatched-anchor"),
+        ("websocket", "matching-anchor"),
+        ("http", "unanchored"),
+    ],
+    ids=[
+        "http-origin-mismatched-client-anchor",
+        "websocket-origin-matching-client-anchor",
+        "http-origin-small-unanchored-resend",
+    ],
+)
+def test_backend_responses_websocket_http_continuity_only_forces_exact_http_anchor(
+    app_instance,
+    monkeypatch,
+    origin_transport,
+    continuation_kind,
+):
+    """Only an exact HTTP-created anchor inherits upstream HTTP transport."""
+
+    class _FakeSettingsCache:
+        async def get(self):
+            return _websocket_settings()
+
+    async def allow_firewall(_websocket):
+        return None
+
+    async def allow_proxy_api_key(_authorization: str | None, *, request: object | None = None):
+        return None
+
+    origin_response_id = f"resp_{origin_transport}_routing_origin"
+    routed_response_id = f"resp_{continuation_kind.replace('-', '_')}_routed"
+    account_id = f"acct_{continuation_kind.replace('-', '_')}"
+
+    websocket_response_ids = (
+        [origin_response_id, routed_response_id] if origin_transport == "websocket" else [routed_response_id]
+    )
+    upstream_sockets = [
+        _FakeUpstreamWebSocket(
+            [
+                _FakeUpstreamMessage(
+                    "text",
+                    text=json.dumps(
+                        {
+                            "type": "response.created",
+                            "response": {"id": response_id, "status": "in_progress"},
+                        },
+                        separators=(",", ":"),
+                    ),
+                ),
+                _FakeUpstreamMessage(
+                    "text",
+                    text=json.dumps(
+                        {
+                            "type": "response.completed",
+                            "response": {"id": response_id, "status": "completed"},
+                        },
+                        separators=(",", ":"),
+                    ),
+                ),
+            ]
+        )
+        for response_id in websocket_response_ids
+    ]
+    available_upstreams = deque(upstream_sockets)
+    websocket_connects = 0
+
+    async def connect_proxy_websocket(self, *args, **kwargs):
+        nonlocal websocket_connects
+        del self, args, kwargs
+        websocket_connects += 1
+        assert available_upstreams
+        return SimpleNamespace(id=account_id), available_upstreams.popleft()
+
+    resolved_previous_response_ids: list[str] = []
+
+    async def resolve_previous_response_owner(
+        self,
+        *,
+        previous_response_id,
+        api_key,
+        session_id=None,
+        surface,
+        request_state=None,
+    ):
+        del self, api_key, session_id, surface, request_state
+        resolved_previous_response_ids.append(previous_response_id)
+        return account_id
+
+    http_stream_calls: list[dict[str, Any]] = []
+
+    async def fake_stream_with_retry(self, payload, headers, **kwargs):
+        del self, headers
+        assert origin_transport == "http"
+        assert not http_stream_calls
+        kwargs["api_key_reservation_settlement_started"].set()
+        http_stream_calls.append({"payload": payload.to_payload(), "kwargs": kwargs})
+        yield format_sse_event(
+            {
+                "type": "response.created",
+                "response": {"id": origin_response_id, "status": "in_progress"},
+            }
+        )
+        yield format_sse_event(
+            {
+                "type": "response.completed",
+                "response": {"id": origin_response_id, "status": "completed"},
+            }
+        )
+
+    monkeypatch.setattr(proxy_api_module, "_websocket_firewall_denial_response", allow_firewall)
+    monkeypatch.setattr(proxy_api_module, "validate_proxy_api_key_authorization", allow_proxy_api_key)
+    monkeypatch.setattr(proxy_module, "get_settings_cache", lambda: _FakeSettingsCache())
+    monkeypatch.setattr(proxy_module, "_UPSTREAM_RESPONSE_CREATE_WARN_BYTES", 512)
+    monkeypatch.setattr(proxy_module, "_UPSTREAM_RESPONSE_CREATE_MAX_BYTES", 1024)
+    monkeypatch.setattr(proxy_module.ProxyService, "_connect_proxy_websocket", connect_proxy_websocket)
+    monkeypatch.setattr(
+        proxy_module.ProxyService,
+        "_resolve_websocket_previous_response_owner",
+        resolve_previous_response_owner,
+    )
+    monkeypatch.setattr(proxy_module.ProxyService, "_stream_with_retry", fake_stream_with_retry)
+
+    origin_input = {
+        "role": "user",
+        "content": [
+            {
+                "type": "input_text",
+                "text": "H" * 4096 if origin_transport == "http" else "seed websocket continuity",
+            }
+        ],
+    }
+    origin_payload = {
+        "type": "response.create",
+        "model": "gpt-5.4",
+        "instructions": "",
+        "input": [origin_input],
+        "stream": True,
+    }
+    routed_input = {
+        "role": "user",
+        "content": [{"type": "input_text", "text": "small routed follow-up"}],
+    }
+    routed_payload = {
+        "type": "response.create",
+        "model": "gpt-5.4",
+        "instructions": "",
+        "input": [routed_input],
+        "stream": True,
+    }
+    expected_previous_response_id: str | None
+    if continuation_kind == "mismatched-anchor":
+        expected_previous_response_id = "resp_unrelated_client_anchor"
+        routed_payload["previous_response_id"] = expected_previous_response_id
+    elif continuation_kind == "matching-anchor":
+        expected_previous_response_id = origin_response_id
+        routed_payload["previous_response_id"] = expected_previous_response_id
+    else:
+        expected_previous_response_id = None
+
+    session_id = f"sid-http-provenance-routing-{continuation_kind}"
+    with TestClient(app_instance) as client:
+        for request_payload in (origin_payload, routed_payload):
+            with client.websocket_connect(
+                "/backend-api/codex/responses",
+                headers={"session_id": session_id},
+            ) as websocket:
+                websocket.send_text(json.dumps(request_payload))
+                created = json.loads(websocket.receive_text())
+                completed = json.loads(websocket.receive_text())
+                assert created["type"] == "response.created"
+                assert completed["type"] == "response.completed"
+
+    assert not available_upstreams
+    assert websocket_connects == len(websocket_response_ids)
+    assert len(http_stream_calls) == (1 if origin_transport == "http" else 0)
+    routed_upstream_payload = json.loads(upstream_sockets[-1].sent_text[0])
+    assert routed_upstream_payload["input"] == [routed_input]
+    if expected_previous_response_id is None:
+        assert "previous_response_id" not in routed_upstream_payload
+        assert resolved_previous_response_ids == []
+    else:
+        assert routed_upstream_payload["previous_response_id"] == expected_previous_response_id
+        assert resolved_previous_response_ids == [expected_previous_response_id]
+
+
+def test_backend_responses_websocket_http_continuation_stale_clears_matching_continuity(
+    app_instance,
+    monkeypatch,
+):
+    """A stale HTTP continuation is sanitized and cannot poison the next resend."""
+
+    class _FakeSettingsCache:
+        async def get(self):
+            return _websocket_settings()
+
+    async def allow_firewall(_websocket):
+        return None
+
+    async def allow_proxy_api_key(_authorization: str | None, *, request: object | None = None):
+        return None
+
+    origin_response_id = "resp_http_stale_origin"
+    account_id = "acct_http_stale_origin"
+    recovered_response_id = "resp_ws_after_http_stale"
+    recovered_upstream = _FakeUpstreamWebSocket(
+        [
+            _FakeUpstreamMessage(
+                "text",
+                text=json.dumps(
+                    {
+                        "type": "response.created",
+                        "response": {"id": recovered_response_id, "status": "in_progress"},
+                    },
+                    separators=(",", ":"),
+                ),
+            ),
+            _FakeUpstreamMessage(
+                "text",
+                text=json.dumps(
+                    {
+                        "type": "response.completed",
+                        "response": {"id": recovered_response_id, "status": "completed"},
+                    },
+                    separators=(",", ":"),
+                ),
+            ),
+        ]
+    )
+    websocket_connects = 0
+
+    async def connect_proxy_websocket(self, *args, **kwargs):
+        nonlocal websocket_connects
+        del self, args, kwargs
+        websocket_connects += 1
+        assert websocket_connects == 1
+        return SimpleNamespace(id=account_id), recovered_upstream
+
+    resolved_previous_response_ids: list[str] = []
+
+    async def resolve_previous_response_owner(
+        self,
+        *,
+        previous_response_id,
+        api_key,
+        session_id=None,
+        surface,
+        request_state=None,
+    ):
+        del self, api_key, session_id, surface, request_state
+        resolved_previous_response_ids.append(previous_response_id)
+        return account_id
+
+    cleared_continuity: list[tuple[str, bool]] = []
+    original_clear_continuity = websocket_mixin_module._clear_websocket_continuity_completion_if_matches
+
+    def clear_continuity(continuity_state, *, response_id):
+        cleared = original_clear_continuity(continuity_state, response_id=response_id)
+        cleared_continuity.append((response_id, cleared))
+        return cleared
+
+    http_stream_payloads: list[dict[str, Any]] = []
+
+    async def fake_stream_with_retry(self, payload, headers, **kwargs):
+        del self, headers
+        kwargs["api_key_reservation_settlement_started"].set()
+        http_stream_payloads.append(payload.to_payload())
+        if len(http_stream_payloads) == 1:
+            yield format_sse_event(
+                {
+                    "type": "response.created",
+                    "response": {"id": origin_response_id, "status": "in_progress"},
+                }
+            )
+            yield format_sse_event(
+                {
+                    "type": "response.completed",
+                    "response": {"id": origin_response_id, "status": "completed"},
+                }
+            )
+            return
+
+        assert len(http_stream_payloads) == 2
+        rewritten_error = proxy_module._rewrite_previous_response_stream_error(
+            previous_response_id=origin_response_id,
+            preferred_account_id=account_id,
+            error_code="previous_response_not_found",
+            error_type="invalid_request_error",
+            error_message=f"Previous response with id '{origin_response_id}' not found.",
+            error_param="previous_response_id",
+            expose_stale_previous_response_classifier=True,
+        )
+        assert rewritten_error is not None
+        error_code, error_message, error_param = rewritten_error
+        yield format_sse_event(
+            proxy_module.response_failed_event(
+                error_code,
+                error_message,
+                error_type="server_error",
+                error_param=error_param,
+            )
+        )
+
+    monkeypatch.setattr(proxy_api_module, "_websocket_firewall_denial_response", allow_firewall)
+    monkeypatch.setattr(proxy_api_module, "validate_proxy_api_key_authorization", allow_proxy_api_key)
+    monkeypatch.setattr(proxy_module, "get_settings_cache", lambda: _FakeSettingsCache())
+    monkeypatch.setattr(proxy_module, "_UPSTREAM_RESPONSE_CREATE_WARN_BYTES", 512)
+    monkeypatch.setattr(proxy_module, "_UPSTREAM_RESPONSE_CREATE_MAX_BYTES", 1024)
+    monkeypatch.setattr(proxy_module.ProxyService, "_connect_proxy_websocket", connect_proxy_websocket)
+    monkeypatch.setattr(
+        proxy_module.ProxyService,
+        "_resolve_websocket_previous_response_owner",
+        resolve_previous_response_owner,
+    )
+    monkeypatch.setattr(proxy_module.ProxyService, "_stream_with_retry", fake_stream_with_retry)
+    monkeypatch.setattr(
+        websocket_mixin_module,
+        "_clear_websocket_continuity_completion_if_matches",
+        clear_continuity,
+    )
+
+    origin_payload = {
+        "type": "response.create",
+        "model": "gpt-5.4",
+        "instructions": "",
+        "input": [
+            {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "H" * 4096}],
+            }
+        ],
+        "stream": True,
+    }
+    continuation_payload = {
+        "type": "response.create",
+        "model": "gpt-5.4",
+        "instructions": "",
+        "previous_response_id": origin_response_id,
+        "input": [
+            {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "small exact HTTP continuation"}],
+            }
+        ],
+        "stream": True,
+    }
+    recovered_input = {
+        "role": "user",
+        "content": [{"type": "input_text", "text": "retry with complete unanchored history"}],
+    }
+    recovered_payload = {
+        "type": "response.create",
+        "model": "gpt-5.4",
+        "instructions": "",
+        "input": [recovered_input],
+        "stream": True,
+    }
+
+    session_id = "sid-http-stale-continuity"
+    with TestClient(app_instance) as client:
+        with client.websocket_connect(
+            "/backend-api/codex/responses",
+            headers={"session_id": session_id},
+        ) as websocket:
+            websocket.send_text(json.dumps(origin_payload))
+            assert json.loads(websocket.receive_text())["response"]["id"] == origin_response_id
+            assert json.loads(websocket.receive_text())["response"]["id"] == origin_response_id
+
+        with client.websocket_connect(
+            "/backend-api/codex/responses",
+            headers={"session_id": session_id},
+        ) as websocket:
+            websocket.send_text(json.dumps(continuation_payload))
+            stale_event = json.loads(websocket.receive_text())
+
+        with client.websocket_connect(
+            "/backend-api/codex/responses",
+            headers={"session_id": session_id},
+        ) as websocket:
+            websocket.send_text(json.dumps(recovered_payload))
+            recovered_created = json.loads(websocket.receive_text())
+            recovered_completed = json.loads(websocket.receive_text())
+
+    assert stale_event["type"] == "response.failed"
+    _assert_codex_previous_response_stale_error(stale_event["response"]["error"])
+    serialized_stale_event = json.dumps(stale_event)
+    assert "previous_response_not_found" not in serialized_stale_event
+    assert origin_response_id not in serialized_stale_event
+    assert cleared_continuity == [(origin_response_id, True)]
+    assert recovered_created["response"]["id"] == recovered_response_id
+    assert recovered_completed["response"]["id"] == recovered_response_id
+    assert len(http_stream_payloads) == 2
+    assert http_stream_payloads[0].get("previous_response_id") is None
+    assert http_stream_payloads[1]["previous_response_id"] == origin_response_id
+    assert websocket_connects == 1
+    assert resolved_previous_response_ids == [origin_response_id]
+    recovered_upstream_payload = json.loads(recovered_upstream.sent_text[0])
+    assert "previous_response_id" not in recovered_upstream_payload
+    assert recovered_upstream_payload["input"] == [recovered_input]
+
+
+def test_backend_responses_websocket_rejects_auto_anchored_resend_during_http_fallback(
+    app_instance,
+    monkeypatch,
+):
+    """Preparation-time anchor injection cannot bypass an active HTTP relay."""
+
+    class _FakeSettingsCache:
+        async def get(self):
+            return _websocket_settings()
+
+    async def allow_firewall(_websocket):
+        return None
+
+    async def allow_proxy_api_key(_authorization: str | None, *, request: object | None = None):
+        return None
+
+    websocket_anchor = "resp_ws_before_active_http"
+    account_id = "acct_auto_anchor_conflict"
+    upstream = _SequencedUpstreamWebSocket(
+        [],
+        deferred_message_batches=[
+            [
+                _FakeUpstreamMessage(
+                    "text",
+                    text=json.dumps(
+                        {
+                            "type": "response.created",
+                            "response": {"id": websocket_anchor, "status": "in_progress"},
+                        },
+                        separators=(",", ":"),
+                    ),
+                ),
+                _FakeUpstreamMessage(
+                    "text",
+                    text=json.dumps(
+                        {
+                            "type": "response.completed",
+                            "response": {"id": websocket_anchor, "status": "completed"},
+                        },
+                        separators=(",", ":"),
+                    ),
+                ),
+            ]
+        ],
+    )
+    websocket_connects = 0
+
+    async def connect_proxy_websocket(self, *args, **kwargs):
+        nonlocal websocket_connects
+        del self, args, kwargs
+        websocket_connects += 1
+        return SimpleNamespace(id=account_id), upstream
+
+    resolved_previous_response_ids: list[str] = []
+
+    async def resolve_previous_response_owner(
+        self,
+        *,
+        previous_response_id,
+        api_key,
+        session_id=None,
+        surface,
+        request_state=None,
+    ):
+        del self, api_key, session_id, surface, request_state
+        resolved_previous_response_ids.append(previous_response_id)
+        assert previous_response_id == websocket_anchor
+        return account_id
+
+    fallback_cancelled = threading.Event()
+    http_stream_payloads: list[dict[str, Any]] = []
+
+    async def fake_stream_with_retry(self, payload, headers, **kwargs):
+        del self, headers
+        kwargs["api_key_reservation_settlement_started"].set()
+        http_stream_payloads.append(payload.to_payload())
+        yield format_sse_event(
+            {
+                "type": "response.created",
+                "response": {"id": "resp_http_active_conflict", "status": "in_progress"},
+            }
+        )
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            fallback_cancelled.set()
+            raise
+        yield ""
+
+    monkeypatch.setattr(proxy_api_module, "_websocket_firewall_denial_response", allow_firewall)
+    monkeypatch.setattr(proxy_api_module, "validate_proxy_api_key_authorization", allow_proxy_api_key)
+    monkeypatch.setattr(proxy_module, "get_settings_cache", lambda: _FakeSettingsCache())
+    monkeypatch.setattr(proxy_module, "_UPSTREAM_RESPONSE_CREATE_WARN_BYTES", 512)
+    monkeypatch.setattr(proxy_module, "_UPSTREAM_RESPONSE_CREATE_MAX_BYTES", 1024)
+    monkeypatch.setattr(proxy_module.ProxyService, "_connect_proxy_websocket", connect_proxy_websocket)
+    monkeypatch.setattr(
+        proxy_module.ProxyService,
+        "_resolve_websocket_previous_response_owner",
+        resolve_previous_response_owner,
+    )
+    monkeypatch.setattr(proxy_module.ProxyService, "_stream_with_retry", fake_stream_with_retry)
+
+    historical_input = {
+        "role": "user",
+        "content": [{"type": "input_text", "text": "seed websocket continuity"}],
+    }
+    next_input = {
+        "role": "user",
+        "content": [{"type": "input_text", "text": "unanchored full resend while HTTP is active"}],
+    }
+    websocket_seed = {
+        "type": "response.create",
+        "model": "gpt-5.4",
+        "instructions": "",
+        "input": [historical_input],
+        "stream": True,
+    }
+    active_http_fallback = {
+        "type": "response.create",
+        "model": "gpt-5.4",
+        "instructions": "",
+        "previous_response_id": websocket_anchor,
+        "input": [
+            {
+                "type": "function_call_output",
+                "call_id": "call-active-http-conflict",
+                "output": "x" * 4096,
+            }
+        ],
+        "stream": True,
+    }
+    incoming_unanchored_resend = {
+        "type": "response.create",
+        "model": "gpt-5.4",
+        "instructions": "",
+        "input": [historical_input, next_input],
+        "stream": True,
+    }
+
+    with TestClient(app_instance) as client:
+        with client.websocket_connect(
+            "/backend-api/codex/responses",
+            headers={"session_id": "sid-auto-anchor-active-http-conflict"},
+        ) as websocket:
+            websocket.send_text(json.dumps(websocket_seed))
+            assert json.loads(websocket.receive_text())["response"]["id"] == websocket_anchor
+            assert json.loads(websocket.receive_text())["response"]["id"] == websocket_anchor
+
+            websocket.send_text(json.dumps(active_http_fallback))
+            active_created = json.loads(websocket.receive_text())
+            assert active_created["response"]["id"] == "resp_http_active_conflict"
+
+            websocket.send_text(json.dumps(incoming_unanchored_resend))
+            conflict = json.loads(websocket.receive_text())
+            assert conflict["type"] == "response.failed"
+            assert conflict["response"]["error"]["code"] == "stream_incomplete"
+            assert conflict["response"]["error"]["message"] == (
+                "Previous response is still streaming; retry after the terminal frame"
+            )
+
+            websocket.send_text(json.dumps({"type": "response.cancel"}))
+            assert fallback_cancelled.wait(timeout=1.0) is True
+
+    assert websocket_connects == 1
+    assert len(upstream.sent_text) == 1
+    assert len(http_stream_payloads) == 1
+    assert http_stream_payloads[0]["previous_response_id"] == websocket_anchor
+    # The explicit fallback and the raw unanchored resend both resolve the
+    # older websocket anchor, proving preparation injected it before conflict
+    # detection rejected the latter frame.
+    assert resolved_previous_response_ids == [websocket_anchor, websocket_anchor]
+
+
+def test_backend_responses_websocket_rejects_second_full_resend_during_http_fallback(
+    app_instance,
+    monkeypatch,
+):
+    """A full resend cannot overtake an active HTTP fallback on the same socket."""
+
+    class _FakeSettingsCache:
+        async def get(self):
+            return _websocket_settings()
+
+    async def allow_firewall(_websocket):
+        return None
+
+    async def allow_proxy_api_key(_authorization: str | None, *, request: object | None = None):
+        return None
+
+    async def fail_connect_proxy_websocket(self, *args, **kwargs):
+        del self, args, kwargs
+        raise AssertionError("oversized unanchored full resend must not open an upstream websocket")
+
+    relay_cancelled = asyncio.Event()
+    stream_calls = 0
+
+    async def fake_stream_with_retry(self, payload, headers, **kwargs):
+        nonlocal stream_calls
+        del self, payload, headers
+        kwargs["api_key_reservation_settlement_started"].set()
+        stream_calls += 1
+        yield format_sse_event({"type": "response.created", "response": {"id": "resp_active_fallback"}})
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            relay_cancelled.set()
+            raise
+        yield ""
+
+    monkeypatch.setattr(proxy_api_module, "_websocket_firewall_denial_response", allow_firewall)
+    monkeypatch.setattr(proxy_api_module, "validate_proxy_api_key_authorization", allow_proxy_api_key)
+    monkeypatch.setattr(proxy_module, "get_settings_cache", lambda: _FakeSettingsCache())
+    monkeypatch.setattr(proxy_module, "_UPSTREAM_RESPONSE_CREATE_WARN_BYTES", 256)
+    monkeypatch.setattr(proxy_module, "_UPSTREAM_RESPONSE_CREATE_MAX_BYTES", 512)
+    monkeypatch.setattr(proxy_module.ProxyService, "_connect_proxy_websocket", fail_connect_proxy_websocket)
+    monkeypatch.setattr(proxy_module.ProxyService, "_stream_with_retry", fake_stream_with_retry)
+
+    request_payload = {
+        "type": "response.create",
+        "model": "gpt-5.4",
+        "instructions": "",
+        "input": [
+            {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Inspect this frame"}],
+            },
+            {
+                "type": "custom_tool_call",
+                "call_id": "call-view-image",
+                "name": "view_image",
+                "input": "{}",
+            },
+            {
+                "type": "custom_tool_call_output",
+                "call_id": "call-view-image",
+                "output": [
+                    {
+                        "type": "input_image",
+                        "image_url": "data:image/jpeg;base64," + ("A" * 4096),
+                    }
+                ],
+            },
+        ],
+        "stream": True,
+    }
+
+    with TestClient(app_instance) as client:
+        with client.websocket_connect("/backend-api/codex/responses") as websocket:
+            websocket.send_text(json.dumps(request_payload))
+            created = json.loads(websocket.receive_text())
+            assert created["type"] == "response.created"
+
+            websocket.send_text(json.dumps(request_payload))
+            conflict = json.loads(websocket.receive_text())
+            assert conflict["type"] == "response.failed"
+            assert conflict["response"]["error"]["code"] == "stream_incomplete"
+            assert conflict["response"]["error"]["message"] == (
+                "Previous response is still streaming; retry after the terminal frame"
+            )
+
+            websocket.send_text(json.dumps({"type": "response.cancel"}))
+
+    assert stream_calls == 1
+    assert relay_cancelled.is_set() is True
+
+
+def test_backend_responses_websocket_cancel_targets_newer_websocket_turn_after_http_fallback(
+    app_instance,
+    monkeypatch,
+):
+    """A newer direct turn keeps ownership of connection-level cancellation."""
+
+    class _FakeSettingsCache:
+        async def get(self):
+            return _websocket_settings()
+
+    async def allow_firewall(_websocket):
+        return None
+
+    async def allow_proxy_api_key(_authorization: str | None, *, request: object | None = None):
+        return None
+
+    upstream = _SequencedUpstreamWebSocket(
+        [],
+        deferred_message_batches=[
+            [
+                _FakeUpstreamMessage(
+                    "text",
+                    text=json.dumps(
+                        {
+                            "type": "response.created",
+                            "response": {"id": "resp_newer_websocket", "status": "in_progress"},
+                        },
+                        separators=(",", ":"),
+                    ),
+                )
+            ],
+            [
+                _FakeUpstreamMessage(
+                    "text",
+                    text=json.dumps(
+                        {
+                            "type": "response.output_text.delta",
+                            "response_id": "resp_newer_websocket",
+                            "delta": "cancel-forwarded",
+                        },
+                        separators=(",", ":"),
+                    ),
+                )
+            ],
+        ],
+    )
+
+    async def connect_proxy_websocket(self, *args, **kwargs):
+        del self, args, kwargs
+        return SimpleNamespace(id="acct_newer_websocket"), upstream
+
+    fallback_cancelled = asyncio.Event()
+
+    async def fake_stream_with_retry(self, payload, headers, **kwargs):
+        del self, payload, headers
+        kwargs["api_key_reservation_settlement_started"].set()
+        yield format_sse_event({"type": "response.created", "response": {"id": "resp_http_older"}})
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            fallback_cancelled.set()
+            raise
+        yield ""
+
+    monkeypatch.setattr(proxy_api_module, "_websocket_firewall_denial_response", allow_firewall)
+    monkeypatch.setattr(proxy_api_module, "validate_proxy_api_key_authorization", allow_proxy_api_key)
+    monkeypatch.setattr(proxy_module, "get_settings_cache", lambda: _FakeSettingsCache())
+    monkeypatch.setattr(proxy_module, "_UPSTREAM_RESPONSE_CREATE_WARN_BYTES", 256)
+    monkeypatch.setattr(proxy_module, "_UPSTREAM_RESPONSE_CREATE_MAX_BYTES", 512)
+    monkeypatch.setattr(proxy_module.ProxyService, "_connect_proxy_websocket", connect_proxy_websocket)
+    monkeypatch.setattr(proxy_module.ProxyService, "_stream_with_retry", fake_stream_with_retry)
+
+    oversized_fallback = {
+        "type": "response.create",
+        "model": "gpt-5.4",
+        "instructions": "",
+        "input": [
+            {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Inspect this frame"}],
+            },
+            {
+                "type": "custom_tool_call",
+                "call_id": "call-older-http",
+                "name": "view_image",
+                "input": "{}",
+            },
+            {
+                "type": "custom_tool_call_output",
+                "call_id": "call-older-http",
+                "output": [
+                    {
+                        "type": "input_image",
+                        "image_url": "data:image/jpeg;base64," + ("A" * 4096),
+                    }
+                ],
+            },
+        ],
+        "stream": True,
+    }
+    newer_websocket_turn = {
+        "type": "response.create",
+        "model": "gpt-5.4",
+        "instructions": "",
+        "conversation": "conv_newer_websocket",
+        "input": [
+            {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "continue separately"}],
+            }
+        ],
+        "stream": True,
+    }
+
+    with TestClient(app_instance) as client:
+        with client.websocket_connect("/backend-api/codex/responses") as websocket:
+            websocket.send_text(json.dumps(oversized_fallback))
+            assert json.loads(websocket.receive_text())["response"]["id"] == "resp_http_older"
+
+            websocket.send_text(json.dumps(newer_websocket_turn))
+            assert json.loads(websocket.receive_text())["response"]["id"] == "resp_newer_websocket"
+            websocket.send_text(json.dumps({"type": "response.cancel"}))
+            forwarded_event = json.loads(websocket.receive_text())
+            assert forwarded_event["delta"] == "cancel-forwarded"
+            assert fallback_cancelled.is_set() is False
+
+    sent_types = [json.loads(text)["type"] for text in upstream.sent_text]
+    assert sent_types == ["response.create", "response.cancel"]
+    assert fallback_cancelled.is_set() is True
+
+
+def test_backend_responses_websocket_cancel_targets_newer_http_fallback_after_websocket_turn(
+    app_instance,
+    monkeypatch,
+):
+    """A newer HTTP fallback owns connection-level cancellation."""
+
+    class _FakeSettingsCache:
+        async def get(self):
+            return _websocket_settings()
+
+    async def allow_firewall(_websocket):
+        return None
+
+    async def allow_proxy_api_key(_authorization: str | None, *, request: object | None = None):
+        return None
+
+    upstream = _SequencedUpstreamWebSocket(
+        [],
+        deferred_message_batches=[
+            [
+                _FakeUpstreamMessage(
+                    "text",
+                    text=json.dumps(
+                        {
+                            "type": "response.created",
+                            "response": {"id": "resp_older_websocket", "status": "in_progress"},
+                        },
+                        separators=(",", ":"),
+                    ),
+                )
+            ]
+        ],
+    )
+
+    async def connect_proxy_websocket(self, *args, **kwargs):
+        del self, args, kwargs
+        return SimpleNamespace(id="acct_older_websocket"), upstream
+
+    fallback_cancelled = threading.Event()
+
+    async def fake_stream_with_retry(self, payload, headers, **kwargs):
+        del self, payload, headers
+        kwargs["api_key_reservation_settlement_started"].set()
+        yield format_sse_event({"type": "response.created", "response": {"id": "resp_http_newer"}})
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            fallback_cancelled.set()
+            raise
+        yield ""
+
+    monkeypatch.setattr(proxy_api_module, "_websocket_firewall_denial_response", allow_firewall)
+    monkeypatch.setattr(proxy_api_module, "validate_proxy_api_key_authorization", allow_proxy_api_key)
+    monkeypatch.setattr(proxy_module, "get_settings_cache", lambda: _FakeSettingsCache())
+    monkeypatch.setattr(proxy_module, "_UPSTREAM_RESPONSE_CREATE_WARN_BYTES", 512)
+    monkeypatch.setattr(proxy_module, "_UPSTREAM_RESPONSE_CREATE_MAX_BYTES", 1024)
+    monkeypatch.setattr(proxy_module.ProxyService, "_connect_proxy_websocket", connect_proxy_websocket)
+    monkeypatch.setattr(proxy_module.ProxyService, "_stream_with_retry", fake_stream_with_retry)
+
+    older_websocket_turn = {
+        "type": "response.create",
+        "model": "gpt-5.4",
+        "instructions": "",
+        "input": [{"role": "user", "content": [{"type": "input_text", "text": "start"}]}],
+        "stream": True,
+    }
+    newer_http_fallback = {
+        "type": "response.create",
+        "model": "gpt-5.4",
+        "instructions": "",
+        "previous_response_id": "resp_older_websocket",
+        "input": [
+            {
+                "type": "function_call_output",
+                "call_id": "call-newer-http",
+                "output": "x" * 4096,
+            }
+        ],
+        "stream": True,
+    }
+
+    with TestClient(app_instance) as client:
+        with client.websocket_connect("/backend-api/codex/responses") as websocket:
+            websocket.send_text(json.dumps(older_websocket_turn))
+            assert json.loads(websocket.receive_text())["response"]["id"] == "resp_older_websocket"
+
+            websocket.send_text(json.dumps(newer_http_fallback))
+            assert json.loads(websocket.receive_text())["response"]["id"] == "resp_http_newer"
+            websocket.send_text(json.dumps({"type": "response.cancel"}))
+            assert fallback_cancelled.wait(timeout=1.0) is True
+            assert [json.loads(text)["type"] for text in upstream.sent_text] == ["response.create"]
+
+
 def test_backend_responses_websocket_http_fallback_cancel_settles_relay(
     app_instance,
     monkeypatch,
@@ -10222,14 +11569,35 @@ def test_backend_responses_websocket_http_fallback_cancel_settles_relay(
 
     relay_cancelled = asyncio.Event()
     relay_started = asyncio.Event()
+    reservation = SimpleNamespace(reservation_id="reservation-stream-owned-cancel")
+    websocket_releases: list[object] = []
+    stream_owned_settlements: list[object] = []
+    heartbeat_transfers: list[bool] = []
+
+    async def reserve_usage(self, *args, **kwargs):
+        del self, args, kwargs
+        return reservation
+
+    async def release_reservation(self, value):
+        del self
+        websocket_releases.append(value)
+
+    original_cancel_heartbeat = proxy_module.ProxyService._cancel_request_state_api_key_reservation_heartbeat
+
+    def cancel_heartbeat(self, request_state):
+        heartbeat_transfers.append(request_state.api_key_reservation_heartbeat_task is not None)
+        original_cancel_heartbeat(self, request_state)
 
     async def fake_stream_with_retry(self, payload, headers, **kwargs):
-        del self, payload, headers, kwargs
+        del self, payload, headers
+        assert kwargs["api_key_reservation"] is reservation
+        kwargs["api_key_reservation_settlement_started"].set()
         yield format_sse_event({"type": "response.created", "response": {"id": "resp_cancel_fallback"}})
         relay_started.set()
         try:
             await asyncio.Event().wait()
         except asyncio.CancelledError:
+            stream_owned_settlements.append(kwargs["api_key_reservation"])
             relay_cancelled.set()
             raise
         yield ""
@@ -10241,6 +11609,13 @@ def test_backend_responses_websocket_http_fallback_cancel_settles_relay(
     monkeypatch.setattr(proxy_module, "_UPSTREAM_RESPONSE_CREATE_MAX_BYTES", 512)
     monkeypatch.setattr(proxy_module, "_OVERSIZED_RESPONSE_CREATE_DUMP_DIR", tmp_path)
     monkeypatch.setattr(proxy_module.ProxyService, "_connect_proxy_websocket", fail_connect_proxy_websocket)
+    monkeypatch.setattr(proxy_module.ProxyService, "_reserve_websocket_api_key_usage", reserve_usage)
+    monkeypatch.setattr(proxy_module.ProxyService, "_release_websocket_reservation", release_reservation)
+    monkeypatch.setattr(
+        proxy_module.ProxyService,
+        "_cancel_request_state_api_key_reservation_heartbeat",
+        cancel_heartbeat,
+    )
     monkeypatch.setattr(proxy_module.ProxyService, "_stream_with_retry", fake_stream_with_retry)
 
     request_payload = {
@@ -10267,3 +11642,351 @@ def test_backend_responses_websocket_http_fallback_cancel_settles_relay(
 
     assert relay_started.is_set() is True
     assert relay_cancelled.is_set() is True
+    assert heartbeat_transfers == [True]
+    assert stream_owned_settlements == [reservation]
+    assert websocket_releases == []
+
+
+@pytest.mark.parametrize("reservation_release_raises", [False, True], ids=["release-ok", "release-error"])
+def test_backend_responses_websocket_http_fallback_preflight_cancel_releases_reservation(
+    app_instance,
+    monkeypatch,
+    reservation_release_raises,
+):
+    """Preflight cancellation releases both the reservation and admission gate."""
+
+    class _FakeSettingsCache:
+        async def get(self):
+            return _websocket_settings()
+
+    async def allow_firewall(_websocket):
+        return None
+
+    async def allow_proxy_api_key(_authorization: str | None, *, request: object | None = None):
+        return None
+
+    async def fail_connect_proxy_websocket(self, *args, **kwargs):
+        del self, args, kwargs
+        raise AssertionError("oversized fallback must not open an upstream websocket")
+
+    reservation = SimpleNamespace(reservation_id="reservation-preflight-cancel")
+    released_reservations: list[object] = []
+    heartbeat_transfers: list[bool] = []
+    released_gates: list[tuple[Any, asyncio.Semaphore]] = []
+    relay_entered = asyncio.Event()
+    relay_cancelled = asyncio.Event()
+
+    async def reserve_usage(self, *args, **kwargs):
+        del self, args, kwargs
+        return reservation
+
+    async def release_reservation(self, value):
+        del self
+        released_reservations.append(value)
+        if reservation_release_raises:
+            raise RuntimeError("reservation release failed")
+
+    original_release_gate = websocket_mixin_module._release_websocket_response_create_gate
+
+    async def release_gate(request_state, response_create_gate):
+        await original_release_gate(request_state, response_create_gate)
+        released_gates.append((request_state, response_create_gate))
+
+    original_cancel_heartbeat = proxy_module.ProxyService._cancel_request_state_api_key_reservation_heartbeat
+
+    def cancel_heartbeat(self, request_state):
+        heartbeat_transfers.append(request_state.api_key_reservation_heartbeat_task is not None)
+        original_cancel_heartbeat(self, request_state)
+
+    async def fake_stream_with_retry(self, payload, headers, **kwargs):
+        del self, payload, headers
+        assert kwargs["api_key_reservation"] is reservation
+        assert kwargs["api_key_reservation_settlement_started"].is_set() is False
+        relay_entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            relay_cancelled.set()
+            raise
+        yield ""
+
+    monkeypatch.setattr(proxy_api_module, "_websocket_firewall_denial_response", allow_firewall)
+    monkeypatch.setattr(proxy_api_module, "validate_proxy_api_key_authorization", allow_proxy_api_key)
+    monkeypatch.setattr(proxy_module, "get_settings_cache", lambda: _FakeSettingsCache())
+    monkeypatch.setattr(proxy_module, "_UPSTREAM_RESPONSE_CREATE_WARN_BYTES", 256)
+    monkeypatch.setattr(proxy_module, "_UPSTREAM_RESPONSE_CREATE_MAX_BYTES", 512)
+    monkeypatch.setattr(proxy_module.ProxyService, "_connect_proxy_websocket", fail_connect_proxy_websocket)
+    monkeypatch.setattr(proxy_module.ProxyService, "_reserve_websocket_api_key_usage", reserve_usage)
+    monkeypatch.setattr(proxy_module.ProxyService, "_release_websocket_reservation", release_reservation)
+    monkeypatch.setattr(websocket_mixin_module, "_release_websocket_response_create_gate", release_gate)
+    monkeypatch.setattr(
+        proxy_module.ProxyService,
+        "_cancel_request_state_api_key_reservation_heartbeat",
+        cancel_heartbeat,
+    )
+    monkeypatch.setattr(proxy_module.ProxyService, "_stream_with_retry", fake_stream_with_retry)
+
+    request_payload = {
+        "type": "response.create",
+        "model": "gpt-5.4",
+        "instructions": "",
+        "input": [
+            {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Inspect this frame"}],
+            },
+            {
+                "type": "custom_tool_call",
+                "call_id": "call-preflight-cancel",
+                "name": "view_image",
+                "input": "{}",
+            },
+            {
+                "type": "custom_tool_call_output",
+                "call_id": "call-preflight-cancel",
+                "output": [
+                    {
+                        "type": "input_image",
+                        "image_url": "data:image/jpeg;base64," + ("A" * 4096),
+                    }
+                ],
+            },
+        ],
+        "stream": True,
+    }
+
+    def exercise_cancel() -> None:
+        with TestClient(app_instance) as client:
+            with client.websocket_connect("/backend-api/codex/responses") as websocket:
+                websocket.send_text(json.dumps(request_payload))
+                websocket.send_text(json.dumps({"type": "response.cancel"}))
+
+    if reservation_release_raises:
+        with pytest.raises(RuntimeError, match="reservation release failed"):
+            exercise_cancel()
+    else:
+        exercise_cancel()
+
+    assert relay_entered.is_set() is True
+    assert relay_cancelled.is_set() is True
+    assert heartbeat_transfers == [True]
+    assert released_reservations == [reservation]
+    assert len(released_gates) == 1
+    request_state, response_create_gate = released_gates[0]
+    assert request_state.response_create_admission is None
+    assert request_state.account_response_create_lease is None
+    assert request_state.account_response_create_release is None
+    assert request_state.response_create_gate is None
+    assert request_state.response_create_gate_acquired is False
+    assert response_create_gate.locked() is False
+
+
+def test_backend_responses_websocket_completed_http_fallback_consumes_cleanup_failure(
+    app_instance,
+    monkeypatch,
+):
+    """A detached fallback failure is consumed and logged by its done callback."""
+
+    class _FakeSettingsCache:
+        async def get(self):
+            return _websocket_settings()
+
+    async def allow_firewall(_websocket):
+        return None
+
+    async def allow_proxy_api_key(_authorization: str | None, *, request: object | None = None):
+        return None
+
+    async def fail_connect_proxy_websocket(self, *args, **kwargs):
+        del self, args, kwargs
+        raise AssertionError("oversized fallback must not open an upstream websocket")
+
+    reservation = SimpleNamespace(reservation_id="reservation-completed-release-error")
+    released_reservations: list[object] = []
+    failure_logged = threading.Event()
+
+    async def reserve_usage(self, *args, **kwargs):
+        del self, args, kwargs
+        return reservation
+
+    async def release_reservation(self, value):
+        del self
+        released_reservations.append(value)
+        raise RuntimeError("completed fallback reservation release failed")
+
+    async def fake_stream_with_retry(self, payload, headers, **kwargs):
+        del self, payload, headers, kwargs
+        yield format_sse_event({"type": "response.created", "response": {"id": "resp_http_completed"}})
+        yield format_sse_event(
+            {
+                "type": "response.completed",
+                "response": {"id": "resp_http_completed", "status": "completed"},
+            }
+        )
+
+    original_logger_error = proxy_module.logger.error
+
+    def capture_logger_error(message, *args, **kwargs):
+        if message == "WebSocket HTTP fallback task failed request_id=%s":
+            failure_logged.set()
+        original_logger_error(message, *args, **kwargs)
+
+    monkeypatch.setattr(proxy_api_module, "_websocket_firewall_denial_response", allow_firewall)
+    monkeypatch.setattr(proxy_api_module, "validate_proxy_api_key_authorization", allow_proxy_api_key)
+    monkeypatch.setattr(proxy_module, "get_settings_cache", lambda: _FakeSettingsCache())
+    monkeypatch.setattr(proxy_module, "_UPSTREAM_RESPONSE_CREATE_WARN_BYTES", 256)
+    monkeypatch.setattr(proxy_module, "_UPSTREAM_RESPONSE_CREATE_MAX_BYTES", 512)
+    monkeypatch.setattr(proxy_module.ProxyService, "_connect_proxy_websocket", fail_connect_proxy_websocket)
+    monkeypatch.setattr(proxy_module.ProxyService, "_reserve_websocket_api_key_usage", reserve_usage)
+    monkeypatch.setattr(proxy_module.ProxyService, "_release_websocket_reservation", release_reservation)
+    monkeypatch.setattr(proxy_module.ProxyService, "_stream_with_retry", fake_stream_with_retry)
+    monkeypatch.setattr(proxy_module.logger, "error", capture_logger_error)
+
+    request_payload = {
+        "type": "response.create",
+        "model": "gpt-5.4",
+        "instructions": "",
+        "input": [
+            {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Inspect this frame"}],
+            },
+            {
+                "type": "custom_tool_call_output",
+                "call_id": "call-completed-release-error",
+                "output": [
+                    {
+                        "type": "input_image",
+                        "image_url": "data:image/jpeg;base64," + ("A" * 4096),
+                    }
+                ],
+            },
+        ],
+        "stream": True,
+    }
+
+    with TestClient(app_instance) as client:
+        with client.websocket_connect("/backend-api/codex/responses") as websocket:
+            websocket.send_text(json.dumps(request_payload))
+            events = [json.loads(websocket.receive_text()) for _ in range(2)]
+            assert [event["type"] for event in events] == ["response.created", "response.completed"]
+            assert failure_logged.wait(timeout=1.0) is True
+
+    assert released_reservations == [reservation]
+
+
+def test_backend_responses_websocket_http_fallback_teardown_continues_after_release_error(
+    app_instance,
+    monkeypatch,
+):
+    """A failed fallback cleanup cannot skip the connection cleanup tail."""
+
+    class _FakeSettingsCache:
+        async def get(self):
+            return _websocket_settings()
+
+    async def allow_firewall(_websocket):
+        return None
+
+    async def allow_proxy_api_key(_authorization: str | None, *, request: object | None = None):
+        return None
+
+    async def fail_connect_proxy_websocket(self, *args, **kwargs):
+        del self, args, kwargs
+        raise AssertionError("oversized fallback must not open an upstream websocket")
+
+    reservation = SimpleNamespace(reservation_id="reservation-teardown-release-error")
+    released_reservations: list[object] = []
+    released_gates: list[tuple[Any, asyncio.Semaphore]] = []
+    cleanup_tail_calls = 0
+    relay_cancelled = asyncio.Event()
+
+    async def reserve_usage(self, *args, **kwargs):
+        del self, args, kwargs
+        return reservation
+
+    async def release_reservation(self, value):
+        del self
+        if value is None:
+            return
+        released_reservations.append(value)
+        raise RuntimeError("reservation release failed during teardown")
+
+    original_release_gate = websocket_mixin_module._release_websocket_response_create_gate
+
+    async def release_gate(request_state, response_create_gate):
+        await original_release_gate(request_state, response_create_gate)
+        released_gates.append((request_state, response_create_gate))
+
+    original_fail_pending = proxy_module.ProxyService._fail_pending_websocket_requests
+
+    async def fail_pending(self, **kwargs):
+        nonlocal cleanup_tail_calls
+        await original_fail_pending(self, **kwargs)
+        cleanup_tail_calls += 1
+
+    async def fake_stream_with_retry(self, payload, headers, **kwargs):
+        del self, payload, headers
+        assert kwargs["api_key_reservation"] is reservation
+        assert kwargs["api_key_reservation_settlement_started"].is_set() is False
+        yield ": preflight\n\n"
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            relay_cancelled.set()
+            raise
+        yield ""
+
+    monkeypatch.setattr(proxy_api_module, "_websocket_firewall_denial_response", allow_firewall)
+    monkeypatch.setattr(proxy_api_module, "validate_proxy_api_key_authorization", allow_proxy_api_key)
+    monkeypatch.setattr(proxy_module, "get_settings_cache", lambda: _FakeSettingsCache())
+    monkeypatch.setattr(proxy_module, "_UPSTREAM_RESPONSE_CREATE_WARN_BYTES", 256)
+    monkeypatch.setattr(proxy_module, "_UPSTREAM_RESPONSE_CREATE_MAX_BYTES", 512)
+    monkeypatch.setattr(proxy_module.ProxyService, "_connect_proxy_websocket", fail_connect_proxy_websocket)
+    monkeypatch.setattr(proxy_module.ProxyService, "_reserve_websocket_api_key_usage", reserve_usage)
+    monkeypatch.setattr(proxy_module.ProxyService, "_release_websocket_reservation", release_reservation)
+    monkeypatch.setattr(websocket_mixin_module, "_release_websocket_response_create_gate", release_gate)
+    monkeypatch.setattr(proxy_module.ProxyService, "_fail_pending_websocket_requests", fail_pending)
+    monkeypatch.setattr(proxy_module.ProxyService, "_stream_with_retry", fake_stream_with_retry)
+
+    request_payload = {
+        "type": "response.create",
+        "model": "gpt-5.4",
+        "instructions": "",
+        "input": [
+            {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Inspect this frame"}],
+            },
+            {
+                "type": "custom_tool_call_output",
+                "call_id": "call-teardown-release-error",
+                "output": [
+                    {
+                        "type": "input_image",
+                        "image_url": "data:image/jpeg;base64," + ("A" * 4096),
+                    }
+                ],
+            },
+        ],
+        "stream": True,
+    }
+
+    with pytest.raises(RuntimeError, match="reservation release failed during teardown"):
+        with TestClient(app_instance) as client:
+            with client.websocket_connect("/backend-api/codex/responses") as websocket:
+                websocket.send_text(json.dumps(request_payload))
+                keepalive = json.loads(websocket.receive_text())
+                assert keepalive["type"] == "codex.keepalive"
+
+    assert relay_cancelled.is_set() is True
+    assert released_reservations == [reservation]
+    assert cleanup_tail_calls == 1
+    assert len(released_gates) >= 1
+    request_state, response_create_gate = released_gates[0]
+    assert request_state.response_create_admission is None
+    assert request_state.account_response_create_lease is None
+    assert request_state.account_response_create_release is None
+    assert request_state.response_create_gate is None
+    assert request_state.response_create_gate_acquired is False
+    assert response_create_gate.locked() is False

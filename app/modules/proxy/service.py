@@ -629,8 +629,10 @@ from app.modules.proxy._service.websocket import (
 from app.modules.proxy._service.websocket.helpers import (
     _app_error_to_websocket_event,  # noqa: F401
     _assign_websocket_response_id,  # noqa: F401
+    _clear_websocket_continuity_completion_if_matches,  # noqa: F401
     _draining_websocket_request_states,  # noqa: F401
     _find_websocket_request_state_by_response_id,  # noqa: F401
+    _invalidate_rejected_proxy_websocket_continuity_anchor,  # noqa: F401
     _is_websocket_previous_response_output_item,  # noqa: F401
     _is_websocket_response_create,  # noqa: F401
     _match_websocket_request_state_for_anonymous_event,  # noqa: F401
@@ -731,6 +733,7 @@ from app.modules.proxy.ring_membership import (
     RingMembershipService,
 )
 from app.modules.proxy.work_admission import WorkAdmissionController
+from app.modules.request_logs.repository import PreviousResponseOwnerRecord
 
 logger = logging.getLogger(__name__)
 
@@ -929,7 +932,9 @@ class ProxyService(
         self._http_bridge_inflight_sessions: dict[_HTTPBridgeSessionKey, asyncio.Future[_HTTPBridgeSession]] = {}
         self._http_bridge_turn_state_index: dict[tuple[str, str | None], _HTTPBridgeSessionKey] = {}
         self._http_bridge_previous_response_index: dict[tuple[str, str | None], _HTTPBridgeSessionKey] = {}
-        self._websocket_previous_response_account_index: dict[tuple[str, str | None, str | None], str] = {}
+        self._websocket_previous_response_account_index: dict[
+            tuple[str, str | None, str | None], PreviousResponseOwnerRecord
+        ] = {}
         self._websocket_continuity_index: dict[tuple[str, str | None], _WebSocketContinuityState] = {}
         self._background_cleanup_tasks: set[asyncio.Task[None]] = set()
         # In-memory pin from upstream-issued file_id -> codex-lb account_id.

@@ -822,6 +822,7 @@ class _WebSocketRequestState:
     previous_response_owner_lookup_outcome: str | None = None
     previous_response_owner_requested_at: datetime | None = None
     previous_response_owner_session_id: str | None = None
+    previous_response_owner_upstream_transport: str | None = None
     response_create_gate_acquired: bool = False
     response_create_gate: asyncio.Semaphore | None = None
     response_create_admission: AdmissionLease | None = None
@@ -1016,6 +1017,10 @@ class _WebSocketContinuityState:
     last_completed_input_count: int = 0
     last_completed_response_id: str | None = None
     last_completed_input_prefix_fingerprint: str | None = None
+    # WebSocket continuity state predates the HTTP fallback, so legacy and
+    # explicitly constructed states default to the only transport that could
+    # originally populate this slot. Every real completion overwrites it.
+    last_completed_upstream_transport: str | None = _REQUEST_TRANSPORT_WEBSOCKET
     last_pending_function_call_ids: list[str] = field(default_factory=list)
     last_pending_tool_call_types: dict[str, str] = field(default_factory=dict)
     responses_lite_model: str | None = None

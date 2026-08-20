@@ -2,12 +2,12 @@
 
 ### Requirement: An oversized current tool-output turn falls back to upstream HTTP
 
-When a downstream Responses WebSocket `response.create` exceeds the upstream
-websocket frame budget, the service MUST relay that single turn over upstream
-HTTP if and only if all of the following hold: the turn carries a non-empty
-client-supplied `previous_response_id`, its `input` is a non-empty list whose
-every item is a current tool-output item, and the projected per-account wire
-frame still exceeds the budget. Every other oversized turn MUST keep the existing
+When a downstream Responses WebSocket `response.create` carries a non-empty
+client-supplied `previous_response_id` and exceeds the upstream websocket frame
+budget, the service MUST relay that single anchored turn over upstream HTTP if
+and only if its `input` is a non-empty list whose every item is a current
+tool-output item and the projected per-account wire frame still exceeds the
+budget. Every other oversized anchored turn MUST keep the existing
 `payload_too_large` rejection with its oversized-request dump.
 
 A turn whose `previous_response_id` was injected by the proxy MUST NOT be
@@ -30,10 +30,10 @@ upstream websocket's pending set.
 - **AND** the client receives the ordinary `response.created`, incremental, and
   terminal events on the same websocket
 
-#### Scenario: Other oversized turns are still rejected
+#### Scenario: Other oversized anchored turns are still rejected
 
-- **WHEN** an oversized turn has no client-supplied `previous_response_id`, has
-  any non-tool-output input item, or carries a proxy-injected anchor
+- **WHEN** an oversized anchored turn has any non-tool-output input item or
+  carries a proxy-injected anchor
 - **THEN** the service returns `payload_too_large`
 - **AND** it records the oversized-request dump as before
 
@@ -49,17 +49,19 @@ same socket, the same event shapes, and Codex keepalives while it is still
 pre-created. Its request log MUST record the websocket request transport with an
 HTTP upstream transport.
 
-The service MUST hold the terminal frame until the upstream stream is drained so a
-retry can never follow a terminal frame downstream. It MUST release the
-response-create gate on `response.created` and on every exit, release the
-API-key reservation, and cancel and await the relay task when the client
-disconnects, when the client sends `response.cancel`, or when the connection is
-torn down. A downstream idle close MUST NOT fire while a fallback relay owns a
-turn.
+The service MUST hold the terminal frame until the upstream stream is drained so
+a retry can never follow a terminal frame downstream. It MUST release the
+response-create gate on `response.created` and on every exit, settle or release
+the API-key reservation under one explicit owner, and cancel and await the relay
+task when the client disconnects, when the relay is the newest active turn and
+the client sends `response.cancel`, or when the connection is torn down. A
+downstream idle close MUST NOT fire while a fallback relay owns a turn.
 
 #### Scenario: Cancel terminates the fallback relay
 
-- **GIVEN** a fallback turn is streaming
+- **GIVEN** a fallback turn is the newest active request on its downstream
+  websocket
+- **AND** it is streaming
 - **WHEN** the client sends `response.cancel`
 - **THEN** the relay task is cancelled and awaited
 - **AND** the gate and reservation are released
@@ -77,6 +79,11 @@ use the previous-response owner account and owner-lookup session id already
 resolved on the websocket path instead of re-deriving them from HTTP headers. The
 resolved owner-lookup session id MUST also be recorded on owner-unavailable
 request logs.
+
+A turn-state synthesized for the current downstream handshake MUST retain that
+classification across the HTTP hop so it does not override a durable session or
+prompt-cache affinity. An input-file owner resolved during websocket preparation
+MUST be passed as a hard file-owner constraint rather than looked up again.
 
 #### Scenario: A fallback continuation stays on its owner account
 

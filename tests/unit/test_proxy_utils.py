@@ -54,6 +54,8 @@ from app.core.utils.request_id import get_request_id, reset_request_id, set_requ
 from app.core.utils.sse import parse_sse_data_json
 from app.core.utils.time import utcnow
 from app.db.models import Account, AccountStatus, ModelSource, StickySessionKind
+from app.db.session import SessionLocal
+from app.dependencies import _proxy_repo_context
 from app.modules.accounts import auth_manager as auth_manager_module
 from app.modules.accounts.repository import AccountsRepository
 from app.modules.api_keys.repository import ApiKeysRepository
@@ -4390,6 +4392,7 @@ class _RequestLogsRecorder:
     def __init__(self) -> None:
         self.calls: list[dict[str, object]] = []
         self.response_owner_by_id: dict[tuple[str, str | None, str | None], str] = {}
+        self.response_upstream_transport_by_id: dict[tuple[str, str | None, str | None], str | None] = {}
         self.latest_response_by_session: dict[tuple[str, str | None], str] = {}
         self.lookup_calls: list[tuple[str, str | None, str | None]] = []
         self.session_lookup_calls: list[tuple[str, str | None]] = []
@@ -4415,14 +4418,17 @@ class _RequestLogsRecorder:
                 account_id=owner,
                 requested_at=None,
                 session_id=session_id,
+                upstream_transport=self.response_upstream_transport_by_id.get(key),
             )
         if session_id is not None:
-            fallback_owner = self.response_owner_by_id.get((response_id, api_key_id, None))
+            fallback_key = (response_id, api_key_id, None)
+            fallback_owner = self.response_owner_by_id.get(fallback_key)
             if fallback_owner is not None:
                 return PreviousResponseOwnerRecord(
                     account_id=fallback_owner,
                     requested_at=None,
                     session_id=None,
+                    upstream_transport=self.response_upstream_transport_by_id.get(fallback_key),
                 )
         return None
 
@@ -4516,6 +4522,87 @@ async def test_write_request_log_detaches_and_persists_in_background() -> None:
 
     assert request_logs.calls[0]["request_id"] == "resp_request_log_cancel"
     assert service._request_log_tasks == set()
+
+
+@pytest.mark.asyncio
+async def test_write_request_log_wait_for_persistence_is_shielded_from_caller_cancellation() -> None:
+    request_logs = _RequestLogsRecorder()
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def blocking_add_log(**kwargs: object) -> None:
+        started.set()
+        await release.wait()
+        request_logs.calls.append(dict(kwargs))
+
+    request_logs.add_log = cast(Any, blocking_add_log)
+    service = proxy_service.ProxyService(_repo_factory(request_logs))
+    waiter = asyncio.create_task(
+        service._write_request_log(
+            account_id="acc_required_provenance",
+            api_key=None,
+            request_id="resp_required_provenance",
+            model="gpt-5.4",
+            latency_ms=1,
+            status="success",
+            transport="websocket",
+            upstream_transport="http",
+        )
+    )
+
+    await asyncio.wait_for(started.wait(), timeout=1)
+    assert not waiter.done()
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+    assert service._request_log_tasks
+
+    release.set()
+    assert await service.drain_persistence_tasks(timeout_seconds=1)
+    assert request_logs.calls[0]["request_id"] == "resp_required_provenance"
+
+
+@pytest.mark.asyncio
+async def test_waited_http_provenance_is_visible_to_fresh_service(db_setup) -> None:
+    del db_setup
+    account = _make_account("acc_durable_http_provenance")
+    async with SessionLocal() as session:
+        session.add(account)
+        await session.commit()
+
+    writer = proxy_service.ProxyService(_proxy_repo_context)
+    await writer._write_request_log(
+        account_id=account.id,
+        api_key=None,
+        request_id="resp_durable_http_provenance",
+        model="gpt-5.4",
+        latency_ms=5,
+        status="success",
+        transport="websocket",
+        upstream_transport="http",
+        session_id="sid-http-origin",
+    )
+
+    fresh_service = proxy_service.ProxyService(_proxy_repo_context)
+    request_state = proxy_service._WebSocketRequestState(
+        request_id="req-http-followup",
+        model="gpt-5.4",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=time.monotonic(),
+    )
+    owner_id = await fresh_service._resolve_websocket_previous_response_owner(
+        previous_response_id="resp_durable_http_provenance",
+        api_key=None,
+        session_id="sid-different-process-session",
+        surface="websocket",
+        request_state=request_state,
+    )
+
+    assert owner_id == account.id
+    assert request_state.previous_response_owner_lookup_source == "request_logs"
+    assert request_state.previous_response_owner_upstream_transport == "http"
 
 
 @pytest.mark.asyncio
@@ -10604,6 +10691,193 @@ async def test_stream_once_records_top_level_raw_codex_error_first(monkeypatch):
     assert settlement.status == "error"
     assert settlement.error == {"message": "OpenCode stream failed"}
     assert settlement.account_health_error is True
+
+
+@pytest.mark.asyncio
+async def test_stream_once_publishes_http_provenance_before_waited_request_log(monkeypatch):
+    request_logs = _RequestLogsRecorder()
+    service = proxy_service.ProxyService(_repo_factory(request_logs))
+    account = _make_account("acc_stream_http_provenance")
+    settlement = proxy_service._StreamSettlement()
+    response_id = "resp_stream_http_provenance"
+    write_calls: list[dict[str, object]] = []
+
+    async def fake_stream(*args: object, **kwargs: object):
+        del args, kwargs
+        yield f'data: {{"type":"response.created","response":{{"id":"{response_id}","status":"in_progress"}}}}\n\n'
+        yield f'data: {{"type":"response.completed","response":{{"id":"{response_id}","status":"completed"}}}}\n\n'
+
+    async def observe_add_log(**kwargs: object) -> None:
+        cached_owner = service._websocket_previous_response_account_index[(response_id, None, None)]
+        assert cached_owner.account_id == account.id
+        assert cached_owner.session_id == "sid-stream-http-provenance"
+        assert cached_owner.upstream_transport == "http"
+        write_calls.append(dict(kwargs))
+
+    monkeypatch.setattr(proxy_service, "core_stream_responses", fake_stream)
+    request_logs.add_log = cast(Any, observe_add_log)
+    payload = ResponsesRequest.model_validate({"model": "gpt-5.4", "instructions": "hi", "input": [], "stream": True})
+
+    chunks = [
+        chunk
+        async for chunk in service._stream_once(
+            account,
+            payload,
+            {"session_id": "sid-stream-http-provenance"},
+            "req-stream-http-provenance",
+            False,
+            request_started_at=0.0,
+            api_key=None,
+            api_key_reservation=None,
+            settlement=settlement,
+            suppress_text_done_events=False,
+            upstream_stream_transport="http",
+            request_transport="websocket",
+        )
+    ]
+
+    assert len(chunks) == 2
+    terminal_event = parse_sse_data_json(chunks[-1])
+    assert terminal_event is not None
+    assert terminal_event["type"] == "response.completed"
+    assert write_calls[0]["upstream_transport"] == "http"
+
+
+@pytest.mark.asyncio
+async def test_stream_once_keeps_completed_terminal_when_waited_provenance_write_fails(monkeypatch, caplog):
+    request_logs = _RequestLogsRecorder()
+
+    async def fail_add_log(**kwargs: object) -> None:
+        del kwargs
+        raise RuntimeError("database unavailable")
+
+    request_logs.add_log = cast(Any, fail_add_log)
+    service = proxy_service.ProxyService(_repo_factory(request_logs))
+    account = _make_account("acc_stream_http_provenance_failure")
+    settlement = proxy_service._StreamSettlement()
+    response_id = "resp_stream_http_provenance_failure"
+
+    async def fake_stream(*args: object, **kwargs: object):
+        del args, kwargs
+        yield f'data: {{"type":"response.created","response":{{"id":"{response_id}","status":"in_progress"}}}}\n\n'
+        yield f'data: {{"type":"response.completed","response":{{"id":"{response_id}","status":"completed"}}}}\n\n'
+
+    monkeypatch.setattr(proxy_service, "core_stream_responses", fake_stream)
+    caplog.set_level(logging.WARNING, logger="app.modules.proxy.service")
+    payload = ResponsesRequest.model_validate({"model": "gpt-5.4", "instructions": "hi", "input": [], "stream": True})
+
+    chunks = [
+        chunk
+        async for chunk in service._stream_once(
+            account,
+            payload,
+            {"session_id": "sid-stream-http-provenance-failure"},
+            "req-stream-http-provenance-failure",
+            False,
+            request_started_at=0.0,
+            api_key=None,
+            api_key_reservation=None,
+            settlement=settlement,
+            suppress_text_done_events=False,
+            upstream_stream_transport="http",
+            request_transport="websocket",
+        )
+    ]
+
+    terminal_event = parse_sse_data_json(chunks[-1])
+    assert terminal_event is not None
+    assert terminal_event["type"] == "response.completed"
+    assert service._websocket_previous_response_account_index[(response_id, None, None)].upstream_transport == "http"
+    assert "Failed to persist request log" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_http_fallback_cancel_after_completed_preserves_http_provenance(monkeypatch):
+    request_logs = _RequestLogsRecorder()
+    service = proxy_service.ProxyService(_repo_factory(request_logs))
+    account = _make_account("acc_http_completed_before_cancel")
+    response_id = "resp_http_completed_before_cancel"
+    draining_after_completed = asyncio.Event()
+
+    async def fake_stream(*args: object, **kwargs: object):
+        del args, kwargs
+        yield f'data: {{"type":"response.created","response":{{"id":"{response_id}","status":"in_progress"}}}}\n\n'
+        yield f'data: {{"type":"response.completed","response":{{"id":"{response_id}","status":"completed"}}}}\n\n'
+        draining_after_completed.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(proxy_service, "core_stream_responses", fake_stream)
+    payload = ResponsesRequest.model_validate({"model": "gpt-5.4", "instructions": "hi", "input": [], "stream": True})
+
+    async def stream_with_retry(
+        stream_payload: ResponsesRequest,
+        headers: Mapping[str, str],
+        **kwargs: object,
+    ) -> AsyncIterator[str]:
+        settlement_started = cast(asyncio.Event, kwargs["api_key_reservation_settlement_started"])
+        settlement_started.set()
+        settlement = proxy_service._StreamSettlement()
+        async for chunk in service._stream_once(
+            account,
+            stream_payload,
+            headers,
+            "req-http-completed-before-cancel",
+            False,
+            request_started_at=time.monotonic(),
+            api_key=None,
+            api_key_reservation=None,
+            settlement=settlement,
+            suppress_text_done_events=False,
+            upstream_stream_transport="http",
+            request_transport="websocket",
+            request_session_id="sid-http-completed-before-cancel",
+            request_session_id_resolved=True,
+        ):
+            yield chunk
+
+    monkeypatch.setattr(service, "_stream_with_retry", stream_with_retry)
+    downstream = _ScriptedDownstreamWebSocket()
+    request_state = proxy_service._WebSocketRequestState(
+        request_id="ws-http-completed-before-cancel",
+        model="gpt-5.4",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=time.monotonic(),
+        session_id="sid-http-completed-before-cancel",
+        upstream_transport="http",
+    )
+    relay = asyncio.create_task(
+        service._relay_websocket_response_create_over_http(
+            cast(WebSocket, downstream),
+            payload,
+            {},
+            request_state=request_state,
+            client_send_lock=anyio.Lock(),
+            response_create_gate=asyncio.Semaphore(1),
+            downstream_activity=proxy_service._DownstreamWebSocketActivity(),
+            continuity_state=None,
+            codex_session_affinity=True,
+            openai_cache_affinity=False,
+            client_ip=None,
+            synthesized_turn_state=None,
+            started=asyncio.Event(),
+        )
+    )
+
+    await asyncio.wait_for(draining_after_completed.wait(), timeout=1)
+    assert [json.loads(text)["type"] for text in downstream.sent_text] == ["response.created"]
+    relay.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await relay
+    assert await service.drain_persistence_tasks(timeout_seconds=1)
+
+    assert request_logs.calls[0]["status"] == "success"
+    assert request_logs.calls[0]["upstream_transport"] == "http"
+    cached_owner = service._websocket_previous_response_account_index[(response_id, None, None)]
+    assert cached_owner.account_id == account.id
+    assert cached_owner.upstream_transport == "http"
+    assert all(json.loads(text)["type"] != "response.failed" for text in downstream.sent_text)
 
 
 @pytest.mark.asyncio
@@ -18771,7 +19045,8 @@ async def test_prepare_websocket_response_create_request_releases_reservation_on
             {
                 "type": "response.create",
                 "model": "gpt-5.1",
-                "input": [{"role": "user", "content": [{"type": "input_text", "text": "x" * 256}]}],
+                "conversation": "conv-large-payload",
+                "input": "x" * 256,
             },
             headers={},
             codex_session_affinity=False,
@@ -19277,6 +19552,85 @@ async def test_prepare_websocket_response_create_request_injects_anchor_for_code
     fresh_payload = json.loads(prepared.request_state.fresh_upstream_request_text)
     assert "previous_response_id" not in fresh_payload
     assert fresh_payload["input"] == [*historical_input, new_input]
+
+
+@pytest.mark.asyncio
+async def test_prepare_websocket_response_create_request_rechecks_injected_anchor_after_reservation(monkeypatch):
+    request_logs = _RequestLogsRecorder()
+    service = proxy_service.ProxyService(_repo_factory(request_logs))
+    api_key = ApiKeyData(
+        id="key_ws_anchor_race",
+        name="ws-anchor-race",
+        key_prefix="sk-ws-anchor-race",
+        allowed_models=["gpt-5.1"],
+        enforced_model=None,
+        enforced_reasoning_effort=None,
+        enforced_service_tier=None,
+        expires_at=None,
+        is_active=True,
+        created_at=utcnow(),
+        last_used_at=None,
+    )
+
+    class Settings:
+        trace_channels = frozenset()
+        openai_prompt_cache_key_derivation_enabled = True
+
+    historical_input: list[JsonValue] = [
+        {"role": "user", "content": [{"type": "input_text", "text": "old question"}]},
+    ]
+    new_input: JsonValue = {"role": "user", "content": [{"type": "input_text", "text": "retry"}]}
+    continuity_state = proxy_service._WebSocketContinuityState(
+        last_completed_input_count=1,
+        last_completed_response_id="resp_rejected_during_prepare",
+        last_completed_input_prefix_fingerprint=proxy_service._fingerprint_input_items(historical_input),
+        last_completed_upstream_transport="websocket",
+    )
+    reservations = [SimpleNamespace(id="first"), SimpleNamespace(id="replacement")]
+    reserve_calls = 0
+
+    async def reserve_usage(*args, **kwargs):
+        nonlocal reserve_calls
+        del args, kwargs
+        reservation = reservations[reserve_calls]
+        reserve_calls += 1
+        if reserve_calls == 1:
+            assert proxy_service._clear_websocket_continuity_completion_if_matches(
+                continuity_state,
+                response_id="resp_rejected_during_prepare",
+            )
+        return reservation
+
+    release_reservation = AsyncMock()
+    monkeypatch.setattr(proxy_service, "get_settings", lambda: Settings())
+    monkeypatch.setattr(service, "_reserve_websocket_api_key_usage", reserve_usage)
+    monkeypatch.setattr(service, "_release_websocket_reservation", release_reservation)
+    monkeypatch.setattr(service, "_refresh_websocket_api_key_policy", AsyncMock(return_value=api_key))
+
+    prepared = await service._prepare_websocket_response_create_request(
+        cast(
+            dict[str, JsonValue],
+            {
+                "type": "response.create",
+                "model": "gpt-5.1",
+                "input": [*historical_input, new_input],
+            },
+        ),
+        headers={"session_id": "turn_ws_anchor_race"},
+        codex_session_affinity=True,
+        openai_cache_affinity=True,
+        sticky_threads_enabled=False,
+        openai_cache_affinity_max_age_seconds=300,
+        api_key=api_key,
+        continuity_state=continuity_state,
+    )
+
+    upstream_payload = json.loads(prepared.text_data)
+    assert "previous_response_id" not in upstream_payload
+    assert upstream_payload["input"] == [*historical_input, new_input]
+    assert prepared.request_state.proxy_injected_previous_response_id is False
+    assert prepared.request_state.api_key_reservation is reservations[1]
+    release_reservation.assert_awaited_once_with(reservations[0])
 
 
 @pytest.mark.asyncio
@@ -19829,7 +20183,7 @@ async def test_prepare_websocket_full_replay_retry_text_uses_size_guard(monkeypa
 
 
 @pytest.mark.asyncio
-async def test_prepare_websocket_full_replay_rejects_oversized_unslimmable_payload(monkeypatch):
+async def test_prepare_websocket_anchored_full_replay_defers_oversized_rejection_until_transport_lookup(monkeypatch):
     request_logs = _RequestLogsRecorder()
     service = proxy_service.ProxyService(_repo_factory(request_logs))
     reserve_usage = AsyncMock(return_value=None)
@@ -19868,27 +20222,28 @@ async def test_prepare_websocket_full_replay_rejects_oversized_unslimmable_paylo
     monkeypatch.setattr(service, "_reserve_websocket_api_key_usage", reserve_usage)
     monkeypatch.setattr(service, "_refresh_websocket_api_key_policy", AsyncMock(return_value=api_key))
 
-    with pytest.raises(proxy_module.ProxyResponseError) as exc_info:
-        await service._prepare_websocket_response_create_request(
-            cast(
-                dict[str, JsonValue],
-                {
-                    "type": "response.create",
-                    "model": "gpt-5.1",
-                    "input": [*historical_input, new_input],
-                },
-            ),
-            headers={"session_id": "turn_ws_trim_too_large"},
-            codex_session_affinity=True,
-            openai_cache_affinity=True,
-            sticky_threads_enabled=False,
-            openai_cache_affinity_max_age_seconds=300,
-            api_key=api_key,
-            continuity_state=continuity_state,
-        )
+    prepared = await service._prepare_websocket_response_create_request(
+        cast(
+            dict[str, JsonValue],
+            {
+                "type": "response.create",
+                "model": "gpt-5.1",
+                "previous_response_id": "resp_other_anchor",
+                "input": [*historical_input, new_input],
+            },
+        ),
+        headers={"session_id": "turn_ws_trim_too_large"},
+        codex_session_affinity=True,
+        openai_cache_affinity=True,
+        sticky_threads_enabled=False,
+        openai_cache_affinity_max_age_seconds=300,
+        api_key=api_key,
+        continuity_state=continuity_state,
+    )
 
-    assert exc_info.value.status_code == 400
-    assert exc_info.value.payload["error"]["code"] == "payload_too_large"
+    assert prepared.http_fallback_payload is None
+    assert prepared.request_state.previous_response_id == "resp_other_anchor"
+    assert len(prepared.text_data.encode("utf-8")) > 2048
 
 
 def test_websocket_continuity_state_reuses_codex_session_scope():
@@ -19990,6 +20345,7 @@ def test_record_websocket_continuity_completion_keeps_anchor_fields_in_sync():
     assert continuity_state.last_completed_response_id == "resp_new_without_fingerprint"
     assert continuity_state.last_completed_input_count == 0
     assert continuity_state.last_completed_input_prefix_fingerprint is None
+    assert continuity_state.last_completed_upstream_transport == "websocket"
 
     complete_state = proxy_service._WebSocketRequestState(
         request_id="ws_complete_continuity",
@@ -20001,6 +20357,7 @@ def test_record_websocket_continuity_completion_keeps_anchor_fields_in_sync():
         input_item_count=3,
         input_full_fingerprint="new-fingerprint",
     )
+    complete_state.upstream_transport = "http"
 
     proxy_service._record_websocket_continuity_completion(
         continuity_state,
@@ -20011,6 +20368,194 @@ def test_record_websocket_continuity_completion_keeps_anchor_fields_in_sync():
     assert continuity_state.last_completed_response_id == "resp_new"
     assert continuity_state.last_completed_input_count == 3
     assert continuity_state.last_completed_input_prefix_fingerprint == "new-fingerprint"
+    assert continuity_state.last_completed_upstream_transport == "http"
+
+
+def test_websocket_continuity_anchor_ignores_http_completion() -> None:
+    historical_input: list[JsonValue] = [
+        {"role": "user", "content": [{"type": "input_text", "text": "old question"}]},
+    ]
+    continuity_state = proxy_service._WebSocketContinuityState(
+        last_completed_input_count=1,
+        last_completed_response_id="resp_http_completion",
+        last_completed_input_prefix_fingerprint=proxy_service._fingerprint_input_items(historical_input),
+        last_completed_upstream_transport="http",
+    )
+    responses_payload = ResponsesRequest.model_validate(
+        {
+            "model": "gpt-5.4",
+            "instructions": "",
+            "input": [
+                *historical_input,
+                {"role": "user", "content": [{"type": "input_text", "text": "continue"}]},
+            ],
+        }
+    )
+
+    assert (
+        proxy_service._websocket_continuity_anchor_for_payload(
+            continuity_state,
+            responses_payload=responses_payload,
+            codex_session_affinity=True,
+        )
+        is None
+    )
+
+
+def test_rejected_proxy_websocket_anchor_is_compare_and_cleared() -> None:
+    continuity_state = proxy_service._WebSocketContinuityState(
+        last_completed_input_count=2,
+        last_completed_response_id="resp_rejected_proxy_anchor",
+        last_completed_input_prefix_fingerprint="stored-fingerprint",
+        last_completed_upstream_transport="websocket",
+        last_pending_function_call_ids=["call_pending"],
+        last_pending_tool_call_types={"call_pending": "function_call"},
+        responses_lite_response_id="resp_rejected_proxy_anchor",
+    )
+    request_state = proxy_service._WebSocketRequestState(
+        request_id="ws_rejected_proxy_anchor",
+        model="gpt-5.4",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=0.0,
+        previous_response_id="resp_rejected_proxy_anchor",
+        proxy_injected_previous_response_id=True,
+    )
+
+    assert (
+        proxy_service._invalidate_rejected_proxy_websocket_continuity_anchor(
+            continuity_state,
+            request_state=request_state,
+        )
+        is True
+    )
+    assert continuity_state.last_completed_response_id is None
+    assert continuity_state.last_completed_input_count == 0
+    assert continuity_state.last_completed_input_prefix_fingerprint is None
+    assert continuity_state.last_completed_upstream_transport is None
+    assert continuity_state.last_pending_function_call_ids == []
+    assert continuity_state.last_pending_tool_call_types == {}
+    assert continuity_state.responses_lite_response_id is None
+
+
+def test_rejected_client_or_superseded_websocket_anchor_is_not_cleared() -> None:
+    continuity_state = proxy_service._WebSocketContinuityState(
+        last_completed_response_id="resp_newer_anchor",
+        last_completed_upstream_transport="websocket",
+    )
+    request_state = proxy_service._WebSocketRequestState(
+        request_id="ws_client_or_superseded_anchor",
+        model="gpt-5.4",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=0.0,
+        previous_response_id="resp_older_anchor",
+        proxy_injected_previous_response_id=True,
+    )
+
+    assert (
+        proxy_service._invalidate_rejected_proxy_websocket_continuity_anchor(
+            continuity_state,
+            request_state=request_state,
+        )
+        is False
+    )
+    assert continuity_state.last_completed_response_id == "resp_newer_anchor"
+
+    request_state.previous_response_id = "resp_newer_anchor"
+    request_state.proxy_injected_previous_response_id = False
+    assert (
+        proxy_service._invalidate_rejected_proxy_websocket_continuity_anchor(
+            continuity_state,
+            request_state=request_state,
+        )
+        is False
+    )
+    assert continuity_state.last_completed_response_id == "resp_newer_anchor"
+
+
+def test_final_proxy_anchor_revalidation_swaps_to_safe_fresh_body() -> None:
+    anchored_text = json.dumps(
+        {
+            "type": "response.create",
+            "model": "gpt-5.4",
+            "previous_response_id": "resp_invalidated_before_send",
+            "input": [{"role": "user", "content": [{"type": "input_text", "text": "new"}]}],
+        }
+    )
+    fresh_text = json.dumps(
+        {
+            "type": "response.create",
+            "model": "gpt-5.4",
+            "input": [
+                {"role": "user", "content": [{"type": "input_text", "text": "history"}]},
+                {"role": "user", "content": [{"type": "input_text", "text": "new"}]},
+            ],
+        }
+    )
+    request_state = proxy_service._WebSocketRequestState(
+        request_id="req-final-anchor-fresh",
+        model="gpt-5.4",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=0.0,
+        request_text=anchored_text,
+        previous_response_id="resp_invalidated_before_send",
+        proxy_injected_previous_response_id=True,
+        fresh_upstream_request_text=fresh_text,
+        fresh_upstream_request_is_retry_safe=True,
+    )
+    continuity_state = proxy_service._WebSocketContinuityState(
+        last_completed_response_id=None,
+        last_completed_upstream_transport=None,
+    )
+
+    send_text = websocket_helpers_module._revalidate_websocket_proxy_anchor_before_send(
+        request_state,
+        continuity_state,
+        text_data=anchored_text,
+    )
+
+    assert send_text == fresh_text
+    assert request_state.request_text == fresh_text
+    assert request_state.previous_response_id is None
+    assert request_state.proxy_injected_previous_response_id is False
+    assert request_state.fresh_upstream_request_is_retry_safe is False
+
+
+def test_final_proxy_anchor_revalidation_fails_locally_without_safe_fresh_body() -> None:
+    request_state = proxy_service._WebSocketRequestState(
+        request_id="req-final-anchor-fail-closed",
+        model="gpt-5.4",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=0.0,
+        request_text='{"type":"response.create"}',
+        previous_response_id="resp_invalidated_before_send",
+        proxy_injected_previous_response_id=True,
+        expose_stale_previous_response_classifier=True,
+    )
+    continuity_state = proxy_service._WebSocketContinuityState(
+        last_completed_response_id="resp_newer_completion",
+        last_completed_upstream_transport="websocket",
+    )
+
+    with pytest.raises(proxy_module.ProxyResponseError) as exc_info:
+        websocket_helpers_module._revalidate_websocket_proxy_anchor_before_send(
+            request_state,
+            continuity_state,
+            text_data=request_state.request_text or "",
+        )
+
+    assert exc_info.value.payload["error"]["code"] == "codex_previous_response_stale"
+    assert request_state.failure_phase_override == "upstream"
+    assert request_state.failure_detail_override is not None
+    assert "previous_response_source=proxy_injected" in request_state.failure_detail_override
+    assert "fresh_replay_available=false" in request_state.failure_detail_override
 
 
 def test_record_websocket_continuity_completion_keeps_pending_tool_calls_for_string_input():
@@ -20055,6 +20600,7 @@ def test_record_websocket_continuity_completion_keeps_pending_tool_calls_for_str
     )
 
     assert continuity_state.last_completed_response_id is None
+    assert continuity_state.last_completed_upstream_transport is None
     assert continuity_state.last_pending_function_call_ids == []
     assert continuity_state.last_pending_tool_call_types == {}
 
@@ -25139,9 +25685,217 @@ async def test_proxy_responses_websocket_replays_precreated_request_after_upstre
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("continuation_text", ["continue", "x" * 4096], ids=["small", "oversized"])
+async def test_proxy_responses_websocket_routes_persisted_http_response_continuation_over_http(
+    monkeypatch,
+    continuation_text: str,
+):
+    request_logs = _RequestLogsRecorder()
+    lookup_key = ("resp_prev_http_transport", None, "sid_http_transport")
+    request_logs.response_owner_by_id[lookup_key] = "acc_owner_http_transport"
+    request_logs.response_upstream_transport_by_id[lookup_key] = "http"
+    service = proxy_service.ProxyService(_repo_factory(request_logs))
+    settings = _make_proxy_settings()
+    settings.stream_idle_timeout_seconds = 300.0
+    settings.proxy_downstream_websocket_idle_timeout_seconds = 120.0
+    monkeypatch.setattr(proxy_service, "get_settings_cache", lambda: _SettingsCache(settings))
+    monkeypatch.setattr(proxy_service, "get_settings", lambda: settings)
+    monkeypatch.setattr(proxy_service, "_UPSTREAM_RESPONSE_CREATE_MAX_BYTES", 512)
+
+    class _TerminalWaitingDownstreamWebSocket:
+        def __init__(self, request_text: str) -> None:
+            self._request_text = request_text
+            self._request_sent = False
+            self._done = asyncio.Event()
+            self.sent_text: list[str] = []
+
+        async def receive(self) -> dict[str, object]:
+            if not self._request_sent:
+                self._request_sent = True
+                return {"type": "websocket.receive", "text": self._request_text}
+            await self._done.wait()
+            return {"type": "websocket.disconnect"}
+
+        async def send_text(self, text: str) -> None:
+            self.sent_text.append(text)
+            if json.loads(text).get("type") in {"response.completed", "response.failed", "error"}:
+                self._done.set()
+
+        async def send_bytes(self, _data: bytes) -> None:
+            return None
+
+        async def close(self, code: int = 1000, reason: str | None = None) -> None:
+            del code, reason
+            self._done.set()
+
+    stream_calls: list[dict[str, object]] = []
+
+    async def stream_with_retry(payload, headers, **kwargs):
+        del headers
+        kwargs["api_key_reservation_settlement_started"].set()
+        stream_calls.append({"payload": payload.to_payload(), "kwargs": kwargs})
+        yield proxy_service.format_sse_event(
+            {
+                "type": "response.created",
+                "response": {"id": "resp_http_transport_next", "status": "in_progress"},
+            }
+        )
+        yield proxy_service.format_sse_event(
+            {
+                "type": "response.completed",
+                "response": {"id": "resp_http_transport_next", "status": "completed"},
+            }
+        )
+
+    connect_websocket = AsyncMock()
+    monkeypatch.setattr(service, "_stream_with_retry", stream_with_retry)
+    monkeypatch.setattr(service, "_connect_proxy_websocket", connect_websocket)
+    request_payload = {
+        "type": "response.create",
+        "model": "gpt-5.1",
+        "instructions": "",
+        "input": [{"role": "user", "content": [{"type": "input_text", "text": continuation_text}]}],
+        "previous_response_id": "resp_prev_http_transport",
+        "stream": True,
+    }
+    downstream = _TerminalWaitingDownstreamWebSocket(json.dumps(request_payload, separators=(",", ":")))
+
+    await service.proxy_responses_websocket(
+        cast(WebSocket, downstream),
+        {"session_id": "sid_http_transport"},
+        codex_session_affinity=False,
+        openai_cache_affinity=False,
+        api_key=None,
+    )
+
+    connect_websocket.assert_not_awaited()
+    assert request_logs.lookup_calls == [lookup_key]
+    assert len(stream_calls) == 1
+    relayed_payload = cast(dict[str, object], stream_calls[0]["payload"])
+    assert relayed_payload["model"] == "gpt-5.1"
+    assert relayed_payload["input"] == request_payload["input"]
+    assert relayed_payload["previous_response_id"] == "resp_prev_http_transport"
+    assert relayed_payload["stream"] is True
+    stream_kwargs = cast(dict[str, object], stream_calls[0]["kwargs"])
+    assert stream_kwargs["upstream_stream_transport_override"] == "http"
+    assert stream_kwargs["resolved_previous_response_owner_account_id"] == "acc_owner_http_transport"
+    assert [json.loads(event)["type"] for event in downstream.sent_text] == [
+        "response.created",
+        "response.completed",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_proxy_responses_websocket_rejects_oversized_persisted_websocket_continuation(monkeypatch):
+    request_logs = _RequestLogsRecorder()
+    lookup_key = ("resp_prev_websocket_transport", None, "sid_websocket_transport")
+    request_logs.response_owner_by_id[lookup_key] = "acc_owner_websocket_transport"
+    request_logs.response_upstream_transport_by_id[lookup_key] = "websocket"
+    service = proxy_service.ProxyService(_repo_factory(request_logs))
+    settings = _make_proxy_settings()
+    settings.proxy_downstream_websocket_idle_timeout_seconds = 120.0
+    monkeypatch.setattr(proxy_service, "get_settings_cache", lambda: _SettingsCache(settings))
+    monkeypatch.setattr(proxy_service, "get_settings", lambda: settings)
+    monkeypatch.setattr(proxy_service, "_UPSTREAM_RESPONSE_CREATE_MAX_BYTES", 512)
+    connect_websocket = AsyncMock()
+    relay_over_http = AsyncMock()
+    monkeypatch.setattr(service, "_connect_proxy_websocket", connect_websocket)
+    monkeypatch.setattr(service, "_relay_websocket_response_create_over_http", relay_over_http)
+    request_payload = {
+        "type": "response.create",
+        "model": "gpt-5.1",
+        "instructions": "",
+        "input": [{"role": "user", "content": [{"type": "input_text", "text": "x" * 4096}]}],
+        "previous_response_id": "resp_prev_websocket_transport",
+        "stream": True,
+    }
+    downstream = _ScriptedDownstreamWebSocket(json.dumps(request_payload, separators=(",", ":")))
+
+    await service.proxy_responses_websocket(
+        cast(WebSocket, downstream),
+        {"session_id": "sid_websocket_transport"},
+        codex_session_affinity=False,
+        openai_cache_affinity=False,
+        api_key=None,
+    )
+
+    connect_websocket.assert_not_awaited()
+    relay_over_http.assert_not_awaited()
+    assert request_logs.lookup_calls == [lookup_key]
+    assert len(downstream.sent_text) == 1
+    failure = json.loads(downstream.sent_text[0])
+    assert failure["type"] == "error"
+    assert failure["status"] == 400
+    assert failure["error"]["code"] == "payload_too_large"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("upstream_transport", "continuation_text", "expects_websocket_connect"),
+    [
+        pytest.param(None, "continue", True, id="legacy-null-small"),
+        pytest.param("legacy-unknown", "continue", True, id="unknown-small"),
+        pytest.param(None, "x" * 4096, False, id="legacy-null-oversized"),
+        pytest.param("legacy-unknown", "x" * 4096, False, id="unknown-oversized"),
+    ],
+)
+async def test_proxy_responses_websocket_never_infers_persisted_non_http_transport_as_http(
+    monkeypatch: pytest.MonkeyPatch,
+    upstream_transport: str | None,
+    continuation_text: str,
+    expects_websocket_connect: bool,
+) -> None:
+    request_logs = _RequestLogsRecorder()
+    lookup_key = ("resp_prev_non_http_transport", None, "sid_non_http_transport")
+    request_logs.response_owner_by_id[lookup_key] = "acc_owner_non_http_transport"
+    request_logs.response_upstream_transport_by_id[lookup_key] = upstream_transport
+    service = proxy_service.ProxyService(_repo_factory(request_logs))
+    settings = _make_proxy_settings()
+    settings.proxy_downstream_websocket_idle_timeout_seconds = 120.0
+    monkeypatch.setattr(proxy_service, "get_settings_cache", lambda: _SettingsCache(settings))
+    monkeypatch.setattr(proxy_service, "get_settings", lambda: settings)
+    monkeypatch.setattr(proxy_service, "_UPSTREAM_RESPONSE_CREATE_MAX_BYTES", 512)
+    connect_websocket = AsyncMock(return_value=(None, None))
+    relay_over_http = AsyncMock()
+    monkeypatch.setattr(service, "_connect_proxy_websocket", connect_websocket)
+    monkeypatch.setattr(service, "_relay_websocket_response_create_over_http", relay_over_http)
+    request_payload = {
+        "type": "response.create",
+        "model": "gpt-5.1",
+        "instructions": "",
+        "input": [{"role": "user", "content": [{"type": "input_text", "text": continuation_text}]}],
+        "previous_response_id": "resp_prev_non_http_transport",
+        "stream": True,
+    }
+    downstream = _ScriptedDownstreamWebSocket(json.dumps(request_payload, separators=(",", ":")))
+
+    await service.proxy_responses_websocket(
+        cast(WebSocket, downstream),
+        {"session_id": "sid_non_http_transport"},
+        codex_session_affinity=False,
+        openai_cache_affinity=False,
+        api_key=None,
+    )
+
+    assert request_logs.lookup_calls == [lookup_key]
+    relay_over_http.assert_not_awaited()
+    if expects_websocket_connect:
+        connect_websocket.assert_awaited_once()
+        assert downstream.sent_text == []
+    else:
+        connect_websocket.assert_not_awaited()
+        assert len(downstream.sent_text) == 1
+        failure = json.loads(downstream.sent_text[0])
+        assert failure["type"] == "error"
+        assert failure["status"] == 400
+        assert failure["error"]["code"] == "payload_too_large"
+
+
+@pytest.mark.asyncio
 async def test_proxy_responses_websocket_prefers_previous_response_owner_from_request_logs(monkeypatch):
     request_logs = _RequestLogsRecorder()
     request_logs.response_owner_by_id[("resp_prev_owner", None, "sid_owner")] = "acc_owner_prev"
+    request_logs.response_upstream_transport_by_id[("resp_prev_owner", None, "sid_owner")] = "websocket"
     service = proxy_service.ProxyService(_repo_factory(request_logs))
 
     settings = _make_proxy_settings()
@@ -26831,6 +27585,56 @@ async def test_resolve_websocket_previous_response_owner_rechecks_same_scope_aft
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("upstream_transport", ["http", "websocket", None])
+async def test_resolve_websocket_previous_response_owner_preserves_transport_in_cache(
+    upstream_transport: str | None,
+) -> None:
+    request_logs = _RequestLogsRecorder()
+    lookup_key = ("resp_prev_transport", None, "sid_transport")
+    request_logs.response_owner_by_id[lookup_key] = "acc_owner_transport"
+    request_logs.response_upstream_transport_by_id[lookup_key] = upstream_transport
+    service = proxy_service.ProxyService(_repo_factory(request_logs))
+    first_state = proxy_service._WebSocketRequestState(
+        request_id="ws_prev_transport_first",
+        model="gpt-5.4",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=0.0,
+    )
+    cached_state = proxy_service._WebSocketRequestState(
+        request_id="ws_prev_transport_cached",
+        model="gpt-5.4",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=0.0,
+    )
+
+    first_owner = await service._resolve_websocket_previous_response_owner(
+        previous_response_id="resp_prev_transport",
+        api_key=None,
+        session_id="sid_transport",
+        surface="websocket",
+        request_state=first_state,
+    )
+    cached_owner = await service._resolve_websocket_previous_response_owner(
+        previous_response_id="resp_prev_transport",
+        api_key=None,
+        session_id="sid_transport",
+        surface="websocket",
+        request_state=cached_state,
+    )
+
+    assert first_owner == cached_owner == "acc_owner_transport"
+    assert first_state.previous_response_owner_lookup_source == "request_logs"
+    assert cached_state.previous_response_owner_lookup_source == "request_cache"
+    assert first_state.previous_response_owner_upstream_transport == upstream_transport
+    assert cached_state.previous_response_owner_upstream_transport == upstream_transport
+    assert request_logs.lookup_calls == [lookup_key]
+
+
+@pytest.mark.asyncio
 async def test_resolve_websocket_previous_response_owner_miss_does_not_evict_known_owner(monkeypatch):
     request_logs = _RequestLogsRecorder()
     service = proxy_service.ProxyService(_repo_factory(request_logs))
@@ -26905,9 +27709,8 @@ async def test_resolve_websocket_previous_response_owner_prefers_scoped_lookup_o
 
     assert owner == "acc_owner_scoped"
     assert request_logs.lookup_calls == [("resp_prev_shared", api_key.id, "turn_scope_a")]
-    assert service._websocket_previous_response_account_index[("resp_prev_shared", api_key.id, "turn_scope_a")] == (
-        "acc_owner_scoped"
-    )
+    cached_owner = service._websocket_previous_response_account_index[("resp_prev_shared", api_key.id, "turn_scope_a")]
+    assert cached_owner.account_id == "acc_owner_scoped"
 
 
 @pytest.mark.asyncio
