@@ -35,7 +35,6 @@ from app.modules.usage.builders import (
     build_activity_summaries,
     build_trends_from_buckets,
     build_usage_window_response,
-    floor_bucket_window_start,
 )
 from app.modules.usage.depletion_service import (
     compute_aggregate_depletion,

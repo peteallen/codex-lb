@@ -10,7 +10,6 @@ from app.modules.dashboard.schemas import (
     DashboardOverviewPresetKey,
     DashboardOverviewSummary,
     DashboardOverviewTimeframe,
-    DashboardOverviewPresetKey,
     DashboardOverviewTimeframeKey,
     DashboardUsageCost,
     DashboardUsageMetrics,

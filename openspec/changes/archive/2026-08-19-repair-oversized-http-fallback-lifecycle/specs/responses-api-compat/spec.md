@@ -2,10 +2,10 @@
 
 ### Requirement: HTTP fallback preserves capability routing and lineage
 
-When an oversized WebSocket `response.create` request requires Trusted Cyber
-authorization, the HTTP fallback MUST pass that requirement to upstream
-account selection and MUST persist the capability lineage aliases for the
-generated response ID before forwarding `response.created` downstream.
+An oversized WebSocket `response.create` request MUST preserve its Trusted
+Cyber authorization requirement through HTTP fallback account selection. The
+fallback MUST persist the capability lineage aliases for the generated
+response ID before forwarding `response.created` downstream.
 
 #### Scenario: capability-aware fallback
 
