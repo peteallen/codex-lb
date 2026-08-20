@@ -5,6 +5,7 @@ import { useTranslation } from "react-i18next";
 import { AlertMessage } from "@/components/alert-message";
 import { Button } from "@/components/ui/button";
 import { listAccounts } from "@/features/accounts/api";
+import { listApiKeys } from "@/features/api-keys/api";
 import { useReports } from "@/features/reports/hooks/use-reports";
 import { useReportChartVisibility } from "@/features/reports/hooks/use-report-chart-visibility";
 import { getErrorMessageOrNull } from "@/utils/errors";
@@ -70,6 +71,7 @@ const createDefaultFilters = (): ReportsFiltersState => ({
   startDate: daysAgoLocalISO(6),
   endDate: localDateISO(),
   accountId: [],
+  apiKeyId: [],
   model: "",
   useragent: "",
 });
@@ -129,6 +131,14 @@ export function ReportsPage({ initialFilters }: ReportsPageProps = {}) {
     queryKey: ["accounts", "reports-filter"],
     queryFn: listAccounts,
   });
+  const {
+    data: apiKeysData,
+    error: apiKeysError,
+    refetch: refetchApiKeys,
+  } = useQuery({
+    queryKey: ["api-keys", "list"],
+    queryFn: listApiKeys,
+  });
 
   const accountOptions = useMemo(
     () =>
@@ -142,6 +152,15 @@ export function ReportsPage({ initialFilters }: ReportsPageProps = {}) {
         isEmail: !account.alias,
       })),
     [accountsData],
+  );
+
+  const apiKeyOptions = useMemo(
+    () =>
+      (apiKeysData ?? []).map((apiKey) => ({
+        value: apiKey.id,
+        label: `${apiKey.name} · ${apiKey.keyPrefix}`,
+      })),
+    [apiKeysData],
   );
 
   const modelOptions = useMemo(
@@ -165,14 +184,15 @@ export function ReportsPage({ initialFilters }: ReportsPageProps = {}) {
   const mainReportsError = getErrorMessageOrNull(reportsQuery.error);
   const sharedOptionsError = getErrorMessageOrNull(filterCatalogQuery.error);
   const accountOptionsError = getErrorMessageOrNull(accountsError);
+  const apiKeyOptionsError = getErrorMessageOrNull(apiKeysError);
 
   const hasAnyError = Boolean(
-    mainReportsError || sharedOptionsError || accountOptionsError,
+    mainReportsError || sharedOptionsError || accountOptionsError || apiKeyOptionsError,
   );
 
   const handleRetry = async () => {
     if (!isReportDateRangeValid(filters.startDate, filters.endDate)) {
-      await refetchAccounts();
+      await Promise.allSettled([refetchAccounts(), refetchApiKeys()]);
       return;
     }
 
@@ -180,6 +200,7 @@ export function ReportsPage({ initialFilters }: ReportsPageProps = {}) {
       reportsQuery.refetch(),
       filterCatalogQuery.refetch(),
       refetchAccounts(),
+      refetchApiKeys(),
     ]);
   };
 
@@ -217,6 +238,7 @@ export function ReportsPage({ initialFilters }: ReportsPageProps = {}) {
         filters={filters}
         selectedPresetDays={selectedPresetDays}
         accountOptions={accountOptions}
+        apiKeyOptions={apiKeyOptions}
         modelOptions={modelOptions}
         useragentOptions={useragentOptions}
         visibleChartIds={visibleChartIds}
@@ -239,6 +261,23 @@ export function ReportsPage({ initialFilters }: ReportsPageProps = {}) {
         <AlertMessage variant="error">
           {t("reports.errors.accounts", { error: accountOptionsError })}
         </AlertMessage>
+      ) : null}
+      {apiKeyOptionsError ? (
+        <AlertMessage variant="error">
+          {t("reports.errors.apiKeys", { error: apiKeyOptionsError })}
+        </AlertMessage>
+      ) : null}
+      {hasAnyError ? (
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          onClick={() => {
+            void handleRetry();
+          }}
+        >
+          {t("common.actions.retry")}
+        </Button>
       ) : null}
 
       {reportsQuery.isLoading ? (
@@ -323,16 +362,6 @@ export function ReportsPage({ initialFilters }: ReportsPageProps = {}) {
           <AlertMessage variant="warning">
             {t("reports.errors.partial")}
           </AlertMessage>
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            onClick={() => {
-              void handleRetry();
-            }}
-          >
-            {t("common.actions.retry")}
-          </Button>
         </div>
       ) : null}
     </div>
