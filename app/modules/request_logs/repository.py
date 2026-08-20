@@ -571,6 +571,7 @@ class RequestLogsRepository:
         self,
         since: datetime,
         bucket_seconds: int = 21600,
+        until: datetime | None = None,
     ) -> list[BucketModelAggregate]:
         # Folded history comes from the hourly rollups; only the un-folded
         # complement scans raw request_logs. Every display bucket the
@@ -584,11 +585,12 @@ class RequestLogsRepository:
             for index, value in enumerate(values):
                 entry[index] += value
 
-        raw_windows: list[RawWindow] = [(since, None)]
+        raw_windows: list[RawWindow] = [(since, until)]
         if bucket_seconds > 0 and bucket_seconds % HOURLY_BUCKET_SECONDS == 0:
             rollup_rows, raw_windows = await read_hourly_window(
                 self._session,
                 since,
+                until,
                 filters=(RequestUsageHourlyRollup.request_kind.not_in(WARMUP_REQUEST_KINDS),),
             )
             for rollup in rollup_rows:
@@ -660,6 +662,7 @@ class RequestLogsRepository:
         self,
         since: datetime,
         bucket_seconds: int = 21600,
+        until: datetime | None = None,
     ) -> list[BucketConversationAggregate]:
         # Hour-multiple display buckets merge the conversation satellite with
         # the raw tail in one UNION statement: COUNT(DISTINCT) over the merge
@@ -670,6 +673,7 @@ class RequestLogsRepository:
             union = conversation_presence_union(
                 self._session,
                 since,
+                until,
                 include_deleted=False,
                 raw_conditions=self._eligible_conversation_row_conditions(),
                 display_bucket_seconds=bucket_seconds,
@@ -689,6 +693,7 @@ class RequestLogsRepository:
                 )
                 .where(
                     RequestLog.requested_at >= since,
+                    *([RequestLog.requested_at < until] if until is not None else []),
                     *self._eligible_conversation_row_conditions(),
                     conversation_id.is_not(None),
                 )

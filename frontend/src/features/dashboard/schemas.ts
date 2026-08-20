@@ -7,14 +7,19 @@ export { AccountAdditionalQuotaSchema, AccountSummarySchema };
 export type { AccountSummary };
 export type { AccountAdditionalQuota as AdditionalQuota } from "@/features/accounts/schemas";
 
-const OverviewTimeframeKeySchema = z.enum(["1d", "7d", "30d"]);
-export type OverviewTimeframe = z.infer<typeof OverviewTimeframeKeySchema>;
+const OverviewTimeframePresetSchema = z.enum(["1d", "7d", "30d"]);
+const OverviewTimeframeKeySchema = z.enum(["1d", "7d", "30d", "custom"]);
+export type OverviewTimeframe = z.infer<typeof OverviewTimeframePresetSchema>;
 export const DEFAULT_OVERVIEW_TIMEFRAME: OverviewTimeframe = "7d";
 
 export function parseOverviewTimeframe(value: string | null | undefined): OverviewTimeframe {
-  const parsed = OverviewTimeframeKeySchema.safeParse(value);
+  const parsed = OverviewTimeframePresetSchema.safeParse(value);
   return parsed.success ? parsed.data : DEFAULT_OVERVIEW_TIMEFRAME;
 }
+
+export type DashboardOverviewRange =
+  | { mode: "preset"; timeframe: OverviewTimeframe }
+  | { mode: "custom"; startDate: string; endDate: string; timezone?: string };
 
 const ConversationTimeframeKeySchema = z.enum(["1d", "7d", "30d"]);
 export type ConversationTimeframe = z.infer<typeof ConversationTimeframeKeySchema>;
@@ -210,6 +215,8 @@ export const RequestLogSchema = z.object({
   costBreakdown: RequestLogCostBreakdownSchema.nullable().optional().default(null),
   latencyMs: z.number().nullable(),
   latencyFirstTokenMs: z.number().nullable().optional().default(null),
+  latencyFirstUpstreamEventMs: z.number().nullable().optional(),
+  latencyResponseCreatedMs: z.number().nullable().optional(),
   latencyQueueMs: z.number().nullable().optional().default(null),
 });
 

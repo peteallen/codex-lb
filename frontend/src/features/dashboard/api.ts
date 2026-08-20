@@ -9,7 +9,7 @@ import {
   RequestLogFilterOptionsSchema,
   RequestLogsResponseSchema,
   type ConversationTimeframe,
-  type OverviewTimeframe,
+  type DashboardOverviewRange,
 } from "@/features/dashboard/schemas";
 
 const DASHBOARD_PATH = "/api/dashboard";
@@ -38,7 +38,7 @@ export type RequestLogFacetFilters = {
 };
 
 export type DashboardOverviewParams = {
-  timeframe?: OverviewTimeframe;
+  range?: DashboardOverviewRange;
 };
 
 function appendMany(params: URLSearchParams, key: string, values?: string[]): void {
@@ -54,7 +54,16 @@ function appendMany(params: URLSearchParams, key: string, values?: string[]): vo
 
 export function getDashboardOverview(params: DashboardOverviewParams = {}) {
   const query = new URLSearchParams();
-  query.set("timeframe", params.timeframe ?? DEFAULT_OVERVIEW_TIMEFRAME);
+  const range = params.range ?? { mode: "preset", timeframe: DEFAULT_OVERVIEW_TIMEFRAME };
+  if (range.mode === "custom") {
+    query.set("start_date", range.startDate);
+    query.set("end_date", range.endDate);
+    if (range.timezone) {
+      query.set("timezone", range.timezone);
+    }
+  } else {
+    query.set("timeframe", range.timeframe);
+  }
   return get(`${DASHBOARD_PATH}/overview?${query.toString()}`, DashboardOverviewSchema);
 }
 

@@ -70,6 +70,20 @@ def align_bucket_window_start(
     return aligned
 
 
+def floor_bucket_window_start(
+    since: datetime,
+    bucket_seconds: int,
+) -> datetime:
+    since_epoch = (
+        int(since.replace(tzinfo=timezone.utc).timestamp()) if since.tzinfo is None else int(since.timestamp())
+    )
+    first_bucket_epoch = since_epoch - since_epoch % bucket_seconds
+    aligned = datetime.fromtimestamp(first_bucket_epoch, tz=timezone.utc)
+    if since.tzinfo is None:
+        return aligned.replace(tzinfo=None)
+    return aligned
+
+
 def build_trends_from_buckets(
     rows: list[BucketModelAggregate],
     since: datetime,

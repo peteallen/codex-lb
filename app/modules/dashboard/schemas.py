@@ -9,7 +9,8 @@ from app.modules.accounts.schemas import AccountSummary
 from app.modules.shared.schemas import DashboardModel
 from app.modules.usage.schemas import MetricsTrends, UsageWindow, UsageWindowResponse
 
-DashboardOverviewTimeframeKey = Literal["1d", "7d", "30d"]
+DashboardOverviewPresetKey = Literal["1d", "7d", "30d"]
+DashboardOverviewTimeframeKey = Literal["1d", "7d", "30d", "custom"]
 
 
 class DashboardOverviewTimeframe(DashboardModel):

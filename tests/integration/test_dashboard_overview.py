@@ -863,6 +863,55 @@ async def test_dashboard_projections_weekly_credit_pace_uses_configured_working_
 
 
 @pytest.mark.asyncio
+async def test_dashboard_projections_weekly_credit_pace_forecast_skips_non_working_days(
+    async_client,
+    db_setup,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    fixed_now = datetime(2026, 5, 24, 12, 0, 0)
+    monkeypatch.setattr("app.modules.dashboard.service.utcnow", lambda: fixed_now)
+    reset_at = int(naive_utc_to_epoch(datetime(2026, 5, 25, 0, 0, 0)))
+
+    settings_response = await async_client.put("/api/settings", json={"weeklyPaceWorkingDays": "0,1,2,3,4"})
+    assert settings_response.status_code == 200
+
+    async with SessionLocal() as session:
+        accounts_repo = AccountsRepository(session)
+        usage_repo = UsageRepository(session)
+
+        await accounts_repo.upsert(
+            _make_account("acc_weekday_forecast", "weekday-forecast@example.com", plan_type="pro")
+        )
+        await usage_repo.add_entry(
+            "acc_weekday_forecast",
+            97.4,
+            window="secondary",
+            window_minutes=10080,
+            reset_at=reset_at,
+            recorded_at=fixed_now - timedelta(hours=3),
+        )
+        await usage_repo.add_entry(
+            "acc_weekday_forecast",
+            98.0,
+            window="secondary",
+            window_minutes=10080,
+            reset_at=reset_at,
+            recorded_at=fixed_now - timedelta(minutes=1),
+        )
+
+    response = await async_client.get("/api/dashboard/projections")
+    assert response.status_code == 200
+    payload = response.json()
+
+    pace = payload["weeklyCreditPace"]
+    assert pace["actualUsedPercent"] == pytest.approx(98.0)
+    assert pace["scheduledUsedPercent"] == pytest.approx(100.0)
+    assert pace["forecastBurnRateCreditsPerHour"] == pytest.approx(101.34, abs=0.1)
+    assert pace["projectedShortfallCredits"] == 0
+    assert pace["status"] == "on_track"
+
+
+@pytest.mark.asyncio
 async def test_dashboard_projections_compute_depletion_from_recent_db_history(async_client, db_setup):
     now = utcnow().replace(microsecond=0)
 
@@ -1025,6 +1074,111 @@ async def test_dashboard_overview_respects_selected_timeframe(
     else:
         assert payload["summary"]["metrics"]["errorCount"] == 1
         assert payload["summary"]["metrics"]["topError"] == "rate_limit_exceeded"
+
+
+@pytest.mark.asyncio
+async def test_dashboard_overview_supports_custom_date_range(
+    async_client,
+    db_setup,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    fixed_now = datetime(2026, 4, 10, 12, 0, 0)
+    monkeypatch.setattr("app.modules.dashboard.service.utcnow", lambda: fixed_now)
+
+    async with SessionLocal() as session:
+        accounts_repo = AccountsRepository(session)
+        usage_repo = UsageRepository(session)
+        logs_repo = RequestLogsRepository(session)
+
+        await accounts_repo.upsert(_make_account("acc_custom_range", "custom-range@example.com"))
+        await usage_repo.add_entry(
+            "acc_custom_range",
+            20.0,
+            window="primary",
+            recorded_at=fixed_now - timedelta(minutes=5),
+        )
+        await usage_repo.add_entry(
+            "acc_custom_range",
+            40.0,
+            window="secondary",
+            recorded_at=fixed_now - timedelta(minutes=2),
+        )
+        await logs_repo.add_log(
+            account_id="acc_custom_range",
+            request_id="req_custom_previous",
+            model="gpt-5.1",
+            input_tokens=10,
+            output_tokens=5,
+            latency_ms=50,
+            status="success",
+            error_code=None,
+            conversation_id="conv-custom-previous",
+            requested_at=datetime(2026, 3, 31, 12, 0, 0),
+        )
+        await logs_repo.add_log(
+            account_id="acc_custom_range",
+            request_id="req_custom_one",
+            model="gpt-5.1",
+            input_tokens=100,
+            output_tokens=50,
+            latency_ms=50,
+            status="success",
+            error_code=None,
+            conversation_id="conv-custom-one",
+            requested_at=datetime(2026, 4, 1, 12, 0, 0),
+        )
+        await logs_repo.add_log(
+            account_id="acc_custom_range",
+            request_id="req_custom_two",
+            model="gpt-5.1",
+            input_tokens=200,
+            output_tokens=100,
+            latency_ms=50,
+            status="error",
+            error_code="rate_limit_exceeded",
+            conversation_id="conv-custom-two",
+            requested_at=datetime(2026, 4, 3, 12, 0, 0),
+        )
+        await logs_repo.add_log(
+            account_id="acc_custom_range",
+            request_id="req_custom_after",
+            model="gpt-5.1",
+            input_tokens=400,
+            output_tokens=200,
+            latency_ms=50,
+            status="success",
+            error_code=None,
+            conversation_id="conv-custom-after",
+            requested_at=datetime(2026, 4, 4, 12, 0, 0),
+        )
+
+    response = await async_client.get("/api/dashboard/overview?start_date=2026-04-01&end_date=2026-04-03&timezone=UTC")
+    assert response.status_code == 200
+
+    payload = response.json()
+    assert payload["timeframe"] == {
+        "key": "custom",
+        "windowMinutes": 4320,
+        "bucketSeconds": 86400,
+        "bucketCount": 3,
+    }
+    assert payload["summary"]["metrics"]["requests"] == 2
+    assert payload["summary"]["metrics"]["tokens"] == 450
+    assert payload["summary"]["metrics"]["errorCount"] == 1
+    assert payload["summary"]["metrics"]["topError"] == "rate_limit_exceeded"
+    assert payload["summary"]["metrics"]["conversations"] == 2
+    assert sum(point["v"] for point in payload["trends"]["conversations"]) == 2
+    assert payload["summary"]["comparison"]["previous"]["requests"] == 1
+    assert len(payload["trends"]["requests"]) == 3
+
+
+@pytest.mark.asyncio
+async def test_dashboard_overview_rejects_invalid_custom_date_range(async_client):
+    response = await async_client.get("/api/dashboard/overview?start_date=2026-04-03&end_date=2026-04-01")
+    assert response.status_code == 400
+
+    payload = response.json()
+    assert "start date must be on or before end date" in payload["error"]["message"]
 
 
 @pytest.mark.asyncio

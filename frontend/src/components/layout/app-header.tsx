@@ -14,6 +14,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Sheet, SheetContent, SheetHeader, SheetTitle, SheetTrigger } from "@/components/ui/sheet";
+import { APP_DISPLAY_NAME } from "@/config/branding";
 import { listAccounts } from "@/features/accounts/api";
 import { getSettings } from "@/features/settings/api";
 import { usePrivacyStore } from "@/hooks/use-privacy";
@@ -98,7 +99,7 @@ export function AppHeader({
             <CodexLogo size={20} className="text-primary" />
           </div>
           <div className="min-w-0">
-            <p className="truncate text-sm font-semibold tracking-tight">Codex LB</p>
+            <p className="truncate text-sm font-semibold tracking-tight">{APP_DISPLAY_NAME}</p>
           </div>
         </Link>
 
@@ -203,7 +204,7 @@ export function AppHeader({
                   <div className="flex h-7 w-7 items-center justify-center rounded-lg bg-primary/10">
                     <CodexLogo size={16} className="text-primary" />
                   </div>
-                  <span className="text-sm font-semibold">Codex LB</span>
+                  <span className="text-sm font-semibold">{APP_DISPLAY_NAME}</span>
                 </SheetTitle>
               </SheetHeader>
               <nav className="flex flex-col gap-0.5 px-4 pt-2">

@@ -4,6 +4,7 @@ import { useTranslation } from "react-i18next";
 
 import { CodexLogo } from "@/components/brand/codex-logo";
 import { SpinnerBlock } from "@/components/ui/spinner";
+import { APP_DISPLAY_NAME } from "@/config/branding";
 import { BootstrapSetupScreen } from "@/features/auth/components/bootstrap-setup-screen";
 import { LoginForm } from "@/features/auth/components/login-form";
 import { TotpDialog } from "@/features/auth/components/totp-dialog";
@@ -62,7 +63,7 @@ export function AuthGate({ children }: PropsWithChildren) {
               <CodexLogo size={28} className="text-primary" />
             </div>
             <div>
-              <h1 className="text-xl font-semibold tracking-tight">{t("auth.appTitle")}</h1>
+              <h1 className="text-xl font-semibold tracking-tight">{APP_DISPLAY_NAME}</h1>
               <p className="mt-0.5 text-sm text-muted-foreground">{t("auth.appSubtitle")}</p>
             </div>
           </div>

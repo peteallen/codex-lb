@@ -28,6 +28,14 @@ function renderHeader(initialEntry = "/dashboard") {
 }
 
 describe("AppHeader", () => {
+  it("shows the fork display name in the desktop and mobile brand", async () => {
+    renderHeader();
+
+    expect(screen.getAllByText("Codex LB (Pete's Fork)")).toHaveLength(1);
+    await userEvent.click(screen.getByRole("button", { name: "Open menu" }));
+    expect(screen.getAllByText("Codex LB (Pete's Fork)")).toHaveLength(2);
+  });
+
   it("shows the summed Accounts reset-credit badge capped at 99+", async () => {
     server.use(
       http.get("/api/accounts", () =>
