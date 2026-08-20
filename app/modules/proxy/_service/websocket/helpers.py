@@ -274,6 +274,7 @@ from app.modules.proxy._service.observability import (
 from app.modules.proxy._service.support import (
     _ACCOUNT_MODEL_UNSUPPORTED_ERROR_CODE,
     _HARD_HTTP_BRIDGE_AFFINITY_KINDS,  # noqa: F401
+    _REQUEST_TRANSPORT_WEBSOCKET,
     _WEBSOCKET_FULL_REPLAY_WAIT_MIN_ITEMS,
     _WEBSOCKET_FULL_REPLAY_WAIT_POLL_SECONDS,  # noqa: F401
     _clear_websocket_request_error_overrides,
@@ -421,6 +422,8 @@ def _websocket_continuity_anchor_for_payload(
         return None
     if responses_payload.previous_response_id is not None:
         return None
+    if continuity_state.last_completed_upstream_transport != _REQUEST_TRANSPORT_WEBSOCKET:
+        return None
     previous_response_id = continuity_state.last_completed_response_id
     if previous_response_id is None:
         return None
@@ -504,6 +507,7 @@ def _record_websocket_continuity_completion(
         continuity_state.last_completed_response_id = None
         continuity_state.last_completed_input_count = 0
         continuity_state.last_completed_input_prefix_fingerprint = None
+        continuity_state.last_completed_upstream_transport = None
         continuity_state.last_pending_function_call_ids = []
         continuity_state.last_pending_tool_call_types = {}
         return
@@ -515,6 +519,7 @@ def _record_websocket_continuity_completion(
     # is cleared rather than left stale when the completed turn cannot
     # provide one.
     continuity_state.last_completed_response_id = response_id
+    continuity_state.last_completed_upstream_transport = request_state.upstream_transport
     if request_state.input_item_count > 0 and request_state.input_full_fingerprint is not None:
         continuity_state.last_completed_input_count = request_state.input_item_count
         continuity_state.last_completed_input_prefix_fingerprint = request_state.input_full_fingerprint

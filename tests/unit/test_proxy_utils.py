@@ -20164,7 +20164,7 @@ async def test_prepare_websocket_response_create_request_logs_affinity_metadata(
 
 
 @pytest.mark.asyncio
-async def test_prepare_websocket_response_create_request_releases_reservation_on_payload_too_large(monkeypatch):
+async def test_prepare_websocket_response_create_request_classifies_oversized_full_resend_for_http(monkeypatch):
     request_logs = _RequestLogsRecorder()
     service = proxy_service.ProxyService(_repo_factory(request_logs))
     reservation = SimpleNamespace(reservation_id="res_large_ws", model="gpt-5.1")
@@ -20195,11 +20195,67 @@ async def test_prepare_websocket_response_create_request_releases_reservation_on
     monkeypatch.setattr(service, "_release_websocket_reservation", release_usage)
     monkeypatch.setattr(service, "_refresh_websocket_api_key_policy", AsyncMock(return_value=api_key))
 
+    prepared = await service._prepare_websocket_response_create_request(
+        {
+            "type": "response.create",
+            "model": "gpt-5.1",
+            "input": [{"role": "user", "content": [{"type": "input_text", "text": "x" * 256}]}],
+        },
+        headers={},
+        codex_session_affinity=False,
+        openai_cache_affinity=True,
+        sticky_threads_enabled=False,
+        openai_cache_affinity_max_age_seconds=300,
+        api_key=api_key,
+    )
+
+    assert prepared.http_fallback_payload is not None
+    assert prepared.http_fallback_payload.input == [
+        {"role": "user", "content": [{"type": "input_text", "text": "x" * 256}]}
+    ]
+    assert prepared.http_fallback_payload.stream is True
+    # The websocket caller transfers this reservation to the HTTP relay.
+    release_usage.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_prepare_websocket_conversation_backed_oversized_request_still_rejects(monkeypatch):
+    request_logs = _RequestLogsRecorder()
+    service = proxy_service.ProxyService(_repo_factory(request_logs))
+    reservation = SimpleNamespace(reservation_id="res_conversation_large_ws", model="gpt-5.1")
+    reserve_usage = AsyncMock(return_value=reservation)
+    release_usage = AsyncMock()
+    api_key = ApiKeyData(
+        id="key_ws_conversation_large",
+        name="conversation-large",
+        key_prefix="sk-conversation-large",
+        allowed_models=["gpt-5.1"],
+        enforced_model=None,
+        enforced_reasoning_effort=None,
+        enforced_service_tier=None,
+        expires_at=None,
+        is_active=True,
+        created_at=utcnow(),
+        last_used_at=None,
+    )
+
+    class Settings:
+        trace_channels = frozenset()
+        openai_prompt_cache_key_derivation_enabled = True
+
+    monkeypatch.setattr(proxy_service, "get_settings", lambda: Settings())
+    monkeypatch.setattr(proxy_service, "_UPSTREAM_RESPONSE_CREATE_WARN_BYTES", 64)
+    monkeypatch.setattr(proxy_service, "_UPSTREAM_RESPONSE_CREATE_MAX_BYTES", 128)
+    monkeypatch.setattr(service, "_reserve_websocket_api_key_usage", reserve_usage)
+    monkeypatch.setattr(service, "_release_websocket_reservation", release_usage)
+    monkeypatch.setattr(service, "_refresh_websocket_api_key_policy", AsyncMock(return_value=api_key))
+
     with pytest.raises(proxy_service.ProxyResponseError) as exc_info:
         await service._prepare_websocket_response_create_request(
             {
                 "type": "response.create",
                 "model": "gpt-5.1",
+                "conversation": "conv-owner",
                 "input": [{"role": "user", "content": [{"type": "input_text", "text": "x" * 256}]}],
             },
             headers={},
@@ -20211,6 +20267,7 @@ async def test_prepare_websocket_response_create_request_releases_reservation_on
         )
 
     assert exc_info.value.status_code == 400
+    assert exc_info.value.payload["error"]["code"] == "payload_too_large"
     release_usage.assert_awaited_once_with(reservation)
 
 
@@ -21261,7 +21318,7 @@ async def test_prepare_websocket_full_replay_retry_text_uses_size_guard(monkeypa
 
 
 @pytest.mark.asyncio
-async def test_prepare_websocket_full_replay_rejects_oversized_unslimmable_payload(monkeypatch):
+async def test_prepare_websocket_full_replay_relays_oversized_unslimmable_payload_over_http(monkeypatch):
     request_logs = _RequestLogsRecorder()
     service = proxy_service.ProxyService(_repo_factory(request_logs))
     reserve_usage = AsyncMock(return_value=None)
@@ -21300,6 +21357,72 @@ async def test_prepare_websocket_full_replay_rejects_oversized_unslimmable_paylo
     monkeypatch.setattr(service, "_reserve_websocket_api_key_usage", reserve_usage)
     monkeypatch.setattr(service, "_refresh_websocket_api_key_policy", AsyncMock(return_value=api_key))
 
+    prepared = await service._prepare_websocket_response_create_request(
+        cast(
+            dict[str, JsonValue],
+            {
+                "type": "response.create",
+                "model": "gpt-5.1",
+                "input": [*historical_input, new_input],
+            },
+        ),
+        headers={"session_id": "turn_ws_trim_too_large"},
+        codex_session_affinity=True,
+        openai_cache_affinity=True,
+        sticky_threads_enabled=False,
+        openai_cache_affinity_max_age_seconds=300,
+        api_key=api_key,
+        continuity_state=continuity_state,
+    )
+
+    assert prepared.request_state.proxy_injected_previous_response_id is False
+    assert prepared.http_fallback_payload is not None
+    assert prepared.http_fallback_payload.previous_response_id is None
+    assert prepared.http_fallback_payload.input == [*historical_input, new_input]
+
+
+@pytest.mark.asyncio
+async def test_prepare_websocket_proxy_injected_anchor_is_not_eligible_for_http_fallback(monkeypatch):
+    request_logs = _RequestLogsRecorder()
+    service = proxy_service.ProxyService(_repo_factory(request_logs))
+    api_key = ApiKeyData(
+        id="key_ws_proxy_anchor_large",
+        name="proxy-anchor-large",
+        key_prefix="sk-proxy-anchor-large",
+        allowed_models=["gpt-5.1"],
+        enforced_model=None,
+        enforced_reasoning_effort=None,
+        enforced_service_tier=None,
+        expires_at=None,
+        is_active=True,
+        created_at=utcnow(),
+        last_used_at=None,
+    )
+
+    class Settings:
+        trace_channels = frozenset()
+        openai_prompt_cache_key_derivation_enabled = True
+
+    historical_input: list[JsonValue] = [
+        {"role": "user", "content": [{"type": "input_text", "text": "old question"}]},
+    ]
+    oversized_tool_output: JsonValue = {
+        "type": "function_call_output",
+        "call_id": "call_large",
+        "output": "x" * 5000,
+    }
+    continuity_state = proxy_service._WebSocketContinuityState(
+        last_completed_input_count=len(historical_input),
+        last_completed_response_id="resp_proxy_anchor_large",
+        last_completed_input_prefix_fingerprint=proxy_service._fingerprint_input_items(historical_input),
+    )
+
+    monkeypatch.setattr(proxy_service, "get_settings", lambda: Settings())
+    monkeypatch.setattr(proxy_service, "_UPSTREAM_RESPONSE_CREATE_WARN_BYTES", 64)
+    monkeypatch.setattr(proxy_service, "_UPSTREAM_RESPONSE_CREATE_MAX_BYTES", 2048)
+    monkeypatch.setattr(service, "_reserve_websocket_api_key_usage", AsyncMock(return_value=None))
+    monkeypatch.setattr(service, "_refresh_websocket_api_key_policy", AsyncMock(return_value=api_key))
+
     with pytest.raises(proxy_module.ProxyResponseError) as exc_info:
         await service._prepare_websocket_response_create_request(
             cast(
@@ -21307,10 +21430,10 @@ async def test_prepare_websocket_full_replay_rejects_oversized_unslimmable_paylo
                 {
                     "type": "response.create",
                     "model": "gpt-5.1",
-                    "input": [*historical_input, new_input],
+                    "input": [*historical_input, oversized_tool_output],
                 },
             ),
-            headers={"session_id": "turn_ws_trim_too_large"},
+            headers={"session_id": "turn_ws_proxy_anchor_large"},
             codex_session_affinity=True,
             openai_cache_affinity=True,
             sticky_threads_enabled=False,
@@ -21422,6 +21545,7 @@ def test_record_websocket_continuity_completion_keeps_anchor_fields_in_sync():
     assert continuity_state.last_completed_response_id == "resp_new_without_fingerprint"
     assert continuity_state.last_completed_input_count == 0
     assert continuity_state.last_completed_input_prefix_fingerprint is None
+    assert continuity_state.last_completed_upstream_transport == "websocket"
 
     complete_state = proxy_service._WebSocketRequestState(
         request_id="ws_complete_continuity",
@@ -21432,6 +21556,7 @@ def test_record_websocket_continuity_completion_keeps_anchor_fields_in_sync():
         started_at=0.0,
         input_item_count=3,
         input_full_fingerprint="new-fingerprint",
+        upstream_transport="http",
     )
 
     proxy_service._record_websocket_continuity_completion(
@@ -21443,6 +21568,38 @@ def test_record_websocket_continuity_completion_keeps_anchor_fields_in_sync():
     assert continuity_state.last_completed_response_id == "resp_new"
     assert continuity_state.last_completed_input_count == 3
     assert continuity_state.last_completed_input_prefix_fingerprint == "new-fingerprint"
+    assert continuity_state.last_completed_upstream_transport == "http"
+
+
+def test_websocket_continuity_anchor_ignores_http_completion() -> None:
+    historical_input: list[JsonValue] = [
+        {"role": "user", "content": [{"type": "input_text", "text": "old question"}]},
+    ]
+    continuity_state = proxy_service._WebSocketContinuityState(
+        last_completed_input_count=1,
+        last_completed_response_id="resp_http_completion",
+        last_completed_input_prefix_fingerprint=proxy_service._fingerprint_input_items(historical_input),
+        last_completed_upstream_transport="http",
+    )
+    responses_payload = ResponsesRequest.model_validate(
+        {
+            "model": "gpt-5.4",
+            "instructions": "",
+            "input": [
+                *historical_input,
+                {"role": "user", "content": [{"type": "input_text", "text": "continue"}]},
+            ],
+        }
+    )
+
+    assert (
+        proxy_service._websocket_continuity_anchor_for_payload(
+            continuity_state,
+            responses_payload=responses_payload,
+            codex_session_affinity=True,
+        )
+        is None
+    )
 
 
 def test_record_websocket_continuity_completion_keeps_pending_tool_calls_for_string_input():
@@ -31390,9 +31547,8 @@ async def test_resolve_websocket_previous_response_owner_prefers_scoped_lookup_o
 
     assert owner == "acc_owner_scoped"
     assert request_logs.lookup_calls == [("resp_prev_shared", api_key.id, "turn_scope_a")]
-    assert service._websocket_previous_response_account_index[("resp_prev_shared", api_key.id, "turn_scope_a")] == (
-        "acc_owner_scoped"
-    )
+    cached_owner = service._websocket_previous_response_account_index[("resp_prev_shared", api_key.id, "turn_scope_a")]
+    assert cached_owner.account_id == "acc_owner_scoped"
 
 
 @pytest.mark.asyncio

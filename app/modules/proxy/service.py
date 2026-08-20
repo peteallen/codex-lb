@@ -754,6 +754,7 @@ from app.modules.proxy.ring_membership import (
 )
 from app.modules.proxy.selection_errors import selection_failure_response
 from app.modules.proxy.work_admission import WorkAdmissionController
+from app.modules.request_logs.repository import PreviousResponseOwnerRecord
 
 logger = logging.getLogger(__name__)
 
@@ -942,7 +943,9 @@ class ProxyService(
         self._http_bridge_inflight_sessions: dict[_HTTPBridgeSessionKey, asyncio.Future[_HTTPBridgeSession]] = {}
         self._http_bridge_turn_state_index: dict[tuple[str, str | None], _HTTPBridgeSessionKey] = {}
         self._http_bridge_previous_response_index: dict[tuple[str, str | None], _HTTPBridgeSessionKey] = {}
-        self._websocket_previous_response_account_index: dict[tuple[str, str | None, str | None], str] = {}
+        self._websocket_previous_response_account_index: dict[
+            tuple[str, str | None, str | None], PreviousResponseOwnerRecord
+        ] = {}
         self._websocket_continuity_index: dict[tuple[str, str | None], _WebSocketContinuityState] = {}
         self._background_cleanup_tasks: set[asyncio.Task[None]] = set()
         self._stream_api_key_release_retry_semaphore = asyncio.Semaphore(_STREAM_API_KEY_RELEASE_RETRY_MAX_CONCURRENCY)

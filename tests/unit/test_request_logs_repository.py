@@ -375,6 +375,28 @@ async def test_find_latest_account_id_for_response_id_ignores_blank_response_id(
 
 
 @pytest.mark.asyncio
+async def test_find_latest_owner_record_preserves_upstream_transport() -> None:
+    session = AsyncMock()
+    repo = RequestLogsRepository(session)
+    requested_at = datetime(2026, 7, 11, 12, 0, 0)
+    session.execute.return_value = SimpleNamespace(
+        one_or_none=lambda: ("acc_http_owner", requested_at, "sid_http", " HTTP "),
+    )
+
+    owner = await repo.find_latest_owner_record_for_response_id(
+        response_id="resp_http_owner",
+        api_key_id="api_key_http",
+        session_id="sid_http",
+    )
+
+    assert owner is not None
+    assert owner.account_id == "acc_http_owner"
+    assert owner.requested_at == requested_at
+    assert owner.session_id == "sid_http"
+    assert owner.upstream_transport == "http"
+
+
+@pytest.mark.asyncio
 async def test_find_latest_account_id_for_response_id_ignores_blank_session_id_scope() -> None:
     session = AsyncMock()
     repo = RequestLogsRepository(session)

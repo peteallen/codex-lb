@@ -149,6 +149,7 @@ class PreviousResponseOwnerRecord:
     account_id: str
     requested_at: datetime | None
     session_id: str | None
+    upstream_transport: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -521,7 +522,12 @@ class RequestLogsRepository:
             conditions: list[ColumnElement[bool]],
         ) -> PreviousResponseOwnerRecord | None:
             stmt = (
-                select(RequestLog.account_id, RequestLog.requested_at, RequestLog.session_id)
+                select(
+                    RequestLog.account_id,
+                    RequestLog.requested_at,
+                    RequestLog.session_id,
+                    RequestLog.upstream_transport,
+                )
                 .where(and_(*conditions))
                 .order_by(RequestLog.requested_at.desc(), RequestLog.id.desc())
                 .limit(1)
@@ -530,7 +536,8 @@ class RequestLogsRepository:
             row = result.one_or_none()
             if row is None:
                 return None
-            account_id, requested_at, owner_session_id = row
+            account_id, requested_at, owner_session_id = row[:3]
+            upstream_transport = row[3] if len(row) > 3 else None
             if not isinstance(account_id, str):
                 return None
             stripped = account_id.strip()
@@ -539,10 +546,16 @@ class RequestLogsRepository:
             normalized_owner_session_id = (
                 owner_session_id.strip() if isinstance(owner_session_id, str) and owner_session_id.strip() else None
             )
+            normalized_upstream_transport = (
+                upstream_transport.strip().lower()
+                if isinstance(upstream_transport, str) and upstream_transport.strip()
+                else None
+            )
             return PreviousResponseOwnerRecord(
                 account_id=stripped,
                 requested_at=requested_at if isinstance(requested_at, datetime) else None,
                 session_id=normalized_owner_session_id,
+                upstream_transport=normalized_upstream_transport,
             )
 
         session_id_value = session_id.strip() if isinstance(session_id, str) else ""

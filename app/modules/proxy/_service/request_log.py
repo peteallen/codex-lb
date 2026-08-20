@@ -8,6 +8,7 @@ from typing import Protocol, cast
 import anyio
 
 from app.core.metrics.prometheus import PROMETHEUS_AVAILABLE, proxy_phase_latency_seconds
+from app.core.utils.time import utcnow
 from app.modules.api_keys.service import ApiKeyData
 from app.modules.proxy.affinity import _extract_model_class
 from app.modules.proxy.repo_bundle import ProxyRepoFactory
@@ -34,6 +35,7 @@ def _is_persistence_task(task: asyncio.Task[None], prefixes: tuple[str, ...] | N
 
 
 _REQUEST_TRANSPORT_HTTP = "http"
+_REQUEST_TRANSPORT_WEBSOCKET = "websocket"
 
 
 def _record_proxy_phase_latency(
@@ -62,6 +64,8 @@ class _RequestLogServiceProtocol(Protocol):
     _repo_factory: ProxyRepoFactory
     _request_log_tasks: set[asyncio.Task[None]]
     _background_cleanup_tasks: set[asyncio.Task[None]]
+
+    def _remember_websocket_previous_response_owner(self, **kwargs: object) -> None: ...
 
 
 def _normalize_session_id(session_id: str | None) -> str | None:
@@ -196,6 +200,23 @@ class _RequestLogMixin:
         client_ip: str | None = None,
         archive_request_id: str | None = None,
     ) -> None:
+        proxy = cast(_RequestLogServiceProtocol, self)
+        require_durable_provenance = bool(
+            status == "success"
+            and transport == _REQUEST_TRANSPORT_WEBSOCKET
+            and upstream_transport == _REQUEST_TRANSPORT_HTTP
+            and account_id is not None
+        )
+        if require_durable_provenance:
+            proxy._remember_websocket_previous_response_owner(
+                previous_response_id=request_id,
+                api_key_id=api_key.id if api_key is not None else None,
+                account_id=account_id,
+                session_id=session_id,
+                requested_at=utcnow(),
+                owner_session_id=session_id,
+                upstream_transport=upstream_transport,
+            )
         task = asyncio.create_task(
             self._persist_request_log(
                 account_id=account_id,
@@ -247,15 +268,21 @@ class _RequestLogMixin:
             ),
             name=f"proxy-request-log-{request_id}",
         )
-        # Detach unconditionally: the row is observational (dashboards, usage
-        # aggregation) and nothing on the response path reads it back
-        # synchronously — the one post-hoc consumer, the images model
+        # Detach by default: most rows are observational (dashboards, usage
+        # aggregation). The HTTP-origin WebSocket completion path opts into a
+        # shielded wait because its row is restart-safe continuity provenance.
+        # The one other post-hoc consumer, the images model
         # rewrite, already retries while the row is missing. Awaiting the
         # INSERT+COMMIT here made every stream's close wait on a DB write,
         # and Codex CLI does not continue until the stream closes. Failures
         # are logged by the tracking callback, and shutdown drains the task
         # set (ProxyService.drain_persistence_tasks).
         self._track_request_log_task(task, account_id=account_id, request_id=request_id)
+        if require_durable_provenance:
+            # HTTP-origin response ids need their transport provenance after a
+            # restart. Shield the tracked task so downstream cancellation leaves
+            # shutdown draining able to finish the correctness-critical commit.
+            await asyncio.shield(task)
         _record_proxy_phase_latency(
             phase="ttft",
             latency_ms=latency_first_token_ms,

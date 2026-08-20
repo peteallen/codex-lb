@@ -29,6 +29,7 @@ from app.core.clients.proxy_websocket import (
     WebsocketsUpstreamWebSocket,
 )
 from app.core.utils.request_id import get_request_id
+from app.core.utils.sse import format_sse_event
 from app.db.models import Account, AccountStatus, ApiKeyUsageReservation, RequestLog
 from app.db.session import SessionLocal
 from app.modules.api_keys.repository import ApiKeysRepository
@@ -8241,7 +8242,7 @@ def test_backend_responses_websocket_emits_terminal_failure_when_upstream_send_b
     assert log_calls[0]["status"] == "error"
 
 
-def test_backend_responses_websocket_rejects_oversized_response_create_before_upstream(
+def test_backend_responses_websocket_rejects_oversized_conversation_request_before_upstream(
     app_instance,
     monkeypatch,
     tmp_path,
@@ -8289,7 +8290,7 @@ def test_backend_responses_websocket_rejects_oversized_response_create_before_up
             client_send_lock,
             websocket,
         )
-        raise AssertionError("oversized response.create must fail before upstream websocket connect")
+        raise AssertionError("oversized conversation request must fail before upstream websocket connect")
 
     monkeypatch.setattr(proxy_api_module, "_websocket_firewall_denial_response", allow_firewall)
     monkeypatch.setattr(proxy_api_module, "validate_proxy_api_key_authorization", allow_proxy_api_key)
@@ -8303,6 +8304,7 @@ def test_backend_responses_websocket_rejects_oversized_response_create_before_up
         "type": "response.create",
         "model": "gpt-5.4",
         "instructions": "",
+        "conversation": "conv_owner_bound",
         "input": [{"role": "user", "content": [{"type": "input_text", "text": "x" * 256}]}],
         "stream": True,
     }
@@ -8429,7 +8431,10 @@ def test_backend_responses_websocket_slims_historical_inline_artifacts_and_succe
     monkeypatch.setattr(proxy_api_module, "validate_proxy_api_key_authorization", allow_proxy_api_key)
     monkeypatch.setattr(proxy_module, "get_settings_cache", lambda: _FakeSettingsCache())
     monkeypatch.setattr(proxy_module, "_UPSTREAM_RESPONSE_CREATE_WARN_BYTES", 64)
-    monkeypatch.setattr(proxy_module, "_UPSTREAM_RESPONSE_CREATE_MAX_BYTES", 512)
+    # Leave room for the per-account installation metadata projected by the
+    # websocket-size classifier; the test is about historical slimming, not
+    # the oversized full-resend HTTP fallback.
+    monkeypatch.setattr(proxy_module, "_UPSTREAM_RESPONSE_CREATE_MAX_BYTES", 640)
     monkeypatch.setattr(proxy_module.ProxyService, "_connect_proxy_websocket", fake_connect_proxy_websocket)
 
     request_payload = {
@@ -8461,6 +8466,160 @@ def test_backend_responses_websocket_slims_historical_inline_artifacts_and_succe
     assert sent_payload["input"][-1]["content"][0]["text"] == "ping"
     assert "data:image/" not in json.dumps(sent_payload["input"], ensure_ascii=True)
     assert "historical tool output" in json.dumps(sent_payload["input"], ensure_ascii=True)
+
+
+@pytest.mark.parametrize(
+    ("include_file", "expected_file_owner"),
+    [(False, None), (True, "acct_full_resend_file_owner")],
+    ids=["session-routed", "file-pinned"],
+)
+def test_backend_responses_websocket_falls_back_to_http_for_oversized_unanchored_full_resend(
+    app_instance,
+    monkeypatch,
+    tmp_path,
+    include_file,
+    expected_file_owner,
+):
+    """An oversized complete resend preserves recent inline images over HTTP."""
+
+    class _FakeSettingsCache:
+        async def get(self):
+            return _websocket_settings()
+
+    async def allow_firewall(_websocket):
+        return None
+
+    async def allow_proxy_api_key(_authorization: str | None, *, request: object | None = None):
+        return None
+
+    async def fail_connect_proxy_websocket(self, *args, **kwargs):
+        del self, args, kwargs
+        raise AssertionError("oversized unanchored full resend must not open an upstream websocket")
+
+    file_owner_lookups = 0
+
+    async def resolve_file_account(self, payload, headers):
+        nonlocal file_owner_lookups
+        del self, payload, headers
+        file_owner_lookups += 1
+        return expected_file_owner
+
+    seen_stream_calls: list[dict[str, Any]] = []
+    reservation = SimpleNamespace(reservation_id=f"reservation-{include_file}")
+    released_reservations: list[object] = []
+    heartbeat_transfers: list[bool] = []
+
+    async def reserve_usage(self, *args, **kwargs):
+        del self, args, kwargs
+        return reservation
+
+    async def release_reservation(self, value):
+        del self
+        released_reservations.append(value)
+
+    original_cancel_heartbeat = proxy_module.ProxyService._cancel_request_state_api_key_reservation_heartbeat
+
+    def cancel_heartbeat(self, request_state):
+        heartbeat_transfers.append(request_state.api_key_reservation_heartbeat_task is not None)
+        original_cancel_heartbeat(self, request_state)
+
+    async def fake_stream_with_retry(self, payload, headers, **kwargs):
+        del self
+        kwargs["api_key_reservation_settlement_started"].set()
+        seen_stream_calls.append({"payload": payload.to_payload(), "headers": headers, "kwargs": kwargs})
+        for event_payload in (
+            {"type": "response.created", "response": {"id": "resp_http_full_resend"}},
+            {
+                "type": "response.output_text.delta",
+                "response_id": "resp_http_full_resend",
+                "delta": "ok",
+            },
+            {
+                "type": "response.completed",
+                "response": {"id": "resp_http_full_resend", "status": "completed"},
+            },
+        ):
+            yield format_sse_event(event_payload)
+
+    monkeypatch.setattr(proxy_api_module, "_websocket_firewall_denial_response", allow_firewall)
+    monkeypatch.setattr(proxy_api_module, "validate_proxy_api_key_authorization", allow_proxy_api_key)
+    monkeypatch.setattr(proxy_module, "get_settings_cache", lambda: _FakeSettingsCache())
+    monkeypatch.setattr(proxy_module, "_UPSTREAM_RESPONSE_CREATE_WARN_BYTES", 256)
+    monkeypatch.setattr(proxy_module, "_UPSTREAM_RESPONSE_CREATE_MAX_BYTES", 512)
+    monkeypatch.setattr(proxy_module, "_OVERSIZED_RESPONSE_CREATE_DUMP_DIR", tmp_path)
+    monkeypatch.setattr(proxy_module.ProxyService, "_connect_proxy_websocket", fail_connect_proxy_websocket)
+    monkeypatch.setattr(proxy_module.ProxyService, "_resolve_file_account_for_responses", resolve_file_account)
+    monkeypatch.setattr(proxy_module.ProxyService, "_reserve_websocket_api_key_usage", reserve_usage)
+    monkeypatch.setattr(proxy_module.ProxyService, "_release_websocket_reservation", release_reservation)
+    monkeypatch.setattr(
+        proxy_module.ProxyService,
+        "_cancel_request_state_api_key_reservation_heartbeat",
+        cancel_heartbeat,
+    )
+    monkeypatch.setattr(proxy_module.ProxyService, "_stream_with_retry", fake_stream_with_retry)
+
+    user_content: list[dict[str, str]] = [{"type": "input_text", "text": "Inspect these frames"}]
+    if include_file:
+        user_content.append({"type": "input_file", "file_id": "file_full_resend"})
+    request_payload = {
+        "type": "response.create",
+        "model": "gpt-5.4",
+        "instructions": "",
+        "input": [
+            {"role": "user", "content": user_content},
+            {
+                "type": "custom_tool_call",
+                "call_id": "call-view-image",
+                "name": "view_image",
+                "input": "{}",
+            },
+            {
+                "type": "custom_tool_call_output",
+                "call_id": "call-view-image",
+                "output": [
+                    {"type": "input_text", "text": "PAGE 1"},
+                    {
+                        "type": "input_image",
+                        "image_url": "data:image/jpeg;base64," + ("A" * 4096),
+                    },
+                ],
+            },
+        ],
+        "stream": True,
+    }
+
+    with TestClient(app_instance) as client:
+        with client.websocket_connect(
+            "/backend-api/codex/responses",
+            headers={"session_id": "sid-full-resend"},
+        ) as websocket:
+            websocket.send_text(json.dumps(request_payload))
+            events = [json.loads(websocket.receive_text()) for _ in range(3)]
+
+    assert [event["type"] for event in events] == [
+        "response.created",
+        "response.output_text.delta",
+        "response.completed",
+    ]
+    assert len(seen_stream_calls) == 1
+    relayed_payload = seen_stream_calls[0]["payload"]
+    assert relayed_payload.get("previous_response_id") is None
+    assert relayed_payload["input"] == request_payload["input"]
+    assert "data:image/jpeg;base64," in json.dumps(relayed_payload["input"])
+    relayed_headers = seen_stream_calls[0]["headers"]
+    kwargs = seen_stream_calls[0]["kwargs"]
+    assert kwargs["request_transport"] == "websocket"
+    assert kwargs["upstream_stream_transport_override"] == "http"
+    assert kwargs["resolved_previous_response_owner_account_id"] is None
+    assert kwargs["previous_response_owner_resolved"] is True
+    assert kwargs["rewritten_file_account_id"] == expected_file_owner
+    assert kwargs["synthesized_turn_state"] == relayed_headers["x-codex-turn-state"]
+    assert kwargs["request_session_id"] == "sid-full-resend"
+    assert file_owner_lookups == 1
+    assert kwargs["api_key_reservation"] is reservation
+    assert heartbeat_transfers == [True]
+    assert released_reservations == []
+    assert list(tmp_path.glob("*.meta.json")) == []
 
 
 def test_backend_responses_websocket_keeps_downstream_open_after_clean_upstream_close(app_instance, monkeypatch):
