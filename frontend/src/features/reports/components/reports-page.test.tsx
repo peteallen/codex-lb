@@ -341,8 +341,8 @@ describe("ReportsPage", () => {
     renderWithProviders(<ReportsPage />);
 
     expect(screen.getByRole("heading", { name: "Cost Report" })).toBeInTheDocument();
-    expect(screen.getByText("Usage history by time period")).toBeInTheDocument();
-    expect(screen.getByText("Total cost")).toBeInTheDocument();
+    expect(screen.getByText("Usage history by date range")).toBeInTheDocument();
+    expect(screen.getByText("Total Cost")).toBeInTheDocument();
     expect(screen.queryByText("Relatório de Custo")).not.toBeInTheDocument();
   });
 
@@ -542,7 +542,7 @@ describe("ReportsPage", () => {
     );
 
     fireEvent.click(screen.getByRole("button", { name: /Custom/i }));
-    const startDateInput = screen.getByLabelText("Start date");
+    const startDateInput = screen.getAllByLabelText("Start date")[1];
     fireEvent.change(startDateInput, { target: { value: "2030-01-01" } });
 
     expect(button30d).toHaveAttribute("aria-pressed", "false");

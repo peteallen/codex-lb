@@ -42,23 +42,18 @@ describe("WeeklyCreditsPaceCard", () => {
     expect(screen.queryByText("2 accounts with weekly timing")).not.toBeInTheDocument();
     expect(screen.getByText("Used now")).toBeInTheDocument();
     expect(screen.getByText("Scheduled by now")).toBeInTheDocument();
-    expect(screen.getByText("Current gap")).toBeInTheDocument();
+    expect(screen.getByText("Pace gap")).toBeInTheDocument();
     expect(screen.getByText("50%")).toBeInTheDocument();
     expect(screen.getByText("14%")).toBeInTheDocument();
-    expect(screen.getByText("24% over schedule")).toBeInTheDocument();
-    expect(screen.getByText("If recent burn continues")).toBeInTheDocument();
-    expect(screen.getByText("Pause active use")).toBeInTheDocument();
-    expect(screen.getByText("2d 12h of active use")).toBeInTheDocument();
+    expect(screen.getByText("24% over planned usage")).toBeInTheDocument();
+    expect(screen.getByText("360K credits projected short before reset")).toBeInTheDocument();
+    expect(screen.getByText("Pause")).toBeInTheDocument();
+    expect(screen.getByText("2d 12h until reset")).toBeInTheDocument();
     expect(screen.getByText("Throttle")).toBeInTheDocument();
     expect(screen.getByText("Reduce ongoing weekly-credit load by ~72%")).toBeInTheDocument();
     expect(screen.getByText("Add capacity")).toBeInTheDocument();
     expect(screen.getByText("7.1x Pro weekly pool (~8 accounts)")).toBeInTheDocument();
-    expect(screen.getByText("240K credits over scheduled spend over 30m")).toBeInTheDocument();
-    expect(
-      screen.getByText(
-        "Recent burn is 3.57x scheduled active pace; 360K credits could run short before a reset if it continues",
-      ),
-    ).toBeInTheDocument();
+    expect(screen.getByText("240K credits over planned usage over 30m")).toBeInTheDocument();
     expect(screen.queryByText("500K")).not.toBeInTheDocument();
     expect(screen.getByText("Schedule marker")).toBeInTheDocument();
   });
@@ -87,10 +82,10 @@ describe("WeeklyCreditsPaceCard", () => {
       />,
     );
 
-    expect(screen.queryByText("If recent burn continues")).not.toBeInTheDocument();
+    expect(screen.queryByText("360K credits projected short before reset")).not.toBeInTheDocument();
     expect(screen.queryByText("No pause needed")).not.toBeInTheDocument();
-    expect(screen.getByText("8% under schedule")).toBeInTheDocument();
-    expect(screen.getByText("8% under scheduled spend over 30m")).toBeInTheDocument();
+    expect(screen.getByText("8% below planned usage")).toBeInTheDocument();
+    expect(screen.getByText("8% below planned usage over 30m")).toBeInTheDocument();
     expect(screen.queryByText("80K credits projected low-water mark")).not.toBeInTheDocument();
   });
 
@@ -133,13 +128,13 @@ describe("WeeklyCreditsPaceCard", () => {
       />,
     );
 
-    expect(screen.queryByText("If recent burn continues")).not.toBeInTheDocument();
-    expect(screen.queryByText("Pause active use")).not.toBeInTheDocument();
+    expect(screen.queryByText("360K credits projected short before reset")).not.toBeInTheDocument();
+    expect(screen.queryByText("Pause")).not.toBeInTheDocument();
     expect(screen.queryByText("3h to return to schedule")).not.toBeInTheDocument();
     expect(screen.queryByText("Throttle")).not.toBeInTheDocument();
-    expect(screen.queryByText("Add capacity")).not.toBeInTheDocument();
-    expect(screen.getByText("3.1K credits over scheduled spend now")).toBeInTheDocument();
-    expect(screen.getByText("No weekly shortfall projected from recent burn")).toBeInTheDocument();
+    expect(screen.getByText("Add capacity")).toBeInTheDocument();
+    expect(screen.getByText("3.1K credits over planned usage now")).toBeInTheDocument();
+    expect(screen.getByText("No weekly shortfall projected at recent pace")).toBeInTheDocument();
   });
 
   it("keeps a danger label when recent burn projects a shortfall below schedule", () => {
@@ -159,12 +154,8 @@ describe("WeeklyCreditsPaceCard", () => {
     );
 
     expect(screen.getByText("Recent burn shortfall")).toBeInTheDocument();
-    expect(screen.queryByText("5% under schedule")).not.toBeInTheDocument();
-    expect(
-      screen.getByText(
-        "Recent burn is 3.57x scheduled active pace; 42K credits could run short before a reset if it continues",
-      ),
-    ).toBeInTheDocument();
+    expect(screen.queryByText("5% below planned usage")).not.toBeInTheDocument();
+    expect(screen.getByText("42K credits projected short before reset")).toBeInTheDocument();
   });
 
   it("does not render fake pace when data is unavailable", () => {
