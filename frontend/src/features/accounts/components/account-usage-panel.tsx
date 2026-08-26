@@ -277,7 +277,12 @@ export function AccountUsagePanel({
           <p className="mt-1 break-words text-xs tabular-nums text-muted-foreground">
             {t("accounts.usage.requestUsageMeta", {
               tokens: formatCompactNumber(requestUsage?.totalTokens),
+              input: formatCompactNumber(requestUsage?.inputTokens),
+              output: formatCompactNumber(requestUsage?.outputTokens),
               cached: formatCompactNumber(requestUsage?.cachedInputTokens),
+              inputLabel: t("common.units.input").toLowerCase(),
+              outputLabel: t("common.units.output").toLowerCase(),
+              cachedLabel: t("common.units.cached").toLowerCase(),
               requests: formatCompactNumber(requestUsage?.requestCount),
               cost: formatCurrency(requestUsage?.totalCostUsd),
             })}

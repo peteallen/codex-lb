@@ -67,6 +67,8 @@ class ApiKeyUsageSummary:
     total_tokens: int
     cached_input_tokens: int
     total_cost_usd: float
+    input_tokens: int = 0
+    output_tokens: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,6 +85,8 @@ class ApiKeyUsageTotals:
     cached_input_tokens: int
     total_cost_usd: float
     account_costs: list["ApiKeyAccountCost"] = field(default_factory=list)
+    input_tokens: int = 0
+    output_tokens: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -243,6 +247,8 @@ class ApiKeysRepository:
                 total_tokens=input_total + output_total,
                 cached_input_tokens=cached_total,
                 total_cost_usd=round(float(total_cost_usd), 6),
+                input_tokens=input_total,
+                output_tokens=output_total,
             )
         return summaries
 
@@ -1050,6 +1056,8 @@ class ApiKeysRepository:
             cached_input_tokens=cached_sum,
             total_cost_usd=round(float(row.total_cost_usd or 0.0), 6),
             account_costs=self._build_account_costs(rows),
+            input_tokens=input_sum,
+            output_tokens=output_sum,
         )
 
 

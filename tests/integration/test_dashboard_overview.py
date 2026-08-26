@@ -130,6 +130,8 @@ async def test_dashboard_overview_combines_data(async_client, db_setup):
     assert payload["summary"]["cost"]["totalUsd"] == pytest.approx(0.000625)
     assert payload["summary"]["metrics"]["requests"] == 1
     assert payload["summary"]["metrics"]["tokens"] == 150
+    assert payload["summary"]["metrics"]["inputTokens"] == 100
+    assert payload["summary"]["metrics"]["outputTokens"] == 50
     assert payload["summary"]["metrics"]["cachedInputTokens"] == 0
     assert payload["summary"]["metrics"]["errorRate"] == pytest.approx(0.0)
     assert payload["summary"]["metrics"]["errorCount"] == 0

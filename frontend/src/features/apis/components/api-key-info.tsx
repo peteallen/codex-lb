@@ -104,7 +104,15 @@ export function ApiKeyInfo({
 								</span>
 								<span className="mx-1 text-muted-foreground/40">|</span>
 								<span className="font-medium">
+									{t("common.units.input")}: {formatCompactNumber(usage.inputTokens)}
+								</span>
+								<span className="mx-1 text-muted-foreground/40">|</span>
+								<span className="font-medium">
 									{t("common.units.cachedShort", { count: formatCompactNumber(usage.cachedInputTokens) })}
+								</span>
+								<span className="mx-1 text-muted-foreground/40">|</span>
+								<span className="font-medium">
+									{t("common.units.output")}: {formatCompactNumber(usage.outputTokens)}
 								</span>
 								<span className="mx-1 text-muted-foreground/40">|</span>
 								<span className="font-medium">

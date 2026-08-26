@@ -275,6 +275,8 @@ export function createDashboardOverview(
 			metrics: {
 				requests: 228,
 				tokens: 45_000,
+				inputTokens: 30_000,
+				outputTokens: 15_000,
 				cachedInputTokens: 8_200,
 				errorRate: 0.028,
 				errorCount: 6,
@@ -695,6 +697,8 @@ export function createApiKey(overrides: Partial<ApiKey> = {}): ApiKey {
 		usageSummary: {
 			requestCount: 150,
 			totalTokens: 50_000,
+			inputTokens: 35_000,
+			outputTokens: 15_000,
 			cachedInputTokens: 10_000,
 			totalCostUsd: 1.23,
 		},
@@ -794,6 +798,8 @@ export function createApiKeyUsage7Day(
 	return ApiKeyUsage7DayResponseSchema.parse({
 		keyId: "key_1",
 		totalTokens: 280_000,
+		inputTokens: 190_000,
+		outputTokens: 90_000,
 		cachedInputTokens: 45_000,
 		totalRequests: 350,
 		totalCostUsd: 2.47,
@@ -816,6 +822,8 @@ export function createConversationEntry(
 		representativeModel: "gpt-5.1",
 		remainingModelCount: 1,
 		totalTokens: 1800,
+		inputTokens: 1200,
+		outputTokens: 600,
 		cachedInputTokens: 320,
 		totalCostUsd: 0.0132,
 		...overrides,

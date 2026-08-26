@@ -913,6 +913,8 @@ describe("buildDashboardView", () => {
 
     expect(view.stats.map((stat) => stat.label)).not.toContain("Account burn projection (5h/7d)");
     expect(view.stats).toHaveLength(4);
+    expect(view.stats[1]?.meta).toContain("Input: 30K");
+    expect(view.stats[1]?.meta).toContain("Output: 15K");
   });
 
   it("shows only the averaged cost text on the estimated cost card", () => {

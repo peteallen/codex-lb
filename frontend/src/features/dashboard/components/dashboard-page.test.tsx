@@ -345,6 +345,20 @@ describe("DashboardPage", () => {
     expect(screen.getByRole("button", { name: "Refresh dashboard" })).toBeDisabled();
   });
 
+  it("keeps the dashboard range and refresh controls in a compact sticky toolbar", () => {
+    mockReadyDashboard();
+
+    renderWithProviders(<DashboardPage />);
+
+    const pageHeading = screen.getByRole("heading", { name: "Dashboard" });
+    const refreshButton = screen.getByRole("button", { name: "Refresh dashboard" });
+    const controlsToolbar = screen.getByTestId("dashboard-controls-toolbar");
+
+    expect(controlsToolbar).toHaveClass("sticky", "top-[53px]", "z-10");
+    expect(controlsToolbar).toContainElement(refreshButton);
+    expect(controlsToolbar).not.toContainElement(pageHeading);
+  });
+
   it("passes the single conversation observer and overview accounts into the conversations view", () => {
     window.history.pushState({}, "", "/dashboard?view=conversations");
     const overview = mockReadyDashboard();

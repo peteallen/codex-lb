@@ -237,6 +237,18 @@ function isFiniteNumber(value: number | null | undefined): value is number {
   return typeof value === "number" && Number.isFinite(value);
 }
 
+function formatTokenBreakdownMeta(
+  totalTokens: number | null | undefined,
+  inputTokens: number | null | undefined,
+  outputTokens: number | null | undefined,
+  cachedInputTokens: number | null | undefined,
+): string {
+  const input = `${t("common.units.input")}: ${formatCompactNumber(inputTokens)}`;
+  const cached = formatCachedTokensMeta(totalTokens, cachedInputTokens);
+  const output = `${t("common.units.output")}: ${formatCompactNumber(outputTokens)}`;
+  return `${input} · ${cached} · ${output}`;
+}
+
 function buildStatComparison(
   current: number | null | undefined,
   previous: number,
@@ -640,7 +652,12 @@ export function buildDashboardView(
     {
       label: t("dashboard.stats.tokens", { timeframe: timeframeLabel }),
       value: formatCompactNumber(metrics?.tokens ?? 0),
-      meta: formatCachedTokensMeta(metrics?.tokens, metrics?.cachedInputTokens),
+      meta: formatTokenBreakdownMeta(
+        metrics?.tokens,
+        metrics?.inputTokens,
+        metrics?.outputTokens,
+        metrics?.cachedInputTokens,
+      ),
       comparison: buildStatComparison(metrics?.tokens, comparison?.previous.tokens ?? 0, canCompare),
       icon: Coins,
       trend: trendPointsToValues(trends.tokens),

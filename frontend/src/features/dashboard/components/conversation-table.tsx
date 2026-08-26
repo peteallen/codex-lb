@@ -109,9 +109,9 @@ export function ConversationTable({
 
   return (
     <div className="space-y-3">
-      <div className="rounded-xl border bg-card shadow-sm shadow-black/[0.02] dark:shadow-black/20">
+      <div className="dashboard-conversation-table-shell rounded-xl border bg-card shadow-sm shadow-black/[0.02] dark:shadow-black/20">
         <div className="relative overflow-x-auto">
-          <Table className="min-w-[980px] table-fixed">
+          <Table className="dashboard-conversation-table min-w-[980px] table-fixed">
             <TableHeader>
               <TableRow className="hover:bg-transparent">
                 <TableHead className={`w-[10%] pl-4 ${headerClass}`}>{t("dashboard.conversations.columns.lastRequest")}</TableHead>
@@ -121,9 +121,9 @@ export function ConversationTable({
                 <TableHead className={`w-[11%] ${headerClass}`}>{t("dashboard.conversations.columns.apiKey")}</TableHead>
                 <TableHead className={`w-[12%] ${headerClass}`}>{t("dashboard.conversations.columns.models")}</TableHead>
                 <TableHead className={`w-[8%] text-right ${headerClass}`}>{t("dashboard.conversations.columns.requests")}</TableHead>
-                <TableHead className={`w-[9%] text-right ${headerClass}`}>{t("dashboard.conversations.columns.tokens")}</TableHead>
-                <TableHead className={`w-[6%] text-right ${headerClass}`}>{t("dashboard.conversations.columns.cost")}</TableHead>
-                <TableHead className={`w-[7%] pr-4 ${headerClass}`}>{t("dashboard.conversations.columns.details")}</TableHead>
+                <TableHead className={`w-[13%] text-right ${headerClass}`}>{t("dashboard.conversations.columns.tokens")}</TableHead>
+                <TableHead className={`w-[8%] text-right ${headerClass}`}>{t("dashboard.conversations.columns.cost")}</TableHead>
+                <TableHead className={`w-[9%] pr-4 ${headerClass}`}>{t("dashboard.conversations.columns.details")}</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -139,31 +139,37 @@ export function ConversationTable({
 
                 return (
                   <TableRow key={conversation.conversationId} className="align-top">
-                    <TableCell className="pl-4 align-top">
+                    <TableCell className="dashboard-conversation-last-request pl-4 align-top" data-mobile-label={t("dashboard.conversations.columns.lastRequest")}>
+                      <span className="dashboard-mobile-label" aria-hidden="true">{t("dashboard.conversations.columns.lastRequest")}</span>
                       <div className="leading-tight">
                         <div className="text-sm font-medium">{time.primary}</div>
                         <div className="text-xs text-muted-foreground">{time.secondary}</div>
                       </div>
                     </TableCell>
-                    <TableCell className="align-top font-mono text-xs tabular-nums">
+                    <TableCell className="dashboard-conversation-lasted align-top font-mono text-xs tabular-nums" data-mobile-label={t("dashboard.conversations.columns.lasted")}>
+                      <span className="dashboard-mobile-label" aria-hidden="true">{t("dashboard.conversations.columns.lasted")}</span>
                       {formatConversationDuration(conversation.firstRequest, conversation.lastRequest)}
                     </TableCell>
-                    <TableCell className="max-w-0 align-top">
+                    <TableCell className="dashboard-conversation-id max-w-0 align-top" data-mobile-label={t("dashboard.conversations.columns.conversation")}>
+                      <span className="dashboard-mobile-label" aria-hidden="true">{t("dashboard.conversations.columns.conversation")}</span>
                       <span className="block truncate font-mono text-xs" title={conversation.conversationId}>
                         <span translate="no">{conversation.conversationId || "—"}</span>
                       </span>
                     </TableCell>
-                    <TableCell className="align-top">
+                    <TableCell className="dashboard-conversation-accounts align-top" data-mobile-label={t("dashboard.conversations.columns.accounts")}>
+                      <span className="dashboard-mobile-label" aria-hidden="true">{t("dashboard.conversations.columns.accounts")}</span>
                       <AggregateValue
                         value={accountLabel}
                         remaining={conversation.remainingAccountCount}
                         blurred={blurred && isEmailLabel}
                       />
                     </TableCell>
-                    <TableCell className="max-w-0 truncate align-top text-xs text-muted-foreground">
+                    <TableCell className="dashboard-conversation-api-key max-w-0 truncate align-top text-xs text-muted-foreground" data-mobile-label={t("dashboard.conversations.columns.apiKey")}>
+                      <span className="dashboard-mobile-label" aria-hidden="true">{t("dashboard.conversations.columns.apiKey")}</span>
                       {conversation.apiKeyName || "—"}
                     </TableCell>
-                    <TableCell className="align-top">
+                    <TableCell className="dashboard-conversation-models align-top" data-mobile-label={t("dashboard.conversations.columns.models")}>
+                      <span className="dashboard-mobile-label" aria-hidden="true">{t("dashboard.conversations.columns.models")}</span>
                       <AggregateValue
                         value={conversation.representativeModel}
                         remaining={conversation.remainingModelCount}
@@ -171,21 +177,28 @@ export function ConversationTable({
                         translateNo
                       />
                     </TableCell>
-                    <TableCell className="text-right align-top font-mono text-xs tabular-nums">
+                    <TableCell className="dashboard-conversation-requests text-right align-top font-mono text-xs tabular-nums" data-mobile-label={t("dashboard.conversations.columns.requests")}>
+                      <span className="dashboard-mobile-label" aria-hidden="true">{t("dashboard.conversations.columns.requests")}</span>
                       {formatNumber(conversation.requestCount)}
                     </TableCell>
-                    <TableCell className="text-right align-top font-mono text-xs tabular-nums">
+                    <TableCell className="dashboard-conversation-tokens text-right align-top font-mono text-xs tabular-nums" data-mobile-label={t("dashboard.conversations.columns.tokens")}>
+                      <span className="dashboard-mobile-label" aria-hidden="true">{t("dashboard.conversations.columns.tokens")}</span>
                       <div>{formatCompactNumber(conversation.totalTokens)}</div>
-                      <div className="mt-1 text-[11px] font-sans text-muted-foreground">
+                      <div className="dashboard-token-breakdown mt-1 text-[11px] font-sans text-muted-foreground">
+                        {t("common.units.input")}: {formatCompactNumber(conversation.inputTokens)} · {t("common.units.output")}: {formatCompactNumber(conversation.outputTokens)}
+                      </div>
+                      <div className="dashboard-token-cache mt-1 text-[11px] font-sans text-muted-foreground">
                         {t("dashboard.conversations.cached", {
                           count: formatCachedTokenCount(conversation.cachedInputTokens),
                         })}
                       </div>
                     </TableCell>
-                    <TableCell className="text-right align-top font-mono text-xs tabular-nums">
+                    <TableCell className="dashboard-conversation-cost text-right align-top font-mono text-xs tabular-nums" data-mobile-label={t("dashboard.conversations.columns.cost")}>
+                      <span className="dashboard-mobile-label" aria-hidden="true">{t("dashboard.conversations.columns.cost")}</span>
                       {formatCurrency(conversation.totalCostUsd)}
                     </TableCell>
-                    <TableCell className="pr-4 align-top">
+                    <TableCell className="dashboard-conversation-details pr-4 align-top" data-mobile-label={t("dashboard.conversations.columns.details")}>
+                      <span className="dashboard-mobile-label" aria-hidden="true">{t("dashboard.conversations.columns.details")}</span>
                       <Button
                         type="button"
                         variant="ghost"

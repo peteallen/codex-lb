@@ -93,6 +93,8 @@ describe("ApiKeyInfo", () => {
 					usageSummary: {
 						requestCount: 150,
 						totalTokens: 50_000,
+						inputTokens: 35_000,
+						outputTokens: 15_000,
 						cachedInputTokens: 10_000,
 						totalCostUsd: 1.23,
 					},
@@ -101,7 +103,9 @@ describe("ApiKeyInfo", () => {
 		);
 
 		expect(screen.getByText(/50K tok/)).toBeInTheDocument();
+		expect(screen.getByText(/Input: 35K/)).toBeInTheDocument();
 		expect(screen.getByText(/10K cached/)).toBeInTheDocument();
+		expect(screen.getByText(/Output: 15K/)).toBeInTheDocument();
 		expect(screen.getByText(/150 req/)).toBeInTheDocument();
 		expect(screen.getByText(/\$1.23/)).toBeInTheDocument();
 	});

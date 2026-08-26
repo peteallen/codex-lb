@@ -18,6 +18,8 @@ describe("ApiKeysOverview", () => {
             usageSummary: {
               requestCount: 300,
               totalTokens: 80_000,
+              inputTokens: 55_000,
+              outputTokens: 25_000,
               cachedInputTokens: 12_000,
               totalCostUsd: 2.5,
             },
@@ -30,6 +32,8 @@ describe("ApiKeysOverview", () => {
             usageSummary: {
               requestCount: 120,
               totalTokens: 20_000,
+              inputTokens: 14_000,
+              outputTokens: 6_000,
               cachedInputTokens: 2_000,
               totalCostUsd: 1.0,
             },
@@ -44,6 +48,8 @@ describe("ApiKeysOverview", () => {
     expect(screen.getByTestId("api-keys-overview-stat-used-keys")).toHaveTextContent("2");
     expect(screen.getByTestId("api-keys-overview-stat-lifetime-requests")).toHaveTextContent("420");
     expect(screen.getByTestId("api-keys-overview-stat-lifetime-cost")).toHaveTextContent("$3.50");
+    expect(screen.getByTestId("api-keys-overview-stat-lifetime-requests")).toHaveTextContent("69K input");
+    expect(screen.getByTestId("api-keys-overview-stat-lifetime-requests")).toHaveTextContent("31K output");
 
     expect(screen.getByText("Lifetime Cost by API Key")).toBeInTheDocument();
     expect(screen.getByText("Lifetime Tokens by API Key")).toBeInTheDocument();

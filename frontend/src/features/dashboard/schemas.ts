@@ -66,6 +66,8 @@ const UsageCostSchema = z.object({
 const DashboardMetricsSchema = z.object({
   requests: z.number().nullable(),
   tokens: z.number().nullable(),
+  inputTokens: z.number().nullable().optional(),
+  outputTokens: z.number().nullable().optional(),
   cachedInputTokens: z.number().nullable(),
   errorRate: z.number().nullable(),
   errorCount: z.number().nullable(),
@@ -313,6 +315,8 @@ export const ConversationEntrySchema = z.object({
   totalTokens: z.number().int().nonnegative(),
   cachedInputTokens: z.number().int().nonnegative().nullable(),
   totalCostUsd: z.number(),
+  inputTokens: z.number().int().nonnegative().optional(),
+  outputTokens: z.number().int().nonnegative().optional(),
 });
 
 export const ConversationsResponseSchema = z.object({

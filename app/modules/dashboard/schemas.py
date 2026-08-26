@@ -28,6 +28,8 @@ class DashboardUsageCost(DashboardModel):
 class DashboardUsageMetrics(DashboardModel):
     requests: int | None = None
     tokens: int | None = None
+    input_tokens: int | None = Field(default=None, alias="inputTokens")
+    output_tokens: int | None = Field(default=None, alias="outputTokens")
     conversations: int = 0
     conversation_requests: int = 0
     cached_input_tokens: int | None = Field(default=None, alias="cachedInputTokens")

@@ -118,6 +118,8 @@ async def test_warmup_request_logs_are_excluded_from_dashboard_api_key_and_accou
         assert key_summary.request_count == 1
         assert key_summary.total_tokens == 15
         assert key_summary.cached_input_tokens == 3
+        assert key_summary.input_tokens == 10
+        assert key_summary.output_tokens == 5
 
         key_trends = await api_keys_repo.trends_by_key("key-warmup-exclusion", since, until, bucket_seconds=3600)
         assert len(key_trends) == 1
@@ -127,6 +129,8 @@ async def test_warmup_request_logs_are_excluded_from_dashboard_api_key_and_accou
         assert key_usage_7d.total_requests == 1
         assert key_usage_7d.total_tokens == 15
         assert key_usage_7d.cached_input_tokens == 3
+        assert key_usage_7d.input_tokens == 10
+        assert key_usage_7d.output_tokens == 5
 
         key_account_costs = await api_keys_repo.usage_7d_by_account("key-warmup-exclusion", since, until)
         assert key_account_costs == [
@@ -143,3 +147,5 @@ async def test_warmup_request_logs_are_excluded_from_dashboard_api_key_and_accou
         assert summary.request_count == 1
         assert summary.total_tokens == 15
         assert summary.cached_input_tokens == 3
+        assert summary.input_tokens == 10
+        assert summary.output_tokens == 5

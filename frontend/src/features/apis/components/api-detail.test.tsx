@@ -87,6 +87,8 @@ describe("ApiDetail", () => {
 			}),
 			usage7Day: createApiKeyUsage7Day({
 				totalTokens: 280_000,
+				inputTokens: 190_000,
+				outputTokens: 90_000,
 				cachedInputTokens: 45_000,
 				totalRequests: 350,
 				totalCostUsd: 2.47,
@@ -94,7 +96,9 @@ describe("ApiDetail", () => {
 		});
 
 		expect(screen.getByText(/280K tok/)).toBeInTheDocument();
+		expect(screen.getByText(/Input: 190K/)).toBeInTheDocument();
 		expect(screen.getByText(/45K cached/)).toBeInTheDocument();
+		expect(screen.getByText(/Output: 90K/)).toBeInTheDocument();
 		expect(screen.getByText(/350 req/)).toBeInTheDocument();
 		expect(screen.getByText(/\$2.47/)).toBeInTheDocument();
 	});

@@ -30,6 +30,8 @@ class AccountRequestUsage(DashboardModel):
     total_tokens: int = 0
     cached_input_tokens: int = 0
     total_cost_usd: float = 0.0
+    input_tokens: int = 0
+    output_tokens: int = 0
 
 
 class AccountUsageResetCredits(DashboardModel):

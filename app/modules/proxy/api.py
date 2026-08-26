@@ -1494,6 +1494,8 @@ async def v1_usage(
     return V1UsageResponse(
         request_count=usage.request_count,
         total_tokens=usage.total_tokens,
+        input_tokens=usage.input_tokens,
+        output_tokens=usage.output_tokens,
         cached_input_tokens=usage.cached_input_tokens,
         total_cost_usd=usage.total_cost_usd,
         limits=own_limits or upstream_limits,

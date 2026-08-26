@@ -470,6 +470,50 @@ async def test_switched_readers_match_legacy_across_watermark_states(db_setup):
 
 
 @pytest.mark.asyncio
+async def test_bucket_aggregates_use_reasoning_tokens_when_output_is_missing(db_setup):
+    """Dashboard trend buckets keep the same output fallback as other usage readers."""
+    del db_setup
+    bucket_start = BASE + timedelta(hours=1)
+    requested_at = bucket_start + timedelta(minutes=15)
+    async with SessionLocal() as session:
+        session.add(
+            _log(
+                requested_at,
+                request_id_suffix="reasoning-only-bucket",
+                account_id=None,
+                api_key_id=None,
+                input_tokens=100,
+                output_tokens=None,
+                reasoning_tokens=17,
+                cached_input_tokens=0,
+            )
+        )
+        await session.commit()
+        repo = RequestLogsRepository(session)
+        raw = await repo.aggregate_by_bucket(bucket_start, bucket_seconds=3600, until=bucket_start + timedelta(hours=1))
+
+    assert len(raw) == 1
+    assert raw[0].input_tokens == 100
+    assert raw[0].output_tokens == 17
+    assert raw[0].reasoning_tokens == 17
+
+    await run_hourly_fold_pass(now=requested_at + FOLD_LAG + timedelta(hours=1))
+
+    async with SessionLocal() as session:
+        repo = RequestLogsRepository(session)
+        folded = await repo.aggregate_by_bucket(
+            bucket_start,
+            bucket_seconds=3600,
+            until=bucket_start + timedelta(hours=1),
+        )
+
+    assert len(folded) == 1
+    assert folded[0].input_tokens == 100
+    assert folded[0].output_tokens == 17
+    assert folded[0].reasoning_tokens == 17
+
+
+@pytest.mark.asyncio
 async def test_reader_is_consistent_under_concurrent_fold_commit(db_setup, monkeypatch):
     """A fold slice committing between the reader's rollup+watermark read and
     its raw-tail read must not lose or double-count the just-folded window:

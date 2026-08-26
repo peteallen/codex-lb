@@ -279,3 +279,248 @@
 ::-webkit-scrollbar-thumb:hover {
   background: oklch(0.6 0 0 / 0.4);
 }
+
+/* Dashboard usage tables deliberately switch from a dense spreadsheet to
+   readable cards on narrow screens. Keeping one DOM tree preserves table
+   semantics for wide screens while avoiding horizontal clipping and token
+   detail collisions on phones and small tablets. */
+.dashboard-mobile-label {
+  display: none;
+}
+
+@media (max-width: 1199px) {
+  .dashboard-request-table-shell > .relative,
+  .dashboard-conversation-table-shell > .relative,
+  .dashboard-request-table-shell [data-slot="table-container"],
+  .dashboard-conversation-table-shell [data-slot="table-container"] {
+    overflow: visible;
+  }
+
+  .dashboard-request-table[data-slot="table"],
+  .dashboard-conversation-table[data-slot="table"] {
+    display: block;
+    width: 100%;
+    min-width: 0 !important;
+    table-layout: auto !important;
+  }
+
+  .dashboard-request-table thead,
+  .dashboard-conversation-table thead {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    clip-path: inset(50%);
+    white-space: nowrap;
+    border: 0;
+  }
+
+  .dashboard-request-table tbody,
+  .dashboard-conversation-table tbody {
+    display: grid;
+    gap: 0.75rem;
+    padding: 0.75rem;
+  }
+
+  .dashboard-request-table tbody tr,
+  .dashboard-conversation-table tbody tr {
+    display: grid;
+    min-width: 0;
+    margin: 0;
+    overflow: hidden;
+    border: 1px solid var(--border);
+    border-radius: calc(var(--radius) + 0.25rem);
+    background: var(--card);
+    box-shadow: var(--shadow-xs);
+  }
+
+  .dashboard-request-table tbody tr {
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-areas:
+      "model status"
+      "time time"
+      "account api-key"
+      "performance performance"
+      "tokens cost"
+      "details details";
+    gap: 0.6rem 1rem;
+    padding: 0.9rem;
+  }
+
+  .dashboard-conversation-table tbody tr {
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-areas:
+      "conversation conversation"
+      "last-request lasted"
+      "accounts accounts"
+      "api-key models"
+      "requests requests"
+      "tokens cost"
+      "details details";
+    gap: 0.6rem 1rem;
+    padding: 0.9rem;
+  }
+
+  .dashboard-request-table tbody td,
+  .dashboard-conversation-table tbody td {
+    display: block;
+    width: auto !important;
+    min-width: 0;
+    max-width: none !important;
+    padding: 0 !important;
+    overflow-wrap: anywhere;
+    white-space: normal !important;
+    vertical-align: top;
+  }
+
+  .dashboard-mobile-label {
+    display: block;
+    margin-bottom: 0.25rem;
+    color: var(--muted-foreground);
+    font-family: var(--font-sans);
+    font-size: 0.625rem;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    line-height: 1;
+    text-transform: uppercase;
+    content: attr(data-mobile-label);
+  }
+
+  .dashboard-request-table .dashboard-table-model {
+    grid-area: model;
+    align-self: center;
+  }
+
+  .dashboard-request-table .dashboard-table-model > div,
+  .dashboard-request-table .dashboard-table-model > div > span,
+  .dashboard-request-table .dashboard-table-account,
+  .dashboard-request-table .dashboard-table-api-key,
+  .dashboard-conversation-table .dashboard-conversation-id,
+  .dashboard-conversation-table .dashboard-conversation-api-key {
+    min-width: 0;
+    overflow-wrap: anywhere;
+    white-space: normal !important;
+  }
+
+  .dashboard-request-table .dashboard-table-status {
+    grid-area: status;
+    justify-self: end;
+    padding-left: 0 !important;
+  }
+
+  .dashboard-request-table .dashboard-table-time {
+    grid-area: time;
+    border-top: 1px solid color-mix(in oklab, var(--border) 70%, transparent);
+    padding-top: 0.6rem !important;
+  }
+
+  .dashboard-request-table .dashboard-table-account {
+    grid-area: account;
+  }
+
+  .dashboard-request-table .dashboard-table-api-key {
+    grid-area: api-key;
+    text-align: right;
+  }
+
+  .dashboard-request-table .dashboard-table-performance {
+    grid-area: performance;
+    border-top: 1px solid color-mix(in oklab, var(--border) 70%, transparent);
+    padding-top: 0.6rem !important;
+  }
+
+  .dashboard-request-table .dashboard-table-tokens,
+  .dashboard-request-table .dashboard-table-cost,
+  .dashboard-conversation-table .dashboard-conversation-tokens,
+  .dashboard-conversation-table .dashboard-conversation-cost {
+    border-top: 1px solid color-mix(in oklab, var(--border) 70%, transparent);
+    padding-top: 0.65rem !important;
+  }
+
+  .dashboard-request-table .dashboard-table-tokens,
+  .dashboard-conversation-table .dashboard-conversation-tokens {
+    grid-area: tokens;
+    text-align: left !important;
+  }
+
+  .dashboard-request-table .dashboard-table-cost,
+  .dashboard-conversation-table .dashboard-conversation-cost {
+    grid-area: cost;
+    text-align: right !important;
+  }
+
+  .dashboard-request-table .dashboard-table-details,
+  .dashboard-conversation-table .dashboard-conversation-details {
+    grid-area: details;
+    border-top: 1px solid color-mix(in oklab, var(--border) 70%, transparent);
+    padding-top: 0.65rem !important;
+  }
+
+  .dashboard-request-table .dashboard-table-details > div,
+  .dashboard-request-table .dashboard-table-details > button,
+  .dashboard-conversation-table .dashboard-conversation-details > button {
+    max-width: 100%;
+  }
+
+  .dashboard-request-table .dashboard-table-details > button,
+  .dashboard-conversation-table .dashboard-conversation-details > button {
+    justify-content: flex-start;
+    padding-left: 0;
+  }
+
+  .dashboard-conversation-table .dashboard-conversation-id {
+    grid-area: conversation;
+  }
+
+  .dashboard-conversation-table .dashboard-conversation-last-request {
+    grid-area: last-request;
+  }
+
+  .dashboard-conversation-table .dashboard-conversation-lasted {
+    grid-area: lasted;
+    text-align: right;
+  }
+
+  .dashboard-conversation-table .dashboard-conversation-accounts {
+    grid-area: accounts;
+  }
+
+  .dashboard-conversation-table .dashboard-conversation-api-key {
+    grid-area: api-key;
+  }
+
+  .dashboard-conversation-table .dashboard-conversation-models {
+    grid-area: models;
+    text-align: right;
+  }
+
+  .dashboard-conversation-table .dashboard-conversation-requests {
+    grid-area: requests;
+    border-top: 1px solid color-mix(in oklab, var(--border) 70%, transparent);
+    padding-top: 0.6rem !important;
+    text-align: left !important;
+  }
+
+  .dashboard-request-table .dashboard-table-tokens .leading-tight,
+  .dashboard-conversation-table .dashboard-conversation-tokens > div {
+    min-width: 0;
+  }
+
+  .dashboard-request-table .dashboard-token-breakdown,
+  .dashboard-request-table .dashboard-token-cache,
+  .dashboard-conversation-table .dashboard-token-breakdown,
+  .dashboard-conversation-table .dashboard-token-cache {
+    overflow-wrap: anywhere;
+    white-space: normal;
+  }
+}
+
+@media (min-width: 1200px) {
+  .dashboard-request-table .dashboard-table-tokens,
+  .dashboard-conversation-table .dashboard-conversation-tokens {
+    white-space: normal;
+  }
+}

@@ -69,6 +69,8 @@ class ApiKeyUsageSummaryResponse(DashboardModel):
     total_tokens: int
     cached_input_tokens: int
     total_cost_usd: float
+    input_tokens: int = 0
+    output_tokens: int = 0
 
 
 class ApiKeyResponse(DashboardModel):
@@ -126,4 +128,6 @@ class ApiKeyUsage7DayResponse(DashboardModel):
     total_cost_usd: float = 0
     total_requests: int = 0
     cached_input_tokens: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
     account_costs: list[ApiKeyAccountCostResponse] = Field(default_factory=list)

@@ -579,6 +579,8 @@ Reservation 생성 후 upstream API 호출에 진입하지 않고 종료되는 �
 ### Requirement: gpt-5.4-mini pricing is recognized
 
 The system MUST recognize `gpt-5.4-mini` pricing when computing request costs. Snapshot aliases for the same model family MUST resolve to the canonical `gpt-5.4-mini` price table entry.
+When the request uses `fast` or `priority`, the system MUST use the published
+Fast-tier input, cached-input, and output rates for `gpt-5.4-mini`.
 
 #### Scenario: gpt-5.4-mini request priced at standard tier
 
@@ -590,6 +592,71 @@ The system MUST recognize `gpt-5.4-mini` pricing when computing request costs. S
 - **WHEN** a request for `gpt-5.4-mini-2026-03-17` completes
 - **THEN** the system resolves the snapshot alias to `gpt-5.4-mini`
 - **AND** the system applies the same standard rates
+
+#### Scenario: gpt-5.4-mini Fast usage uses the published tier rates
+
+- **WHEN** a `gpt-5.4-mini` request uses `fast` or `priority`
+- **THEN** the system computes cost using the published Fast input, cached-input, and output rates
+
+### Requirement: Represented OpenAI model pricing matches the current published rates
+
+For the additional GPT-5 models represented by the canonical pricing registry,
+the system MUST use the USD-per-1M-token rates published on the official
+OpenAI API pricing page on August 26, 2026. Each triplet is uncached input /
+cached input / output; a dash means the published table has no rate for that
+dimension or context tier.
+
+| Model | Standard short | Standard long | Fast short | Flex short | Flex long |
+| --- | --- | --- | --- | --- | --- |
+| `gpt-5.5` | `5 / 0.50 / 30` | `10 / 1 / 45` | `12.5 / 1.25 / 75` | `2.5 / 0.25 / 15` | `5 / 0.50 / 22.5` |
+| `gpt-5.5-pro` | `30 / - / 180` | `60 / - / 270` | `-` | `15 / - / 90` | `-` |
+| `gpt-5.4` | `2.5 / 0.25 / 15` | `5 / 0.50 / 22.5` | `5 / 0.50 / 30` | `1.25 / 0.125 / 7.5` | `2.5 / 0.25 / 11.25` |
+| `gpt-5.4-mini` | `0.75 / 0.075 / 4.5` | `-` | `1.5 / 0.15 / 9` | `0.375 / 0.0375 / 2.25` | `-` |
+| `gpt-5.4-nano` | `0.20 / 0.02 / 1.25` | `-` | `-` | `0.10 / 0.01 / 0.625` | `-` |
+| `gpt-5.4-pro` | `30 / - / 180` | `60 / - / 270` | `-` | `15 / - / 90` | `30 / - / 135` |
+
+When a request uses an unsupported tier/context combination, cost accounting
+MUST fall back to the configured rate for that tier, or to Standard pricing
+when no tier-specific rate exists. It MUST NOT derive a new rate from a
+generic multiplier. Long-context rates MUST apply only when input tokens
+exceed 272,000. Snapshot aliases MUST resolve to the corresponding canonical
+registry entry.
+
+#### Scenario: GPT-5.5 Fast usage uses the published short-context rate
+
+- **WHEN** a `gpt-5.5` request uses `fast` or `priority`
+- **THEN** the system computes cost using `12.5 / 1.25 / 75` per 1M tokens
+
+#### Scenario: GPT-5.5 Flex long-context usage uses the published rate
+
+- **WHEN** a `gpt-5.5` request uses `flex` and exceeds 272,000 input tokens
+- **THEN** the system computes cost using `5 / 0.50 / 22.5` per 1M tokens
+
+#### Scenario: GPT-5.4 Mini unsupported long-context tier falls back safely
+
+- **WHEN** a `gpt-5.4-mini` request exceeds 272,000 input tokens and uses `fast`, `priority`, or `flex`
+- **THEN** the system uses the configured short-context rate for that tier
+- **AND** it does not invent a long-context multiplier
+
+#### Scenario: GPT-5.4 Pro Flex long-context usage uses the published rate
+
+- **WHEN** a `gpt-5.4-pro` request uses `flex` and exceeds 272,000 input tokens
+- **THEN** the system computes cost using `30 / - / 135` per 1M tokens
+
+### Requirement: Supported GPT Image models use model-specific current pricing
+
+For the supported public image models `gpt-image-2`, `gpt-image-1.5`,
+`gpt-image-1`, and `gpt-image-1-mini`, the registry MUST use each model's
+current published image-generation rates through the documented single-input
+rate approximation. The approximation uses text input for `input_per_1m`,
+image cached input for `cached_input_per_1m`, and image output for
+`output_per_1m`. The unsupported `chatgpt-image-latest` ID MUST NOT be made
+priceable unless the image-model allowlist supports it.
+
+#### Scenario: Legacy GPT Image models retain distinct prices
+
+- **WHEN** cost accounting prices `gpt-image-1.5`, `gpt-image-1`, or `gpt-image-1-mini`
+- **THEN** it uses that model's published rates rather than copying `gpt-image-2`
 
 ### Requirement: API keys can read their own `/v1/usage`
 
@@ -1167,23 +1234,28 @@ When API-key authentication and proxy-header trust are disabled, a loopback sock
 ### Requirement: GPT-5.6 usage cost pricing matches the current published rates
 
 When computing API-key usage, request-log, reservation, or aggregate cost for the canonical GPT-5.6 models, the system MUST use these USD-per-1M-token rates
-for input, cached input, and output:
+for input, cached input, and output, as published by the official OpenAI API
+pricing table on August 26, 2026:
 
-| Model | Standard | Fast/priority | Flex | Standard long context |
-| --- | --- | --- | --- | --- |
-| `gpt-5.6-sol` | `5 / 0.50 / 30` | `10 / 1 / 60` | `2.5 / 0.25 / 15` | `10 / 1 / 45` |
-| `gpt-5.6-terra` | `2 / 0.20 / 12` | `4 / 0.40 / 24` | `1 / 0.10 / 6` | `4 / 0.40 / 18` |
-| `gpt-5.6-luna` | `0.20 / 0.02 / 1.20` | `0.40 / 0.04 / 2.40` | `0.10 / 0.01 / 0.60` | `0.40 / 0.04 / 1.80` |
+| Model | Standard short | Fast/priority short | Flex short | Standard long | Fast/priority long | Flex long |
+| --- | --- | --- | --- | --- | --- | --- |
+| `gpt-5.6-sol` | `4 / 0.40 / 20` | `8 / 0.80 / 40` | `2 / 0.20 / 10` | `8 / 0.80 / 30` | `16 / 1.60 / 60` | `4 / 0.40 / 15` |
+| `gpt-5.6-terra` | `2 / 0.20 / 12` | `4 / 0.40 / 24` | `1 / 0.10 / 6` | `4 / 0.40 / 18` | `8 / 0.80 / 36` | `2 / 0.20 / 9` |
+| `gpt-5.6-luna` | `0.20 / 0.02 / 1.20` | `0.40 / 0.04 / 2.40` | `0.10 / 0.01 / 0.60` | `0.40 / 0.04 / 1.80` | `0.80 / 0.08 / 3.60` | `0.20 / 0.02 / 0.90` |
 
 The existing `priority` and `fast` service-tier aliases MUST use the
-Fast/priority rates. Standard long-context rates MUST apply only when input
-tokens exceed 272,000. Flex long-context pricing MUST continue to use the
-existing Flex short-context rates and multipliers. Model aliases with a
-version or snapshot suffix MUST resolve to the corresponding canonical table
-entry.
+Fast/priority rates. Long-context rates MUST apply only when input tokens
+exceed 272,000. Model aliases with a version or snapshot suffix MUST resolve
+to the corresponding canonical table entry.
 
-Batch rates and cache-write rates MUST NOT be introduced into this contract
-without corresponding proxy request and usage fields.
+Batch rates, regional-processing uplifts, and cache-write rates MUST NOT be
+introduced into this contract without corresponding proxy request and usage
+fields.
+
+#### Scenario: Sol standard usage uses the current promotional rate
+
+- **WHEN** a short-context Standard request for `gpt-5.6` or `gpt-5.6-sol` has 200,000 input tokens and one million output tokens
+- **THEN** the token cost is `$20.80`
 
 #### Scenario: Terra standard usage uses the current rate
 
@@ -1202,6 +1274,17 @@ without corresponding proxy request and usage fields.
 
 - **WHEN** a standard-tier `gpt-5.6-terra` request has 300,000 input tokens, 50,000 cached input tokens, and 100,000 output tokens
 - **THEN** the token cost is `$2.82`
+
+#### Scenario: Sol Fast long-context usage uses the published long-context row
+
+- **WHEN** a `gpt-5.6-sol` Fast request has 300,000 input tokens, 50,000 cached input tokens, and 100,000 output tokens
+- **THEN** the token cost is `$10.08`
+- **AND** the system does not reuse the short-context Fast rates
+
+#### Scenario: Sol Flex long-context usage uses the published long-context row
+
+- **WHEN** a `gpt-5.6-sol` Flex request has 300,000 input tokens, 50,000 cached input tokens, and 100,000 output tokens
+- **THEN** the token cost is `$2.52`
 
 #### Scenario: Versioned aliases use canonical GPT-5.6 pricing
 

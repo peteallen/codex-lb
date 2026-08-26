@@ -21,10 +21,16 @@ class ModelPrice:
     flex_input_per_1m: float | None = None
     flex_output_per_1m: float | None = None
     flex_cached_input_per_1m: float | None = None
+    flex_long_context_input_per_1m: float | None = None
+    flex_long_context_output_per_1m: float | None = None
+    flex_long_context_cached_input_per_1m: float | None = None
     long_context_threshold_tokens: float | None = None
     long_context_input_per_1m: float | None = None
     long_context_output_per_1m: float | None = None
     long_context_cached_input_per_1m: float | None = None
+    priority_long_context_input_per_1m: float | None = None
+    priority_long_context_output_per_1m: float | None = None
+    priority_long_context_cached_input_per_1m: float | None = None
 
 
 @dataclass(frozen=True)
@@ -89,19 +95,25 @@ def _normalize_usage(usage: UsageTokens | ResponseUsage | None) -> UsageTokens |
 
 DEFAULT_PRICING_MODELS: dict[str, ModelPrice] = {
     "gpt-5.6-sol": ModelPrice(
-        input_per_1m=5.0,
-        cached_input_per_1m=0.5,
-        output_per_1m=30.0,
-        priority_input_per_1m=10.0,
-        priority_cached_input_per_1m=1.0,
-        priority_output_per_1m=60.0,
-        flex_input_per_1m=2.5,
-        flex_cached_input_per_1m=0.25,
-        flex_output_per_1m=15.0,
+        input_per_1m=4.0,
+        cached_input_per_1m=0.4,
+        output_per_1m=20.0,
+        priority_input_per_1m=8.0,
+        priority_cached_input_per_1m=0.8,
+        priority_output_per_1m=40.0,
+        priority_long_context_input_per_1m=16.0,
+        priority_long_context_cached_input_per_1m=1.6,
+        priority_long_context_output_per_1m=60.0,
+        flex_input_per_1m=2.0,
+        flex_cached_input_per_1m=0.2,
+        flex_output_per_1m=10.0,
+        flex_long_context_input_per_1m=4.0,
+        flex_long_context_cached_input_per_1m=0.4,
+        flex_long_context_output_per_1m=15.0,
         long_context_threshold_tokens=272_000,
-        long_context_input_per_1m=10.0,
-        long_context_cached_input_per_1m=1.0,
-        long_context_output_per_1m=45.0,
+        long_context_input_per_1m=8.0,
+        long_context_cached_input_per_1m=0.8,
+        long_context_output_per_1m=30.0,
     ),
     "gpt-5.6-terra": ModelPrice(
         input_per_1m=2.0,
@@ -110,9 +122,15 @@ DEFAULT_PRICING_MODELS: dict[str, ModelPrice] = {
         priority_input_per_1m=4.0,
         priority_cached_input_per_1m=0.4,
         priority_output_per_1m=24.0,
+        priority_long_context_input_per_1m=8.0,
+        priority_long_context_cached_input_per_1m=0.8,
+        priority_long_context_output_per_1m=36.0,
         flex_input_per_1m=1.0,
         flex_cached_input_per_1m=0.1,
         flex_output_per_1m=6.0,
+        flex_long_context_input_per_1m=2.0,
+        flex_long_context_cached_input_per_1m=0.2,
+        flex_long_context_output_per_1m=9.0,
         long_context_threshold_tokens=272_000,
         long_context_input_per_1m=4.0,
         long_context_cached_input_per_1m=0.4,
@@ -125,9 +143,15 @@ DEFAULT_PRICING_MODELS: dict[str, ModelPrice] = {
         priority_input_per_1m=0.4,
         priority_cached_input_per_1m=0.04,
         priority_output_per_1m=2.4,
+        priority_long_context_input_per_1m=0.8,
+        priority_long_context_cached_input_per_1m=0.08,
+        priority_long_context_output_per_1m=3.6,
         flex_input_per_1m=0.1,
         flex_cached_input_per_1m=0.01,
         flex_output_per_1m=0.6,
+        flex_long_context_input_per_1m=0.2,
+        flex_long_context_cached_input_per_1m=0.02,
+        flex_long_context_output_per_1m=0.9,
         long_context_threshold_tokens=272_000,
         long_context_input_per_1m=0.4,
         long_context_cached_input_per_1m=0.04,
@@ -140,15 +164,25 @@ DEFAULT_PRICING_MODELS: dict[str, ModelPrice] = {
         flex_input_per_1m=2.5,
         flex_cached_input_per_1m=0.25,
         flex_output_per_1m=15.0,
+        flex_long_context_input_per_1m=5.0,
+        flex_long_context_cached_input_per_1m=0.5,
+        flex_long_context_output_per_1m=22.5,
         priority_input_per_1m=12.5,
         priority_cached_input_per_1m=1.25,
         priority_output_per_1m=75.0,
+        long_context_threshold_tokens=272_000,
+        long_context_input_per_1m=10.0,
+        long_context_cached_input_per_1m=1.0,
+        long_context_output_per_1m=45.0,
     ),
     "gpt-5.5-pro": ModelPrice(
         input_per_1m=30.0,
         output_per_1m=180.0,
         flex_input_per_1m=15.0,
         flex_output_per_1m=90.0,
+        long_context_threshold_tokens=272_000,
+        long_context_input_per_1m=60.0,
+        long_context_output_per_1m=270.0,
     ),
     "gpt-5.4": ModelPrice(
         input_per_1m=2.5,
@@ -160,6 +194,9 @@ DEFAULT_PRICING_MODELS: dict[str, ModelPrice] = {
         flex_input_per_1m=1.25,
         flex_cached_input_per_1m=0.125,
         flex_output_per_1m=7.5,
+        flex_long_context_input_per_1m=2.5,
+        flex_long_context_cached_input_per_1m=0.25,
+        flex_long_context_output_per_1m=11.25,
         long_context_threshold_tokens=272_000,
         long_context_input_per_1m=5.0,
         long_context_cached_input_per_1m=0.5,
@@ -169,6 +206,9 @@ DEFAULT_PRICING_MODELS: dict[str, ModelPrice] = {
         input_per_1m=0.75,
         cached_input_per_1m=0.075,
         output_per_1m=4.5,
+        priority_input_per_1m=1.5,
+        priority_cached_input_per_1m=0.15,
+        priority_output_per_1m=9.0,
         flex_input_per_1m=0.375,
         flex_cached_input_per_1m=0.0375,
         flex_output_per_1m=2.25,
@@ -186,6 +226,8 @@ DEFAULT_PRICING_MODELS: dict[str, ModelPrice] = {
         output_per_1m=180.0,
         flex_input_per_1m=15.0,
         flex_output_per_1m=90.0,
+        flex_long_context_input_per_1m=30.0,
+        flex_long_context_output_per_1m=135.0,
         long_context_threshold_tokens=272_000,
         long_context_input_per_1m=60.0,
         long_context_output_per_1m=270.0,
@@ -288,18 +330,25 @@ DEFAULT_PRICING_MODELS: dict[str, ModelPrice] = {
         priority_output_per_1m=20.0,
     ),
     # OpenAI Images token-based pricing (per 1M tokens, USD).
-    # gpt-image-2 (April 2026):
+    # gpt-image-2 (August 2026):
     #   text input  $5.00, image input $8.00, image cached input $2.00,
     #   image output $30.00.
     # The current ``ModelPrice`` shape carries a single input rate, so we
     # use the text-input rate as the dominant input cost (text dominates
     # the input side for typical prompts) and the image-output rate as
     # the output cost. Cached input maps to the image-cached rate.
-    # The legacy gpt-image-1.5 / gpt-image-1 / gpt-image-1-mini entries
-    # mirror gpt-image-2 today; they will be split out once OpenAI
-    # publishes per-model deltas. Without these entries cost-based API
-    # key quotas would resolve every /v1/images/* call to $0 and the
-    # quota would never bite.
+    # Current legacy GPT Image model rates:
+    #   gpt-image-1.5: text input $5.00, image cached input $2.00,
+    #                  image output $32.00.
+    #   gpt-image-1:   text input $5.00, image cached input $2.50,
+    #                  image output $40.00.
+    #   gpt-image-1-mini: text input $2.00, image cached input $0.25,
+    #                     image output $8.00.
+    # The current ``ModelPrice`` shape carries a single input rate, so we
+    # use each model's text-input rate as the dominant input cost and map
+    # the image-specific cached-input/output rates to the corresponding
+    # fields. Without these model-specific entries cost-based API key
+    # quotas would resolve every /v1/images/* call to the wrong price.
     "gpt-image-2": ModelPrice(
         input_per_1m=5.0,
         cached_input_per_1m=2.0,
@@ -308,49 +357,60 @@ DEFAULT_PRICING_MODELS: dict[str, ModelPrice] = {
     "gpt-image-1.5": ModelPrice(
         input_per_1m=5.0,
         cached_input_per_1m=2.0,
-        output_per_1m=30.0,
+        output_per_1m=32.0,
     ),
     "gpt-image-1": ModelPrice(
         input_per_1m=5.0,
-        cached_input_per_1m=2.0,
-        output_per_1m=30.0,
+        cached_input_per_1m=2.5,
+        output_per_1m=40.0,
     ),
     "gpt-image-1-mini": ModelPrice(
-        input_per_1m=5.0,
-        cached_input_per_1m=2.0,
-        output_per_1m=30.0,
+        input_per_1m=2.0,
+        cached_input_per_1m=0.25,
+        output_per_1m=8.0,
     ),
 }
 
 DEFAULT_MODEL_ALIASES: dict[str, str] = {
     "gpt-5.6": "gpt-5.6-sol",
-    "gpt-5.6-sol*": "gpt-5.6-sol",
-    "gpt-5.6-terra*": "gpt-5.6-terra",
-    "gpt-5.6-luna*": "gpt-5.6-luna",
-    "gpt-5.5-pro*": "gpt-5.5-pro",
-    "gpt-5.5*": "gpt-5.5",
-    "gpt-5.4-pro*": "gpt-5.4-pro",
-    "gpt-5.4-mini*": "gpt-5.4-mini",
-    "gpt-5.4-nano*": "gpt-5.4-nano",
-    "gpt-5.4*": "gpt-5.4",
-    "gpt-5.3-codex*": "gpt-5.3-codex",
-    "gpt-5.3-chat-latest*": "gpt-5.3-chat-latest",
-    "gpt-5.2-codex*": "gpt-5.2-codex",
-    "gpt-5.2-chat-latest*": "gpt-5.2-chat-latest",
-    "gpt-5.3*": "gpt-5.3",
-    "gpt-5.1-chat-latest*": "gpt-5.1-chat-latest",
-    "gpt-5.2*": "gpt-5.2",
-    "gpt-5-chat-latest*": "gpt-5-chat-latest",
-    "gpt-5.1*": "gpt-5.1",
-    "gpt-5*": "gpt-5",
-    "gpt-5.1-codex-max*": "gpt-5.1-codex-max",
-    "gpt-5.1-codex-mini*": "gpt-5.1-codex-mini",
-    "gpt-5.1-codex*": "gpt-5.1-codex",
-    "gpt-5-codex*": "gpt-5-codex",
-    "gpt-image-2*": "gpt-image-2",
-    "gpt-image-1.5*": "gpt-image-1.5",
-    "gpt-image-1-mini*": "gpt-image-1-mini",
-    "gpt-image-1*": "gpt-image-1",
+    # Wildcards only accept dated snapshots. Broad family wildcards can
+    # otherwise make a distinct public model (for example ``gpt-5-pro`` or
+    # ``gpt-5.6-cyber``) inherit a neighboring model's price.
+    "gpt-5.6-20*": "gpt-5.6-sol",
+    "gpt-5.6-sol-20*": "gpt-5.6-sol",
+    # The service-layer compatibility tests and older callers use this
+    # explicit marker; keep it supported without reopening a broad wildcard.
+    "gpt-5.6-sol-snapshot": "gpt-5.6-sol",
+    "gpt-5.6-terra-20*": "gpt-5.6-terra",
+    "gpt-5.6-terra-snapshot": "gpt-5.6-terra",
+    "gpt-5.6-luna-20*": "gpt-5.6-luna",
+    "gpt-5.6-luna-snapshot": "gpt-5.6-luna",
+    "gpt-5.5-pro-20*": "gpt-5.5-pro",
+    "gpt-5.5-20*": "gpt-5.5",
+    "gpt-5.4-pro-20*": "gpt-5.4-pro",
+    "gpt-5.4-mini-20*": "gpt-5.4-mini",
+    "gpt-5.4-nano-20*": "gpt-5.4-nano",
+    "gpt-5.4-20*": "gpt-5.4",
+    "gpt-5.3-codex-spark": "gpt-5.3-codex",
+    "gpt-5.3-codex-spark-20*": "gpt-5.3-codex",
+    "gpt-5.3-codex-20*": "gpt-5.3-codex",
+    "gpt-5.3-chat-latest-20*": "gpt-5.3-chat-latest",
+    "gpt-5.2-codex-20*": "gpt-5.2-codex",
+    "gpt-5.2-chat-latest-20*": "gpt-5.2-chat-latest",
+    "gpt-5.3-20*": "gpt-5.3",
+    "gpt-5.1-chat-latest-20*": "gpt-5.1-chat-latest",
+    "gpt-5.2-20*": "gpt-5.2",
+    "gpt-5-chat-latest-20*": "gpt-5-chat-latest",
+    "gpt-5.1-20*": "gpt-5.1",
+    "gpt-5-20*": "gpt-5",
+    "gpt-5.1-codex-max-20*": "gpt-5.1-codex-max",
+    "gpt-5.1-codex-mini-20*": "gpt-5.1-codex-mini",
+    "gpt-5.1-codex-20*": "gpt-5.1-codex",
+    "gpt-5-codex-20*": "gpt-5-codex",
+    "gpt-image-2-20*": "gpt-image-2",
+    "gpt-image-1.5-20*": "gpt-image-1.5",
+    "gpt-image-1-mini-20*": "gpt-image-1-mini",
+    "gpt-image-1-20*": "gpt-image-1",
 }
 
 
@@ -419,16 +479,31 @@ def _effective_rates(
     service_tier: str | None,
 ) -> tuple[float, float, float]:
     is_long_context = (
-        price.long_context_threshold_tokens is not None
-        and usage.input_tokens > price.long_context_threshold_tokens
-        and price.long_context_input_per_1m is not None
-        and price.long_context_output_per_1m is not None
+        price.long_context_threshold_tokens is not None and usage.input_tokens > price.long_context_threshold_tokens
+    )
+    has_long_context_rates = (
+        is_long_context and price.long_context_input_per_1m is not None and price.long_context_output_per_1m is not None
     )
     input_rate = price.input_per_1m
     cached_rate = price.cached_input_per_1m if price.cached_input_per_1m is not None else input_rate
     output_rate = price.output_per_1m
 
     if _uses_priority_tier(service_tier):
+        if (
+            is_long_context
+            and price.priority_long_context_input_per_1m is not None
+            and price.priority_long_context_output_per_1m is not None
+        ):
+            priority_long_cached = (
+                price.priority_long_context_cached_input_per_1m
+                if price.priority_long_context_cached_input_per_1m is not None
+                else price.priority_long_context_input_per_1m
+            )
+            return (
+                price.priority_long_context_input_per_1m,
+                priority_long_cached,
+                price.priority_long_context_output_per_1m,
+            )
         if price.priority_input_per_1m is not None and price.priority_output_per_1m is not None:
             priority_cached = (
                 price.priority_cached_input_per_1m
@@ -446,13 +521,21 @@ def _effective_rates(
         input_rate = price.flex_input_per_1m
         cached_rate = price.flex_cached_input_per_1m if price.flex_cached_input_per_1m is not None else input_rate
         output_rate = price.flex_output_per_1m
-        if is_long_context:
-            input_rate *= 2.0
-            cached_rate *= 2.0
-            output_rate *= 1.5
+        if (
+            is_long_context
+            and price.flex_long_context_input_per_1m is not None
+            and price.flex_long_context_output_per_1m is not None
+        ):
+            input_rate = price.flex_long_context_input_per_1m
+            cached_rate = (
+                price.flex_long_context_cached_input_per_1m
+                if price.flex_long_context_cached_input_per_1m is not None
+                else input_rate
+            )
+            output_rate = price.flex_long_context_output_per_1m
         return input_rate, cached_rate, output_rate
 
-    if is_long_context:
+    if has_long_context_rates:
         assert price.long_context_input_per_1m is not None
         assert price.long_context_output_per_1m is not None
         input_rate = price.long_context_input_per_1m

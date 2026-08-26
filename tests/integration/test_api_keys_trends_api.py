@@ -632,6 +632,8 @@ async def test_usage_7d_sums_only_recent_request_logs(async_client):
         "totalCostUsd": 0.53,
         "totalRequests": 3,
         "cachedInputTokens": 21,
+        "inputTokens": 130,
+        "outputTokens": 44,
         "accountCosts": [
             {
                 "accountId": None,
@@ -684,6 +686,8 @@ async def test_usage_7d_clamps_cached_input_tokens_to_total_input(async_client):
         "totalCostUsd": 0.15,
         "totalRequests": 2,
         "cachedInputTokens": 14,
+        "inputTokens": 14,
+        "outputTokens": 5,
         "accountCosts": [
             {
                 "accountId": None,

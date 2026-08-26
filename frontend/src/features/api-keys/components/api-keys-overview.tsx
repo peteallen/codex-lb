@@ -16,8 +16,24 @@ type BreakdownRow = {
   label: string;
   labelSuffix: string;
   value: number;
+  inputTokens: number | undefined;
+  outputTokens: number | undefined;
+  cachedInputTokens: number;
   share: number;
 };
+
+type UsageSummary = NonNullable<ApiKey["usageSummary"]>;
+
+function sumUsageField(apiKeys: ApiKey[], field: "inputTokens" | "outputTokens"): number | undefined {
+  let total = 0;
+  for (const apiKey of apiKeys) {
+    const usage: UsageSummary | null | undefined = apiKey.usageSummary;
+    if (!usage) continue;
+    if (usage[field] == null) return undefined;
+    total += usage[field];
+  }
+  return total;
+}
 
 function isExpired(apiKey: ApiKey): boolean {
   if (!apiKey.expiresAt) return false;
@@ -68,6 +84,9 @@ function buildBreakdownRows(apiKeys: ApiKey[], metric: UsageMetric): BreakdownRo
         label: apiKey.name,
         labelSuffix: apiKey.keyPrefix ? ` · ${apiKey.keyPrefix}` : "",
         value,
+        inputTokens: usage?.inputTokens,
+        outputTokens: usage?.outputTokens,
+        cachedInputTokens: usage?.cachedInputTokens ?? 0,
       });
     }
     return nextRows;
@@ -131,6 +150,11 @@ function BreakdownPanel({
                   {formatMetricValue(metric, row.value)} · {formatSharePercent(row.share)}
                 </span>
               </div>
+              {metric === "tokens" ? (
+                <div className="text-right text-[11px] tabular-nums text-muted-foreground">
+                  {t("common.units.input")}: {formatCompactNumber(row.inputTokens)} · {t("common.units.cachedShort", { count: formatCompactNumber(row.cachedInputTokens) })} · {t("common.units.output")}: {formatCompactNumber(row.outputTokens)}
+                </div>
+              ) : null}
               <div className="h-1.5 overflow-hidden rounded-full bg-muted">
                 <div
                   className="h-full rounded-full bg-primary transition-[width] duration-500 ease-out"
@@ -157,6 +181,9 @@ export function ApiKeysOverview({ apiKeys }: ApiKeysOverviewProps) {
   const usedKeys = apiKeys.filter((apiKey) => (apiKey.usageSummary?.requestCount ?? 0) > 0).length;
   const totalRequests = apiKeys.reduce((sum, apiKey) => sum + (apiKey.usageSummary?.requestCount ?? 0), 0);
   const totalTokens = apiKeys.reduce((sum, apiKey) => sum + (apiKey.usageSummary?.totalTokens ?? 0), 0);
+  const totalInputTokens = sumUsageField(apiKeys, "inputTokens");
+  const totalOutputTokens = sumUsageField(apiKeys, "outputTokens");
+  const totalCachedInputTokens = apiKeys.reduce((sum, apiKey) => sum + (apiKey.usageSummary?.cachedInputTokens ?? 0), 0);
   const totalCostUsd = apiKeys.reduce((sum, apiKey) => sum + (apiKey.usageSummary?.totalCostUsd ?? 0), 0);
   const inactiveKeys = totalKeys - activeKeys;
   const idleKeys = totalKeys - usedKeys;
@@ -175,7 +202,15 @@ export function ApiKeysOverview({ apiKeys }: ApiKeysOverviewProps) {
         <OverviewStat
           label={t("apiKeys.overview.lifetimeRequests")}
           value={formatCompactNumber(totalRequests)}
-          meta={t("apiKeys.overview.tokensMeta", { count: formatCompactNumber(totalTokens) })}
+          meta={t("apiKeys.overview.tokensMeta", {
+            count: formatCompactNumber(totalTokens),
+            input: formatCompactNumber(totalInputTokens),
+            output: formatCompactNumber(totalOutputTokens),
+            cached: formatCompactNumber(totalCachedInputTokens),
+            inputLabel: t("common.units.input").toLowerCase(),
+            outputLabel: t("common.units.output").toLowerCase(),
+            cachedLabel: t("common.units.cached").toLowerCase(),
+          })}
         />
         <OverviewStat label={t("apiKeys.overview.lifetimeCost")} value={formatCurrency(totalCostUsd)} meta={t("apiKeys.overview.lifetimeCostMeta")} />
       </div>

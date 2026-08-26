@@ -41,6 +41,8 @@ describe("ApiKeyTable", () => {
     expect(within(firstRow).getByText(keys[0].name)).toBeInTheDocument();
     expect(within(firstRow).getByText(keys[0].keyPrefix)).toBeInTheDocument();
     expect(within(firstRow).getByText("Active")).toBeInTheDocument();
+    expect(within(firstRow).getByText(/35K input/)).toBeInTheDocument();
+    expect(within(firstRow).getByText(/15K output/)).toBeInTheDocument();
 
     const secondRow = rows[2];
     expect(within(secondRow).getByText("Disabled")).toBeInTheDocument();

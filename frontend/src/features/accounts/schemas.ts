@@ -16,6 +16,8 @@ const AccountRequestUsageSchema = z.object({
   totalTokens: z.number().int().nonnegative(),
   cachedInputTokens: z.number().int().nonnegative(),
   totalCostUsd: z.number().nonnegative(),
+  inputTokens: z.number().int().nonnegative().optional(),
+  outputTokens: z.number().int().nonnegative().optional(),
 });
 
 export const AccountUsageResetCreditsSchema = z.object({

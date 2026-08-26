@@ -288,6 +288,8 @@ async def test_v1_usage_returns_zero_usage_for_key_without_logs(async_client):
     assert response.json() == {
         "request_count": 0,
         "total_tokens": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
         "cached_input_tokens": 0,
         "total_cost_usd": 0.0,
         "limits": [],
@@ -312,6 +314,8 @@ async def test_v1_usage_omits_disabled_account_pool_usage_section(async_client):
     assert response.json() == {
         "request_count": 0,
         "total_tokens": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
         "cached_input_tokens": 0,
         "total_cost_usd": 0.0,
         "limits": [],
@@ -423,6 +427,8 @@ async def test_v1_usage_scopes_usage_and_limits_to_authenticated_key(async_clien
     payload = response.json()
     assert payload["request_count"] == 2
     assert payload["total_tokens"] == 140
+    assert payload["input_tokens"] == 110
+    assert payload["output_tokens"] == 30
     assert payload["cached_input_tokens"] == 22
     assert payload["total_cost_usd"] > 0
     assert payload["limits"] == [

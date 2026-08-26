@@ -166,6 +166,8 @@ class AccountsService:
                 total_tokens=row.total_tokens,
                 cached_input_tokens=row.cached_input_tokens,
                 total_cost_usd=row.total_cost_usd,
+                input_tokens=row.input_tokens,
+                output_tokens=row.output_tokens,
             )
             for account_id, row in request_usage_rows.items()
         }

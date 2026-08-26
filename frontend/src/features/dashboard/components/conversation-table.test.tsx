@@ -119,6 +119,8 @@ describe("ConversationTable", () => {
             representativeModel: "gpt-5.4",
             remainingModelCount: 1,
             totalTokens: 2048,
+            inputTokens: 1536,
+            outputTokens: 512,
             cachedInputTokens: 512,
             totalCostUsd: 0.42,
           }),
@@ -166,6 +168,22 @@ describe("ConversationTable", () => {
     expect(screen.getByText("+ 2 more")).toBeInTheDocument();
     expect(screen.getByText("+ 1 more")).toBeInTheDocument();
     expect(screen.getByText(/cached/i)).toBeInTheDocument();
+    expect(screen.getByText(/Input: 1\.54K.*Output: 512/)).toBeInTheDocument();
+    expect(screen.getByRole("table")).toHaveClass("dashboard-conversation-table");
+    expect(screen.getByText(/Input: 1\.54K.*Output: 512/).closest("td")).toHaveClass("dashboard-conversation-tokens");
+    expect(screen.getByText(/Input: 1\.54K.*Output: 512/).closest("td")).toHaveAttribute("data-mobile-label", "Tokens");
+    expect(Array.from(screen.getByRole("row", { name: /conv_visible/ }).querySelectorAll(".dashboard-mobile-label"), (label) => label.textContent)).toEqual([
+      "Last request",
+      "Lasted",
+      "Conversation",
+      "Accounts",
+      "API key",
+      "Models",
+      "Requests",
+      "Tokens",
+      "Cost",
+      "Details",
+    ]);
     expect(screen.getByText("Operator key")).toBeInTheDocument();
     expect(screen.getByTitle("gpt-5.4").querySelector('[translate="no"]')).toHaveTextContent("gpt-5.4");
     expect(screen.queryByText("key_1")).not.toBeInTheDocument();

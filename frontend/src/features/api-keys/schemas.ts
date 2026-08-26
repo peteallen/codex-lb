@@ -28,6 +28,8 @@ const ApiKeyUsageSummarySchema = z.object({
   totalTokens: z.number().int().nonnegative(),
   cachedInputTokens: z.number().int().nonnegative(),
   totalCostUsd: z.number().nonnegative().default(0),
+  inputTokens: z.number().int().nonnegative().optional(),
+  outputTokens: z.number().int().nonnegative().optional(),
 });
 
 const SERVICE_TIERS = ["auto", "default", "priority", "flex"] as const;

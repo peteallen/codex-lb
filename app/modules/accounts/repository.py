@@ -63,6 +63,8 @@ class AccountRequestUsageSummary:
     total_tokens: int
     cached_input_tokens: int
     total_cost_usd: float
+    input_tokens: int = 0
+    output_tokens: int = 0
 
 
 class AccountIdentityConflictError(Exception):
@@ -160,6 +162,8 @@ class AccountsRepository:
                 total_tokens=input_total + output_total,
                 cached_input_tokens=cached_total,
                 total_cost_usd=round(float(total_cost_usd), 6),
+                input_tokens=input_total,
+                output_tokens=output_total,
             )
         return summaries
 

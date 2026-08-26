@@ -121,6 +121,8 @@ class ConversationEntry(DashboardModel):
     total_tokens: int
     cached_input_tokens: int | None
     total_cost_usd: float
+    input_tokens: int = 0
+    output_tokens: int = 0
 
 
 class ConversationsResponse(DashboardModel):

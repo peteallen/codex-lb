@@ -226,6 +226,8 @@ async def test_conversation_list_contract_search_and_aggregate(async_client, db_
         "totalTokens",
         "cachedInputTokens",
         "totalCostUsd",
+        "inputTokens",
+        "outputTokens",
     }
     assert entry["conversationId"] == "Conv-A"
     assert entry["requestCount"] == 3
@@ -238,6 +240,8 @@ async def test_conversation_list_contract_search_and_aggregate(async_client, db_
     assert entry["representativeModel"] == "model-a"
     assert entry["remainingModelCount"] == 1
     assert entry["totalTokens"] == 225
+    assert entry["inputTokens"] == 150
+    assert entry["outputTokens"] == 75
     assert entry["cachedInputTokens"] == 100
     assert entry["totalCostUsd"] == pytest.approx(6.0)
     _assert_no_seeded_sensitive_values(response, ("secret-a", "secret-z", "sk-a", "sk-z"))

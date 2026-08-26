@@ -24,6 +24,8 @@ export const ApiKeyUsage7DayResponseSchema = z.object({
   totalCostUsd: z.number(),
   totalRequests: z.number().int(),
   cachedInputTokens: z.number().int(),
+  inputTokens: z.number().int().nonnegative().optional(),
+  outputTokens: z.number().int().nonnegative().optional(),
   accountCosts: z.array(ApiKeyAccountCostSchema).default([]),
 });
 

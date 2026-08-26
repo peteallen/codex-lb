@@ -305,6 +305,8 @@ def _to_conversations(result: ConversationListResult, api_key_names: dict[str, s
                 total_tokens=summary.total_tokens,
                 cached_input_tokens=summary.cached_input_tokens,
                 total_cost_usd=summary.cost_usd,
+                input_tokens=summary.input_tokens,
+                output_tokens=summary.output_tokens,
             )
         )
     return entries

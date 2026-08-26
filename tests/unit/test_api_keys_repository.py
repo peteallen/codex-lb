@@ -232,6 +232,8 @@ class TestUsage7d:
         assert result.total_tokens == 250
         assert result.cached_input_tokens == 25
         assert result.total_cost_usd == 1.8
+        assert result.input_tokens == 200
+        assert result.output_tokens == 50
         assert result.account_costs == [
             ApiKeyAccountCost(
                 account_id="acc_1",

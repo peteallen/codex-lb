@@ -151,7 +151,7 @@ describe("RecentRequestsTable", () => {
     );
 
     expect(screen.getByText("Primary Account")).toBeInTheDocument();
-    expect(screen.getByRole("cell", { name: "Plus" })).toBeInTheDocument();
+    expect(screen.getByText("Plus")).toBeInTheDocument();
     expect(screen.getByText("Key Alpha")).toBeInTheDocument();
     expect(screen.getByText("gpt-5.1 (high, default)")).toBeInTheDocument();
     expect(screen.getByText("Requested priority")).toBeInTheDocument();
@@ -159,6 +159,21 @@ describe("RecentRequestsTable", () => {
     expect(screen.getByText("Up Auto")).toBeInTheDocument();
     expect(screen.getByText("Rate limit")).toBeInTheDocument();
     expect(screen.getByText("rate_limit_exceeded")).toBeInTheDocument();
+    expect(screen.getByText(/Input: 1K.*Output: 200/)).toBeInTheDocument();
+    expect(screen.getByRole("table")).toHaveClass("dashboard-request-table");
+    expect(screen.getByText(/Input: 1K.*Output: 200/).closest("td")).toHaveClass("dashboard-table-tokens");
+    expect(screen.getByText(/Input: 1K.*Output: 200/).closest("td")).toHaveAttribute("data-mobile-label", "Tokens");
+    expect(Array.from(screen.getByRole("row", { name: /gpt-5.1/ }).querySelectorAll(".dashboard-mobile-label"), (label) => label.textContent)).toEqual([
+      "Time",
+      "Account",
+      "API Key",
+      "Model",
+      "Status",
+      "TTFT / TPS",
+      "Tokens",
+      "Cost",
+      "Details",
+    ]);
 
     const dialog = openRequestDetails();
     expect(dialog).toBeInTheDocument();

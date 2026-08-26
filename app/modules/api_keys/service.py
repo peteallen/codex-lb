@@ -350,6 +350,8 @@ class ApiKeyUsageSummaryData:
     total_tokens: int
     cached_input_tokens: int
     total_cost_usd: float
+    input_tokens: int = 0
+    output_tokens: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -1166,6 +1168,8 @@ class ApiKeysService:
         return ApiKeySelfUsageData(
             request_count=usage.request_count,
             total_tokens=usage.total_tokens,
+            input_tokens=usage.input_tokens,
+            output_tokens=usage.output_tokens,
             cached_input_tokens=usage.cached_input_tokens,
             total_cost_usd=usage.total_cost_usd,
             limits=limits,
@@ -1184,6 +1188,8 @@ class ApiKeysService:
             total_cost_usd=data.total_cost_usd,
             total_requests=data.total_requests,
             cached_input_tokens=data.cached_input_tokens,
+            input_tokens=data.input_tokens,
+            output_tokens=data.output_tokens,
             account_costs=[
                 ApiKeyAccountCostData(
                     account_id=ac.account_id,
@@ -1225,6 +1231,8 @@ class ApiKeyUsage7DayData:
     total_requests: int = 0
     cached_input_tokens: int = 0
     account_costs: list[ApiKeyAccountCostData] = field(default_factory=list)
+    input_tokens: int = 0
+    output_tokens: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -1243,6 +1251,8 @@ class ApiKeySelfLimitData:
 class ApiKeySelfUsageData:
     request_count: int = 0
     total_tokens: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
     cached_input_tokens: int = 0
     total_cost_usd: float = 0.0
     limits: list[ApiKeySelfLimitData] = field(default_factory=list)
@@ -1702,6 +1712,8 @@ def _to_usage_summary_data(summary: ApiKeyUsageSummary | None) -> ApiKeyUsageSum
         total_tokens=summary.total_tokens,
         cached_input_tokens=summary.cached_input_tokens,
         total_cost_usd=summary.total_cost_usd,
+        input_tokens=summary.input_tokens,
+        output_tokens=summary.output_tokens,
     )
 
 

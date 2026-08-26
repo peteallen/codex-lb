@@ -61,15 +61,29 @@ function formatLimitSummary(limits: LimitRule[], t: ReturnType<typeof useTransla
 function formatUsageSummary(
   requestCount: number,
   totalTokens: number,
+  inputTokens: number | undefined,
+  outputTokens: number | undefined,
   cachedInputTokens: number,
   totalCostUsd: number,
   t: ReturnType<typeof useTranslation>["t"],
 ): string {
   const total = formatCompactNumber(totalTokens);
+  const input = formatCompactNumber(inputTokens);
+  const output = formatCompactNumber(outputTokens);
   const cached = formatCompactNumber(cachedInputTokens);
   const requests = formatCompactNumber(requestCount);
   const cost = formatCurrency(totalCostUsd);
-  return t("apiKeys.table.usageSummary", { total, cached, requests, cost });
+  return t("apiKeys.table.usageSummary", {
+    total,
+    input,
+    output,
+    cached,
+    inputLabel: t("common.units.input").toLowerCase(),
+    outputLabel: t("common.units.output").toLowerCase(),
+    cachedLabel: t("common.units.cached").toLowerCase(),
+    requests,
+    cost,
+  });
 }
 
 function getUsageValue(apiKey: ApiKey, t: ReturnType<typeof useTranslation>["t"]): string {
@@ -80,6 +94,8 @@ function getUsageValue(apiKey: ApiKey, t: ReturnType<typeof useTranslation>["t"]
   return formatUsageSummary(
     apiKey.usageSummary.requestCount,
     apiKey.usageSummary.totalTokens,
+    apiKey.usageSummary.inputTokens,
+    apiKey.usageSummary.outputTokens,
     apiKey.usageSummary.cachedInputTokens,
     apiKey.usageSummary.totalCostUsd,
     t,

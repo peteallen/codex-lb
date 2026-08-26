@@ -76,6 +76,8 @@ def _to_response(row: ApiKeyData) -> ApiKeyResponse:
                 total_tokens=row.usage_summary.total_tokens,
                 cached_input_tokens=row.usage_summary.cached_input_tokens,
                 total_cost_usd=row.usage_summary.total_cost_usd,
+                input_tokens=row.usage_summary.input_tokens,
+                output_tokens=row.usage_summary.output_tokens,
             )
             if row.usage_summary is not None
             else None
@@ -297,6 +299,8 @@ async def get_api_key_usage_7d(
         total_cost_usd=result.total_cost_usd,
         total_requests=result.total_requests,
         cached_input_tokens=result.cached_input_tokens,
+        input_tokens=result.input_tokens,
+        output_tokens=result.output_tokens,
         account_costs=[
             ApiKeyAccountCostResponse(
                 account_id=ac.account_id,

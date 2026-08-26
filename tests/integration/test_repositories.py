@@ -357,6 +357,8 @@ async def test_account_slot_upgrades_single_legacy_unknown_workspace_row(db_setu
 
         usage = await repo.list_request_usage_summary_by_account([stored.id])
         assert usage[stored.id].request_count == 1
+        assert usage[stored.id].input_tokens == 7
+        assert usage[stored.id].output_tokens == 11
 
 
 @pytest.mark.asyncio

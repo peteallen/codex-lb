@@ -364,16 +364,20 @@ export function DashboardPage() {
     null;
 
   return (
-    <div className="animate-fade-in-up space-y-8">
+    <div className="animate-fade-in-up">
       {/* Page header */}
-      <div className="flex items-start justify-between">
-        <div>
-          <h1 className="text-2xl font-semibold tracking-tight">{t("dashboard.page.title")}</h1>
-          <p className="mt-1 text-sm text-muted-foreground">
-            {t("dashboard.page.subtitle")}
-          </p>
-        </div>
-        <div className="flex items-center gap-2">
+      <div className="mb-4">
+        <h1 className="text-2xl font-semibold tracking-tight">{t("dashboard.page.title")}</h1>
+        <p className="mt-1 text-sm text-muted-foreground">
+          {t("dashboard.page.subtitle")}
+        </p>
+      </div>
+
+      <div
+        className="sticky top-[53px] z-10 -mx-4 border-y border-border/70 bg-background/90 px-4 py-2 shadow-[0_1px_12px_rgba(0,0,0,0.06)] backdrop-blur-xl supports-[backdrop-filter]:bg-background/75 dark:shadow-[0_1px_12px_rgba(0,0,0,0.25)] sm:-mx-6 sm:px-6"
+        data-testid="dashboard-controls-toolbar"
+      >
+        <div className="flex w-full min-w-0 max-w-full flex-wrap items-center gap-2">
           {dashboardView === "request-logs" ? (
             <OverviewTimeframeSelect
               value={overviewRange}
@@ -400,13 +404,14 @@ export function DashboardPage() {
         </div>
       </div>
 
-      {errorMessage ? <AlertMessage variant="error">{errorMessage}</AlertMessage> : null}
+      <div className="mt-8 space-y-8">
+        {errorMessage ? <AlertMessage variant="error">{errorMessage}</AlertMessage> : null}
 
-      {!view ? (
-        <DashboardSkeleton />
-      ) : (
-        <>
-          <StatsGrid stats={view.stats} />
+        {!view ? (
+          <DashboardSkeleton />
+        ) : (
+          <>
+            <StatsGrid stats={view.stats} />
 
           {view.weeklyCreditPace ? (
             <div className="grid gap-4 xl:grid-cols-[minmax(0,2fr)_minmax(18rem,1fr)]">
@@ -538,8 +543,9 @@ export function DashboardPage() {
               </>
             ) : null}
           </section>
-        </>
-      )}
+          </>
+        )}
+      </div>
 
       {resetCreditDialog.data ? (
         <ResetCreditConfirmDialog

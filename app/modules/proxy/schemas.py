@@ -275,6 +275,8 @@ class V1UsageResponse(BaseModel):
 
     request_count: int
     total_tokens: int
+    input_tokens: int
+    output_tokens: int
     cached_input_tokens: int
     total_cost_usd: float
     limits: list[V1UsageLimitResponse]

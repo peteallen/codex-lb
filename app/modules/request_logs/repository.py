@@ -163,6 +163,8 @@ class ConversationListSummary:
     total_tokens: int
     cached_input_tokens: int | None
     cost_usd: float
+    input_tokens: int = 0
+    output_tokens: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -292,6 +294,8 @@ class RequestLogsRepository:
                 func.max(RequestLog.requested_at).label("last_requested_at"),
                 func.count().label("request_count"),
                 func.count(func.distinct(RequestLog.account_id)).label("account_count"),
+                func.coalesce(func.sum(func.coalesce(RequestLog.input_tokens, 0)), 0).label("input_tokens"),
+                func.coalesce(func.sum(output), 0).label("output_tokens"),
                 func.coalesce(func.sum(func.coalesce(RequestLog.input_tokens, 0) + output), 0).label("total_tokens"),
                 func.sum(cached).label("cached_input_tokens"),
                 func.coalesce(func.sum(RequestLog.cost_usd), 0.0).label("cost_usd"),
@@ -339,6 +343,8 @@ class RequestLogsRepository:
                 last_requested_at=row.last_requested_at,
                 request_count=int(row.request_count),
                 account_count=int(row.account_count),
+                input_tokens=int(row.input_tokens),
+                output_tokens=int(row.output_tokens),
                 total_tokens=int(row.total_tokens),
                 cached_input_tokens=(int(row.cached_input_tokens) if row.cached_input_tokens is not None else None),
                 cost_usd=float(row.cost_usd or 0.0),
@@ -632,7 +638,7 @@ class RequestLogsRepository:
                         rollup.request_count,
                         rollup.error_count,
                         rollup.input_tokens,
-                        rollup.output_tokens,
+                        rollup.output_or_reasoning_tokens,
                         rollup.cached_input_tokens,
                         rollup.reasoning_tokens,
                         rollup.cost_usd,
@@ -648,7 +654,10 @@ class RequestLogsRepository:
                     func.count().label("request_count"),
                     func.sum(cast(RequestLog.status != literal_column("'success'"), Integer)).label("error_count"),
                     func.coalesce(func.sum(RequestLog.input_tokens), 0).label("input_tokens"),
-                    func.coalesce(func.sum(RequestLog.output_tokens), 0).label("output_tokens"),
+                    func.coalesce(
+                        func.sum(func.coalesce(RequestLog.output_tokens, RequestLog.reasoning_tokens, 0)),
+                        0,
+                    ).label("output_tokens"),
                     func.coalesce(func.sum(RequestLog.cached_input_tokens), 0).label("cached_input_tokens"),
                     func.coalesce(func.sum(RequestLog.reasoning_tokens), 0).label("reasoning_tokens"),
                     func.coalesce(func.sum(RequestLog.cost_usd), 0.0).label("cost_usd"),
@@ -785,7 +794,12 @@ class RequestLogsRepository:
             request_count += rollup.request_count
             error_count += rollup.error_count
             input_tokens += rollup.input_tokens
-            output_tokens += rollup.output_tokens
+            # The raw tail uses output_tokens with reasoning_tokens as its
+            # fallback.  Hourly rollups keep that exact per-row semantic in
+            # output_or_reasoning_tokens; using the raw output-only measure
+            # here would undercount folded rows whose output is represented
+            # by reasoning tokens.
+            output_tokens += rollup.output_or_reasoning_tokens
             cached_input_tokens += rollup.cached_input_tokens
             cost_usd += rollup.cost_usd
         if raw_windows:
@@ -796,7 +810,10 @@ class RequestLogsRepository:
                     0,
                 ).label("error_count"),
                 func.coalesce(func.sum(RequestLog.input_tokens), 0).label("input_tokens"),
-                func.coalesce(func.sum(RequestLog.output_tokens), 0).label("output_tokens"),
+                func.coalesce(
+                    func.sum(func.coalesce(RequestLog.output_tokens, RequestLog.reasoning_tokens, 0)),
+                    0,
+                ).label("output_tokens"),
                 func.coalesce(func.sum(RequestLog.cached_input_tokens), 0).label("cached_input_tokens"),
                 func.coalesce(func.sum(RequestLog.cost_usd), 0.0).label("cost_usd"),
             ).where(

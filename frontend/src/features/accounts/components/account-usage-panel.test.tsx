@@ -103,6 +103,8 @@ describe("AccountUsagePanel", () => {
       requestUsage: {
         requestCount: 7,
         totalTokens: 51_480,
+        inputTokens: 35_000,
+        outputTokens: 16_480,
         cachedInputTokens: 41_470,
         totalCostUsd: 0.13,
       },
@@ -113,6 +115,8 @@ describe("AccountUsagePanel", () => {
     expect(screen.getByText("Request logs total")).toBeInTheDocument();
     expect(screen.getByText(/\$0\.13/)).toBeInTheDocument();
     expect(screen.getByText(/51\.48K tok/)).toBeInTheDocument();
+    expect(screen.getByText(/35K input/)).toBeInTheDocument();
+    expect(screen.getByText(/16\.48K output/)).toBeInTheDocument();
   });
 
   it("renders usage reset credit availability when provided", () => {

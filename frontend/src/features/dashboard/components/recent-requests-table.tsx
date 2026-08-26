@@ -234,23 +234,20 @@ export function RecentRequestsTable({
 
   return (
     <div className="space-y-3">
-    <div className="rounded-xl border bg-card">
+    <div className="dashboard-request-table-shell rounded-xl border bg-card">
       <div className="relative overflow-x-auto">
-        <Table className="w-full table-fixed">
+        <Table className="dashboard-request-table min-w-[1240px] table-fixed">
           <TableHeader>
             <TableRow className="hover:bg-transparent">
               <TableHead className="w-28 pl-4 text-[11px] font-medium uppercase tracking-wider text-muted-foreground/80">{t("dashboard.requests.columns.time")}</TableHead>
-              <TableHead className="text-[11px] font-medium uppercase tracking-wider text-muted-foreground/80">{t("dashboard.requests.columns.account")}</TableHead>
-              <TableHead className="w-24 text-[11px] font-medium uppercase tracking-wider text-muted-foreground/80">{t("dashboard.requests.columns.plan")}</TableHead>
-              <TableHead className="text-[11px] font-medium uppercase tracking-wider text-muted-foreground/80">{t("dashboard.requests.columns.apiKey")}</TableHead>
-              <TableHead className="text-[11px] font-medium uppercase tracking-wider text-muted-foreground/80">{t("dashboard.requests.columns.model")}</TableHead>
-              <TableHead className="w-32 pr-3 text-[11px] font-medium uppercase tracking-wider text-muted-foreground/80">{t("dashboard.requests.columns.transport")}</TableHead>
-              <TableHead className="w-24 pl-3 text-[11px] font-medium uppercase tracking-wider text-muted-foreground/80">{t("dashboard.requests.columns.status")}</TableHead>
-              <TableHead className="w-20 text-right text-[11px] font-medium uppercase tracking-wider text-muted-foreground/80">TTFT</TableHead>
-              <TableHead className="w-20 text-right text-[11px] font-medium uppercase tracking-wider text-muted-foreground/80">TPS</TableHead>
-              <TableHead className="w-24 text-right text-[11px] font-medium uppercase tracking-wider text-muted-foreground/80">{t("dashboard.requests.columns.tokens")}</TableHead>
-              <TableHead className="w-16 text-right text-[11px] font-medium uppercase tracking-wider text-muted-foreground/80">{t("dashboard.requests.columns.cost")}</TableHead>
-              <TableHead className="w-72 pr-4 text-[11px] font-medium uppercase tracking-wider text-muted-foreground/80">{t("dashboard.requests.columns.details")}</TableHead>
+              <TableHead className="w-40 text-[11px] font-medium uppercase tracking-wider text-muted-foreground/80">{t("dashboard.requests.columns.account")}</TableHead>
+              <TableHead className="w-28 text-[11px] font-medium uppercase tracking-wider text-muted-foreground/80">{t("dashboard.requests.columns.apiKey")}</TableHead>
+              <TableHead className="w-44 text-[11px] font-medium uppercase tracking-wider text-muted-foreground/80">{t("dashboard.requests.columns.model")}</TableHead>
+              <TableHead className="w-[88px] text-[11px] font-medium uppercase tracking-wider text-muted-foreground/80">{t("dashboard.requests.columns.status")}</TableHead>
+              <TableHead className="w-28 text-right text-[11px] font-medium uppercase tracking-wider text-muted-foreground/80">TTFT / TPS</TableHead>
+              <TableHead className="w-48 text-right text-[11px] font-medium uppercase tracking-wider text-muted-foreground/80">{t("dashboard.requests.columns.tokens")}</TableHead>
+              <TableHead className="w-20 text-right text-[11px] font-medium uppercase tracking-wider text-muted-foreground/80">{t("dashboard.requests.columns.cost")}</TableHead>
+              <TableHead className="w-[198px] pr-4 text-[11px] font-medium uppercase tracking-wider text-muted-foreground/80">{t("dashboard.requests.columns.details")}</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
@@ -271,39 +268,45 @@ export function RecentRequestsTable({
 
               return (
                 <TableRow key={request.requestId}>
-                  <TableCell className="pl-4 align-top">
+                  <TableCell className="dashboard-table-time pl-4 align-top" data-mobile-label={t("dashboard.requests.columns.time")}>
+                    <span className="dashboard-mobile-label" aria-hidden="true">{t("dashboard.requests.columns.time")}</span>
                     <div className="leading-tight">
                       <div className="text-sm font-medium">{time.primary}</div>
                       <div className="text-xs text-muted-foreground">{time.secondary}</div>
                     </div>
                   </TableCell>
-                  <TableCell className="truncate align-top text-sm">
-                    {isEmailLabel && blurred ? (
-                      <span className="privacy-blur">{accountLabel}</span>
-                    ) : (
-                      accountLabel
-                    )}
+                  <TableCell className="dashboard-table-account min-w-0 align-top text-sm" data-mobile-label={t("dashboard.requests.columns.account")}>
+                    <span className="dashboard-mobile-label" aria-hidden="true">{t("dashboard.requests.columns.account")}</span>
+                    <div className="min-w-0 space-y-1">
+                      <div className="truncate">
+                        {isEmailLabel && blurred ? (
+                          <span className="privacy-blur">{accountLabel}</span>
+                        ) : (
+                          accountLabel
+                        )}
+                      </div>
+                      {planType ? (
+                        <Badge
+                          variant="outline"
+                          className={PLAN_CLASS_MAP[planType] ?? PLAN_CLASS_MAP.free}
+                        >
+                          {planLabel}
+                        </Badge>
+                      ) : (
+                        <span className="text-xs text-muted-foreground">--</span>
+                      )}
+                    </div>
                   </TableCell>
-                  <TableCell className="align-top">
-                    {planType ? (
-                      <Badge
-                        variant="outline"
-                        className={PLAN_CLASS_MAP[planType] ?? PLAN_CLASS_MAP.free}
-                      >
-                        {planLabel}
-                      </Badge>
-                    ) : (
-                      <span className="text-xs text-muted-foreground">--</span>
-                    )}
+                  <TableCell className="dashboard-table-api-key min-w-0 align-top text-xs text-muted-foreground" data-mobile-label={t("dashboard.requests.columns.apiKey")}>
+                    <span className="dashboard-mobile-label" aria-hidden="true">{t("dashboard.requests.columns.apiKey")}</span>
+                    <span className="block truncate">{request.apiKeyName || "--"}</span>
                   </TableCell>
-                  <TableCell className="truncate align-top text-xs text-muted-foreground">
-                    {request.apiKeyName || "--"}
-                  </TableCell>
-                  <TableCell className="truncate align-top">
-                    <div className="leading-tight">
-                      <span className="font-mono text-xs">
+                  <TableCell className="dashboard-table-model min-w-0 align-top" data-mobile-label={t("dashboard.requests.columns.model")}>
+                    <span className="dashboard-mobile-label" aria-hidden="true">{t("dashboard.requests.columns.model")}</span>
+                    <div className="min-w-0 leading-tight">
+                      <div className="truncate font-mono text-xs">
                         {formatModelLabel(request.model, request.reasoningEffort, visibleServiceTier)}
-                      </span>
+                      </div>
                       {request.requestKind === "warmup" || request.requestKind === "limit_warmup" ? (
                         <div className="mt-1 text-xs text-muted-foreground">
                           {REQUEST_KIND_LABELS.warmup}
@@ -314,29 +317,26 @@ export function RecentRequestsTable({
                           {t("dashboard.requests.requestedTier", { tier: request.requestedServiceTier })}
                         </div>
                       ) : null}
+                      {request.transport ? (
+                        <div className="mt-1 flex min-w-0 flex-wrap items-center gap-1">
+                          <Badge
+                            variant="outline"
+                            className={TRANSPORT_CLASS_MAP[request.transport] ?? TRANSPORT_CLASS_MAP.http}
+                            title={t("dashboard.requests.downstreamTransport")}
+                          >
+                            {TRANSPORT_LABELS[request.transport] ?? request.transport}
+                          </Badge>
+                          {upstreamTransport ? (
+                            <span className="truncate text-[11px] text-muted-foreground">
+                              {t("dashboard.requests.upstreamTransport", { transport: TRANSPORT_LABELS[upstreamTransport] ?? upstreamTransport })}
+                            </span>
+                          ) : null}
+                        </div>
+                      ) : null}
                     </div>
                   </TableCell>
-                  <TableCell className="pr-3 align-top">
-                    {request.transport ? (
-                      <div className="space-y-1">
-                        <Badge
-                          variant="outline"
-                          className={TRANSPORT_CLASS_MAP[request.transport] ?? TRANSPORT_CLASS_MAP.http}
-                          title={t("dashboard.requests.downstreamTransport")}
-                        >
-                          {TRANSPORT_LABELS[request.transport] ?? request.transport}
-                        </Badge>
-                        {upstreamTransport ? (
-                          <div className="text-[11px] text-muted-foreground">
-                            {t("dashboard.requests.upstreamTransport", { transport: TRANSPORT_LABELS[upstreamTransport] ?? upstreamTransport })}
-                          </div>
-                        ) : null}
-                      </div>
-                    ) : (
-                      <span className="text-xs text-muted-foreground">--</span>
-                    )}
-                  </TableCell>
-                  <TableCell className="pl-3 align-top">
+                  <TableCell className="dashboard-table-status align-top" data-mobile-label={t("dashboard.requests.columns.status")}>
+                    <span className="dashboard-mobile-label" aria-hidden="true">{t("dashboard.requests.columns.status")}</span>
                     <Badge
                       variant="outline"
                       className={STATUS_CLASS_MAP[request.status] ?? STATUS_CLASS_MAP.error}
@@ -344,37 +344,50 @@ export function RecentRequestsTable({
                       {t(`dashboard.requestStatus.${request.status}`, { defaultValue: REQUEST_STATUS_LABELS[request.status] ?? request.status })}
                     </Badge>
                   </TableCell>
-                  <TableCell className="text-right align-top font-mono text-xs tabular-nums">
-                    {firstToken == null ? (
-                      "--"
-                    ) : firstToken.approximate ? (
-                      <span
-                        className="text-muted-foreground"
-                        title={t("dashboard.requests.firstOutputApproxHint")}
-                      >
-                        ~{firstToken.text}
-                      </span>
-                    ) : (
-                      firstToken.text
-                    )}
+                  <TableCell className="dashboard-table-performance align-top font-mono text-xs tabular-nums" data-mobile-label="TTFT / TPS">
+                    <span className="dashboard-mobile-label" aria-hidden="true">TTFT / TPS</span>
+                    <div className="grid grid-cols-2 gap-2 text-right">
+                      <div>
+                        <div className="mb-1 font-sans text-[10px] uppercase tracking-wider text-muted-foreground">TTFT</div>
+                        {firstToken == null ? (
+                          "--"
+                        ) : firstToken.approximate ? (
+                          <span
+                            className="text-muted-foreground"
+                            title={t("dashboard.requests.firstOutputApproxHint")}
+                          >
+                            ~{firstToken.text}
+                          </span>
+                        ) : (
+                          firstToken.text
+                        )}
+                      </div>
+                      <div>
+                        <div className="mb-1 font-sans text-[10px] uppercase tracking-wider text-muted-foreground">TPS</div>
+                        {generationSpeed ?? "--"}
+                      </div>
+                    </div>
                   </TableCell>
-                  <TableCell className="text-right align-top font-mono text-xs tabular-nums">
-                    {generationSpeed ?? "--"}
-                  </TableCell>
-                  <TableCell className="text-right align-top font-mono text-xs tabular-nums">
+                  <TableCell className="dashboard-table-tokens text-right align-top font-mono text-xs tabular-nums" data-mobile-label={t("dashboard.requests.columns.tokens")}>
+                    <span className="dashboard-mobile-label" aria-hidden="true">{t("dashboard.requests.columns.tokens")}</span>
                     <div className="leading-tight">
                       <div>{formatCompactNumber(request.tokens)}</div>
+                      <div className="dashboard-token-breakdown text-[11px] text-muted-foreground">
+                        {t("common.units.input")}: {formatCompactNumber(request.inputTokens)} · {t("common.units.output")}: {formatCompactNumber(request.outputTokens)}
+                      </div>
                       {request.cachedInputTokens != null && request.cachedInputTokens > 0 && (
-                        <div className="text-[11px] text-muted-foreground">
+                        <div className="dashboard-token-cache text-[11px] text-muted-foreground">
                           {t("common.units.cachedShort", { count: formatCompactNumber(request.cachedInputTokens) })}
                         </div>
                       )}
                     </div>
                   </TableCell>
-                  <TableCell className="text-right align-top font-mono text-xs tabular-nums">
+                  <TableCell className="dashboard-table-cost text-right align-top font-mono text-xs tabular-nums" data-mobile-label={t("dashboard.requests.columns.cost")}>
+                    <span className="dashboard-mobile-label" aria-hidden="true">{t("dashboard.requests.columns.cost")}</span>
                     {formatCurrency(request.costUsd)}
                   </TableCell>
-                  <TableCell className="pr-4 align-top whitespace-normal">
+                  <TableCell className="dashboard-table-details pr-4 align-top whitespace-normal" data-mobile-label={t("dashboard.requests.columns.details")}>
+                    <span className="dashboard-mobile-label" aria-hidden="true">{t("dashboard.requests.columns.details")}</span>
                     {hasError ? (
                       <div className="space-y-2">
                         {request.errorCode ? (
