@@ -38,3 +38,7 @@ For example, a 1,000 ms request with 200 output tokens and 200 ms TTFT reports
 250 TPS regardless of a 100 ms response-created or 50 ms first-upstream-event
 timing. The same row without TTFT uses response-created and reports the 200 ms
 timing as approximate first output.
+
+## Missing response-created acknowledgment
+
+`missing_created_progress` accompanies reader failures that have response activity without an assigned acknowledgment. It records event count, a bounded last-event category, dispatch, assigned-ID, acknowledgment, and downstream-visibility flags. At most 16 pending requests are summarized per failure; unknown event names become `response.other`. It does not contain prompt text or tool arguments. These diagnostics distinguish protocol activity from safe-to-retry unsent work; they do not prove whether the provider omitted an event or the bridge failed to match it.

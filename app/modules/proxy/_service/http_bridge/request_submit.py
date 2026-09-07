@@ -939,9 +939,10 @@ class _HTTPBridgeRequestSubmitMixin:
             _copy_websocket_route_metadata_from_session(request_state, session)
             request_state.bridge_queue_wait_started_at = _service_time().monotonic()
             request_state.response_create_gate_wait_started_at = _service_time().monotonic()
-            # Bridge ownership is established before this late admission. A
-            # cap race stays a bounded error/wait on that owner; it must not
-            # publish a replacement bridge as a spillover side effect.
+            # Catch contention that appeared after the early routing check.
+            # The caller may use an independent lane without rebinding this one.
+            if request_state.bridge_soft_capacity_reroute_allowed and session.response_create_gate.locked():
+                raise ProxyResponseError(429, openai_error("response_create_gate_timeout", "Preferred bridge is busy"))
             await self._acquire_request_state_response_create_admission(
                 request_state,
                 response_create_gate=session.response_create_gate,

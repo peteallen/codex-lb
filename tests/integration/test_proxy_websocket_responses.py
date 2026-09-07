@@ -374,6 +374,7 @@ def test_responses_websocket_route_drain_preserves_terminal_ownership_and_reject
         input_tokens: int,
         output_tokens: int,
         cached_input_tokens: int = 0,
+        cache_write_tokens: int = 0,
         service_tier: str | None = None,
         cost_microdollars: int | None = None,
     ) -> None:
@@ -386,6 +387,7 @@ def test_responses_websocket_route_drain_preserves_terminal_ownership_and_reject
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             cached_input_tokens=cached_input_tokens,
+            cache_write_tokens=cache_write_tokens,
             service_tier=service_tier,
             cost_microdollars=cost_microdollars,
         )

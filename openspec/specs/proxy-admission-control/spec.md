@@ -48,7 +48,7 @@ The proxy MUST enforce separate in-process admission limits for token refresh, u
 
 For `/v1/responses`, `/backend-api/codex/responses`, and compact Responses traffic, the proxy MUST enforce account-local response-create and streaming concurrency limits in addition to process-wide admission limits, and the configured limits MUST be cluster-wide per-account targets enforced across all replicas rather than per-replica allowances. Because per-account caps are partitioned per replica via the bridge ring and cannot be safely partitioned across intra-pod worker processes, each instance MUST run a single worker process; horizontal scaling is achieved by adding replicas. The default account response-create cap MUST be 4 and the default account stream cap MUST be 8 unless operators configure a different value.
 
-When an account is at either cap, new soft-affinity work MUST prefer another eligible account before returning local overload. A bare process-session mapping MAY supply soft locality only while the request is self-contained, pre-visible, and has no required owner. Account-cap spillover MUST be decided during account selection and MUST NOT switch an account after a request enters shared transport, replay, or durable bridge ownership. Hard-continuity work MUST remain on its required owner and MAY fail closed when that owner is saturated. Hard Codex ownership rows MUST bypass soft sticky fallback/reallocation so pressure cannot delete or rewrite them.
+When an account is at either cap, new soft-affinity work MUST prefer another eligible account before returning local overload. A bare process-session mapping MAY supply soft locality only while the request is self-contained, pre-visible, and has no required owner. Account-cap spillover MUST NOT switch the account of an existing shared transport or rebind durable bridge ownership. A proven complete, unsent original request MAY use a separate transport under the safe original full resend capacity-escape requirement, including after a local admission race. Hard-continuity work MUST remain on its required owner and MAY fail closed when that owner is saturated. Hard Codex ownership rows MUST bypass soft sticky fallback/reallocation so pressure cannot delete or rewrite them.
 
 #### Scenario: Soft work avoids saturated account
 
@@ -76,7 +76,8 @@ When an account is at either cap, new soft-affinity work MUST prefer another eli
 
 - **GIVEN** a session header resolves to a live or durable HTTP bridge owner
 - **WHEN** that owner's account or response-create gate is saturated
-- **THEN** the request follows the existing hard bridge-capacity behavior
+- **THEN** owner-bound requests follow the existing hard bridge-capacity behavior
+- **AND** a proven complete, unsent original request may use an independent route without rebinding the owner
 - **AND** account-cap spillover does not publish a replacement bridge under the same canonical identity
 
 ### Requirement: Local overload reasons are stable and distinguishable
@@ -108,7 +109,7 @@ Local Responses overload failures MUST expose stable low-cardinality reason fiel
 
 The proxy MUST apply the configured proxy admission wait timeout to each HTTP bridge startup wait attempt for per-session response-create gate acquisition, bridge capacity waiters, and in-flight session creation waiters.
 
-For per-session response-create gate acquisition by a bridged Responses request, an expired gate acquisition attempt MUST be treated as a recoverable capacity wait rather than a terminal failure: the request MUST release its queue slot and account lease, wait with capacity-wait progress semantics, and retry gate acquisition, bounded by the bridge request budget. Requests eligible for soft-affinity reroute MUST still attempt the reroute before entering the recoverable wait. When the bridge request budget is exhausted before the gate opens, the proxy MUST reject the request locally with HTTP 429, `error.code = "response_create_gate_timeout"`, and the stable local-overload reason.
+For per-session response-create gate acquisition by a bridged Responses request, an expired gate acquisition attempt MUST be treated as a recoverable capacity wait rather than a terminal failure: the request MUST release its queue slot and account lease, wait with capacity-wait progress semantics, and retry gate acquisition, bounded by the bridge request budget. Requests eligible for soft-affinity reroute or proven original full resend capacity escape MUST still attempt the independent route before entering the recoverable wait. When the bridge request budget is exhausted before the gate opens, the proxy MUST reject the request locally with HTTP 429, `error.code = "response_create_gate_timeout"`, and the stable local-overload reason.
 
 For bridge capacity waiters and in-flight session creation waiters, when the timeout expires the proxy MUST reject the request locally with HTTP 429 and an OpenAI-style `proxy_overloaded` error envelope. Timing out while observing another request's pending in-flight session creation MUST evict that in-flight marker when it is still pending so later requests can attempt a fresh bridge session instead of waiting on the same stalled future.
 
@@ -117,7 +118,7 @@ If a request owns in-flight bridge session creation and is cancelled or fails af
 #### Scenario: Gate contention queues within the bridge request budget
 
 - **GIVEN** an HTTP bridge session whose response-create gate is held by a legitimate in-flight turn
-- **AND** a bridged Responses request that cannot soft-reroute (hard-affinity key or `previous_response_id` continuity)
+- **AND** a bridged Responses request that lacks a safe independent route (client-owned continuity or incomplete context)
 - **WHEN** a gate acquisition attempt exceeds the configured proxy admission wait timeout
 - **THEN** the request emits capacity-wait keepalive progress on streaming surfaces and retries gate acquisition
 - **AND** the request completes normally once the in-flight turn releases the gate before the bridge request budget expires
@@ -458,3 +459,49 @@ Per-account concurrency caps are partitioned per bridge-ring replica and are cor
 - **WHEN** the process loads its settings at startup
 - **THEN** startup fails with a settings validation error naming `CODEX_LB_WORKERS_PER_INSTANCE`
 - **AND** the error states multi-worker-per-instance is not supported and directs the operator to run one worker per pod/container and scale via replicas
+
+### Requirement: Session gate waiters do not reserve account startup capacity
+
+The proxy MUST acquire the session response-create gate before reserving account response-create capacity. A request waiting for that gate MUST hold no account response-create lease. Failure or cancellation after either acquisition MUST release all resources owned by that request without releasing another request's gate.
+
+#### Scenario: One stalled session does not saturate the account with waiters
+- **GIVEN** one request owns a session gate and three additional requests are waiting for that gate
+- **WHEN** an unrelated session requests account startup capacity
+- **THEN** the three gate waiters contribute zero account response-create leases
+- **AND** admission uses only actual admitted startup work
+
+#### Scenario: Account admission fails after the session gate opens
+- **WHEN** account startup admission fails after a request acquires its session gate
+- **THEN** the session gate is released and the request retains no admission lease
+
+### Requirement: Safe original full resends can escape local bridge pressure
+
+For a complete original client request whose replay safety is proven, the proxy MUST retain the ability to use an independent route when its preferred bridge is busy. Eligibility MUST require no client-supplied previous response, conversation, turn state, file reference or required file owner; no upstream dispatch or response progress for the current request; and a validated original full-context body. A proxy-injected previous-response optimization MUST NOT by itself revoke this eligibility. The independent route MUST preserve the original full input and prompt-cache key, prefer an available connection on the original account, and select another eligible account if that account is locally capped. It MUST NOT replace or rebind the existing canonical bridge or its locality mapping.
+
+#### Scenario: Busy warm bridge with another ready route
+- **GIVEN** a replay-safe original full resend is eligible for capacity escape
+- **AND** its warm session gate is already held
+- **WHEN** the request is admitted
+- **THEN** it attempts an independent connection without waiting through the busy gate's admission timeout
+- **AND** it sends full context without the proxy-injected anchor
+
+#### Scenario: Local cap race after context optimization
+- **GIVEN** the proxy injected an optional anchor into a proven full resend
+- **WHEN** local admission rejects it before dispatch
+- **THEN** the independent route restores its original full body and enforces ordinary account eligibility
+
+#### Scenario: Genuine continuation and accepted work remain protected
+- **WHEN** a request relies on client-owned continuation state or account-owned files, lacks proven full context, or has already dispatched or received response progress
+- **THEN** the capacity escape is unavailable and existing ownership/replay rules remain enforced
+
+### Requirement: Local capacity retries wake on released capacity
+
+Bridge retries waiting on local account or session capacity MUST recheck admission when relevant local capacity is released, bounded by the original request budget. A capacity wakeup MUST NOT grant a lease or bypass eligibility checks. Upstream quota/backoff waits MUST retain their existing timing semantics.
+
+#### Scenario: Capacity opens during a retry sleep
+- **WHEN** capacity is released while a local-capacity retry is waiting
+- **THEN** it rechecks admission before the original fixed retry sleep expires
+
+#### Scenario: Competing waiter consumes the available slot
+- **WHEN** another waiter acquires capacity first after a wakeup
+- **THEN** the remaining request follows normal bounded admission without exceeding configured caps

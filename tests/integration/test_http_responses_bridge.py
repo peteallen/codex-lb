@@ -53,6 +53,181 @@ pytestmark = pytest.mark.integration
 _TEST_SYNC_TIMEOUT_SECONDS = 5.0
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "pressure",
+    [
+        "busy_gate",
+        "late_gate",
+        "account_cap",
+        "all_accounts_cap",
+        "connection_cap",
+        "client_anchor",
+        "turn_state",
+        "delta",
+    ],
+)
+async def test_full_resend_escapes_capacity_without_rebinding_warm_bridge(
+    async_client,
+    app_instance,
+    monkeypatch,
+    pressure,
+):
+    _install_bridge_settings_with_limits(monkeypatch, enabled=True, admission_wait_timeout_seconds=3.0)
+    accounts = [
+        await _get_account(await _import_account(async_client, f"capacity-{i}", f"capacity-{i}@example.com"))
+        for i in range(2)
+    ]
+    service = get_proxy_service_for_app(app_instance)
+    connections = []
+    selection_preferences = []
+
+    async def select_account(deadline, **kwargs):
+        selection_preferences.append(kwargs.get("preferred_account_id"))
+        candidates = [a for a in accounts if a.id not in (kwargs.get("exclude_account_ids") or ())]
+        if not candidates:
+            return AccountSelection(account=None, error_message="No available accounts", error_code="no_accounts")
+        preferred = kwargs.get("preferred_account_id")
+        account = next((a for a in candidates if a.id == preferred), candidates[0])
+        return AccountSelection(account=account, error_message=None, error_code=None)
+
+    async def connect(headers, access_token, account_id_header, **kwargs):
+        upstream = _FakeBridgeUpstreamWebSocket(f"resp_capacity_{len(connections)}")
+        connections.append((account_id_header, upstream))
+        return upstream
+
+    async def ensure_fresh(account, **kwargs):
+        return account
+
+    monkeypatch.setattr(service, "_select_account_with_budget", select_account)
+    monkeypatch.setattr(service, "_ensure_fresh_with_budget", ensure_fresh)
+    monkeypatch.setattr(proxy_module, "connect_responses_websocket", connect)
+    headers = {"session_id": "capacity-canonical-session"}
+    original_input = [{"role": "user", "content": "remember the number 47"}]
+    body = {"model": "gpt-5.1", "input": original_input, "prompt_cache_key": "capacity-warm-cache", "stream": True}
+    _, first_headers = await _collect_sse_events_with_headers(
+        async_client, "/v1/responses", json_body=body, headers=headers
+    )
+    canonical = next(s for s in service._http_bridge_sessions.values() if s.key.affinity_kind == "session_header")
+    original_anchor = canonical.last_completed_response_id
+    assert original_anchor is not None
+    full_input = original_input + [
+        {"role": "assistant", "content": [{"type": "output_text", "text": "47"}]},
+        {"role": "user", "content": "What number did I give you?"},
+    ]
+    leases = []
+    capacity_waiting = asyncio.Event()
+    if pressure in {"client_anchor", "turn_state", "delta"}:
+        if pressure == "client_anchor":
+            body["previous_response_id"] = original_anchor
+        elif pressure == "turn_state":
+            headers["x-codex-turn-state"] = first_headers["x-codex-turn-state"]
+        else:
+            full_input = [{"role": "user", "content": "continue"}]
+        await canonical.response_create_gate.acquire()
+        waiting = asyncio.Event()
+        acquire = service._acquire_request_state_response_create_admission
+
+        async def observe_wait(request_state, **kwargs):
+            waiting.set()
+            return await acquire(request_state, **kwargs)
+
+        monkeypatch.setattr(service, "_acquire_request_state_response_create_admission", observe_wait)
+        task = asyncio.create_task(
+            _collect_sse_events(
+                async_client,
+                "/v1/responses",
+                json_body={**body, "input": full_input},
+                headers=headers,
+            )
+        )
+        try:
+            await asyncio.wait_for(waiting.wait(), 2)
+            assert len(connections) == 1
+            assert not task.done()
+        finally:
+            canonical.response_create_gate.release()
+            events = await asyncio.wait_for(task, 2)
+        assert events[-1]["type"] == "response.completed"
+        assert len(connections) == 1
+        return
+    if pressure == "busy_gate":
+        await canonical.response_create_gate.acquire()
+    elif pressure in {"account_cap", "all_accounts_cap"}:
+        caps = proxy_module.effective_account_concurrency_caps(await proxy_module.get_settings_cache().get())
+        for account in accounts if pressure == "all_accounts_cap" else accounts[:1]:
+            for _ in range(caps.response_create_limit):
+                leases.append(
+                    await service._load_balancer.acquire_account_lease(
+                        account.id,
+                        kind="response_create",
+                        concurrency_caps=caps,
+                    )
+                )
+        original_wait = http_bridge_streaming_module._iter_account_capacity_wait_sse
+
+        async def observe_capacity_wait(**kwargs):
+            capacity_waiting.set()
+            async for item in original_wait(**kwargs):
+                yield item
+
+        monkeypatch.setattr(http_bridge_streaming_module, "_iter_account_capacity_wait_sse", observe_capacity_wait)
+    elif pressure == "connection_cap":
+        get_session = service._get_or_create_http_bridge_session
+
+        async def capped_connection(key, **kwargs):
+            if key == canonical.key:
+                raise proxy_module.ProxyResponseError(
+                    429,
+                    proxy_module.openai_error(
+                        "account_stream_cap",
+                        "All eligible accounts are at the stream cap",
+                    ),
+                )
+            return await get_session(key, **kwargs)
+
+        monkeypatch.setattr(service, "_get_or_create_http_bridge_session", capped_connection)
+    else:
+        original_inline = service._inline_http_bridge_image_urls
+
+        async def hold_gate_during_prepare(text, state):
+            await canonical.response_create_gate.acquire()
+            monkeypatch.setattr(service, "_inline_http_bridge_image_urls", original_inline)
+            return await original_inline(text, state)
+
+        monkeypatch.setattr(service, "_inline_http_bridge_image_urls", hold_gate_during_prepare)
+    try:
+        request_task = asyncio.create_task(
+            _collect_sse_events(async_client, "/v1/responses", json_body={**body, "input": full_input}, headers=headers)
+        )
+        if pressure == "all_accounts_cap":
+            try:
+                await asyncio.wait_for(capacity_waiting.wait(), 2)
+                assert not request_task.done()
+            finally:
+                for lease in leases:
+                    await service._load_balancer.release_account_lease(lease)
+        events = await asyncio.wait_for(request_task, timeout=2.0)
+        assert events[-1]["type"] == "response.completed"
+        assert service._http_bridge_sessions[canonical.key] is canonical
+        assert canonical.last_completed_response_id == original_anchor
+        assert len(connections[0][1].sent_text) == 1
+        sent = json.loads(connections[-1][1].sent_text[-1])
+        assert sent["input"] == full_input
+        assert sent.get("previous_response_id") is None
+        assert sent["prompt_cache_key"] == "capacity-warm-cache"
+        if pressure != "connection_cap":
+            assert selection_preferences[1] == accounts[0].id
+        expected_account = accounts[1] if pressure == "account_cap" else accounts[0]
+        assert connections[-1][0] == expected_account.chatgpt_account_id
+        assert canonical.closed is False
+    finally:
+        if canonical.response_create_gate.locked():
+            canonical.response_create_gate.release()
+        for lease in leases:
+            await service._load_balancer.release_account_lease(lease)
+
+
 @pytest_asyncio.fixture(autouse=True)
 async def _cleanup_http_bridge_sessions(app_instance):
     yield

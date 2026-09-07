@@ -276,6 +276,12 @@ class LoadBalancer:
         self._account_locks: dict[str, asyncio.Lock] = {}
         self._account_locks_registry_lock = asyncio.Lock()
         self._selection_inputs_cache = get_account_selection_cache()
+        self._capacity_release_events = (asyncio.Event(), asyncio.Event())
+
+    @property
+    def capacity_release_events(self) -> tuple[asyncio.Event, asyncio.Event]:
+        """Snapshot releases by lease kind before admission to avoid lost wakeups."""
+        return self._capacity_release_events
 
     async def release_account_lease(self, lease: AccountLease | None) -> None:
         if lease is None:
@@ -479,6 +485,14 @@ class LoadBalancer:
                     runtime.stream_key_inflight.pop(current.api_key_id, None)
         runtime.leased_tokens = max(0.0, runtime.leased_tokens - current.estimated_tokens)
         runtime.version += 1
+        create_event, stream_event = self._capacity_release_events
+        if current.kind == "response_create":
+            create_event.set()
+            create_event = asyncio.Event()
+        else:
+            stream_event.set()
+            stream_event = asyncio.Event()
+        self._capacity_release_events = (create_event, stream_event)
         _record_account_lease_released(current.kind, reason)
         _record_account_inflight_leases(current.account_id, runtime)
         if reason == "stale":

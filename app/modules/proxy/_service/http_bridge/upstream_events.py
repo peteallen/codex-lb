@@ -734,6 +734,19 @@ class _HTTPBridgeUpstreamEventsMixin:
                 default=0,
             )
             pending_request_states = list(session.pending_requests)
+        for state in pending_request_states[:16]:
+            if state.response_event_count and state.latency_response_created_ms is None:
+                _log_http_bridge_event(
+                    "missing_created_progress",
+                    session.key,
+                    account_id=session.account.id,
+                    model=session.request_model,
+                    detail=(
+                        f"events={state.response_event_count} last_type={state.last_response_event_type} "
+                        f"dispatched={state.recovery_attempt_dispatched} assigned_id={state.response_id is not None} "
+                        f"created=False visible={state.downstream_visible}"
+                    ),
+                )
         # The #1534 wedge shape: a reattached stream that streamed response
         # events whose ``response.created`` was never assigned. The eventless
         # watchdog and the durable-anchor clear both key on

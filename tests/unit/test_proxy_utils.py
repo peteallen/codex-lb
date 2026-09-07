@@ -36069,7 +36069,7 @@ async def test_response_create_admission_failure_releases_session_gate(monkeypat
 
 
 @pytest.mark.asyncio
-async def test_response_create_admission_cancellation_releases_account_lease(monkeypatch):
+async def test_response_create_admission_gate_waiter_holds_no_account_lease(monkeypatch):
     settings = _make_proxy_settings()
     settings.proxy_admission_wait_timeout_seconds = 5.0
     service = proxy_service.ProxyService(_repo_factory(_RequestLogsRecorder()))
@@ -36096,10 +36096,11 @@ async def test_response_create_admission_cancellation_releases_account_lease(mon
     )
     try:
         for _ in range(50):
-            if await service._load_balancer.account_pressure_snapshot("acc-gate-cancel") == (1, 0, 0.0):
+            if request_state.response_create_gate_wait_started_at is not None:
                 break
             await asyncio.sleep(0.01)
-        assert await service._load_balancer.account_pressure_snapshot("acc-gate-cancel") == (1, 0, 0.0)
+        assert request_state.response_create_gate_wait_started_at is not None
+        assert await service._load_balancer.account_pressure_snapshot("acc-gate-cancel") == (0, 0, 0.0)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task

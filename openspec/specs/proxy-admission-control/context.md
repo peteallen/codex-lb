@@ -14,8 +14,8 @@ Persistent rebind was rejected because admission completes at different points i
 
 ## Constraints and Failure Modes
 
-- Spillover ends at transport handoff. A late lease race returns the existing bounded local-cap error rather than switching a shared WebSocket or publishing a replacement bridge.
-- Previous-response, file, conversation, turn-state, live/durable bridge, replay, and reattach ownership remain fail-closed.
+- A late lease race does not switch a shared WebSocket or publish a replacement canonical bridge. A proven complete original HTTP request that has not dispatched can use a separate connection; true continuations retain bounded owner waits.
+- Client previous-response, file, conversation, turn-state, replay, and reattach ownership remain fail-closed. A proxy-injected anchor is optional only when prefix matching, retained prior output, and account-neutral payload validation prove the original request is complete.
 - A single process must run per instance because account caps are partitioned across replicas, not safely across worker processes inside one instance.
 - Repeated self-contained requests may use different alternates during sustained pressure; this is an accepted cache-locality trade-off.
 
@@ -28,3 +28,11 @@ Session `S` is mapped to account A. A has all response-create slots in use, whil
 Operators can distinguish local account pressure through the stable `account_response_create_cap` and `account_stream_cap` reasons. The spillover behavior is zero-config because it mutates no ownership state; rollback restores conservative fail-closed selection without data conversion.
 
 Related capability: `openspec/specs/sticky-session-operations/`.
+
+## Busy bridge capacity escape
+
+Session-gate waiters no longer hold account startup leases. One stalled turn and three gate waiters therefore consume one startup slot, not all four. Once a gate opens, the request must still pass account and global admission.
+
+For example, a client resends the previous input, the assistant output, and a new question under the same session/cache key. If the warm bridge is busy, the proxy sends the complete request on an independent connection to the same account. If that account is capped, it selects another eligible account. The canonical session and sticky mapping stay in place. Explicit client anchors, opaque references, file ownership, and incomplete context disable this escape. Any upstream dispatch, including an ambiguous send failure, also disables it.
+
+Capacity retries snapshot separate startup and stream release signals before admission. Releases during an attempt remain visible to the waiter; releasing a temporary stream lease cannot repeatedly wake a startup-cap wait. When a round exhausts all candidates, temporary exclusions are cleared for the next round. Upstream quota and provider backoff keep their existing timing. No cap or timeout setting changes are needed.

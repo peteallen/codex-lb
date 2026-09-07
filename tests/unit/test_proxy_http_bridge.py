@@ -23316,12 +23316,43 @@ async def test_http_bridge_reader_retirement_recovers_concurrent_gate_waiter(
 
 
 @pytest.mark.asyncio
+async def test_http_bridge_missing_created_failure_logs_bounded_progress(monkeypatch, caplog):
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    request = _make_eventless_http_bridge_owner()
+    request.request_text = "private prompt and tool arguments"
+    request.proxy_injected_previous_response_id = True
+    request.previous_response_id = "resp-prior"
+    request.recovery_attempt_dispatched = True
+    request.response_event_count = 16
+    request.last_response_event_type = "response.output_text.delta"
+    session = _make_bridge_session(key_value="missing-created-diagnostic", pending_requests=deque([request]))
+    session.admission_waiter_count = 1
+    monkeypatch.setattr(service, "_fail_pending_websocket_requests", AsyncMock())
+    monkeypatch.setattr(service, "_record_http_bridge_retry_circuit_failure", AsyncMock())
+    caplog.set_level(logging.INFO)
+    await service._fail_http_bridge_reader_and_maybe_retire(
+        session,
+        error_code="stream_idle_timeout",
+        error_message="timeout",
+    )
+    progress = [
+        record.getMessage() for record in caplog.records if "event=missing_created_progress" in record.getMessage()
+    ]
+    assert len(progress) == 1
+    assert (
+        "events=16 last_type=response.output_text.delta dispatched=True assigned_id=False created=False visible=False"
+        in progress[0]
+    )
+    assert request.request_text not in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_http_bridge_reader_failure_keeps_waiter_count_when_draining_request_is_present(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     service = proxy_service.ProxyService(cast(Any, nullcontext()))
-    normal = cast(Any, SimpleNamespace(draining_until_terminal=False))
-    draining = cast(Any, SimpleNamespace(draining_until_terminal=True))
+    normal = cast(Any, SimpleNamespace(draining_until_terminal=False, response_event_count=0))
+    draining = cast(Any, SimpleNamespace(draining_until_terminal=True, response_event_count=0))
     session = _make_bridge_session(
         key_value="bridge-draining-accounting",
         pending_requests=deque([normal, draining]),

@@ -70,6 +70,11 @@ from app.modules.proxy._service.compact import (
 from app.modules.proxy._service.compact import (
     _sticky_key_from_compact_payload as _sticky_key_from_compact_payload,
 )
+from app.modules.proxy._service.http_bridge.capacity import (
+    capacity_release_event_for_error,
+    original_request_can_escape_capacity,
+    request_is_unsent,
+)
 from app.modules.proxy._service.http_bridge.helpers import (
     _effective_http_bridge_idle_ttl_seconds,
     _http_bridge_durable_lease_ttl_seconds,
@@ -603,6 +608,7 @@ async def _iter_account_capacity_wait_sse(
     sleep_seconds: float,
     emit_keepalives: bool,
     request_state: _WebSocketRequestState | None = None,
+    capacity_release_event: asyncio.Event | None = None,
 ) -> AsyncIterator[str]:
     if not emit_keepalives:
         if request_state is not None and request_state.capacity_startup_ready_event is not None:
@@ -630,7 +636,14 @@ async def _iter_account_capacity_wait_sse(
             remaining_sleep_seconds,
             _ACCOUNT_SELECTION_RECOVERY_HEARTBEAT_SECONDS,
         )
-        await asyncio.sleep(chunk_seconds)
+        if capacity_release_event is None:
+            await asyncio.sleep(chunk_seconds)
+        else:
+            try:
+                await asyncio.wait_for(capacity_release_event.wait(), timeout=chunk_seconds)
+                return
+            except TimeoutError:
+                pass
         remaining_sleep_seconds -= chunk_seconds
 
 
@@ -1192,6 +1205,8 @@ class _HTTPBridgeStreamingMixin:
             forwarded_request,
             forwarded_original_request_unanchored,
         )
+        capacity_escape_original_payload = payload
+        capacity_escape_client_turn_state = _sticky_key_from_turn_state_header(headers)
         if legacy_anchor_lookup is not None:
             durable_lookup = legacy_anchor_lookup
         else:
@@ -1936,6 +1951,7 @@ class _HTTPBridgeStreamingMixin:
             raise owner_unavailable
 
         while True:
+            capacity_release_events = self._load_balancer.capacity_release_events
             try:
                 session_or_forward = await self._get_or_create_http_bridge_session(
                     bridge_session_key,
@@ -1975,6 +1991,47 @@ class _HTTPBridgeStreamingMixin:
             except ProxyResponseError as exc:
                 if not owner_unavailable_allows_account_neutral_replay(exc):
                     exc_code, _exc_message = _proxy_error_code_message(exc)
+                    if (
+                        not unanchored_fork_spill_attempted
+                        and _is_local_account_cap_code(exc_code)
+                        and request_state.previous_response_id is None
+                        and original_request_can_escape_capacity(
+                            capacity_escape_original_payload,
+                            request_state,
+                            client_turn_state=capacity_escape_client_turn_state,
+                            forwarded=forwarded_request,
+                            file_owner_required=file_required_preferred_account,
+                            stored_input_count=(durable_lookup.latest_input_item_count or 0) if durable_lookup else 0,
+                            stored_input_fingerprint=durable_lookup.latest_input_full_fingerprint
+                            if durable_lookup
+                            else None,
+                        )
+                    ):
+                        _log_http_bridge_event(
+                            "independent_capacity_connection",
+                            bridge_session_key,
+                            account_id=request_state.preferred_account_id,
+                            model=effective_payload.model,
+                            detail=f"reason={exc_code}",
+                        )
+                        unanchored_fork_spill_attempted = True
+                        bridge_session_key = _HTTPBridgeSessionKey(
+                            "internal_soft_affinity_reroute",
+                            uuid4().hex,
+                            bridge_session_key.api_key_id,
+                            strength="soft",
+                        )
+                        affinity = _AffinityPolicy()
+                        session_creation_headers = without_http_bridge_session_affinity_headers(
+                            session_creation_headers
+                        )
+                        session_header_fallback_key = None
+                        durable_lookup = None
+                        durable_full_resend_fresh_bridge_proof = None
+                        downstream_turn_state = None
+                        preferred_account_has_continuity_provenance = False
+                        request_state.preferred_account_id = None
+                        continue
                     if not unanchored_fork_spill_attempted and _http_bridge_unanchored_fork_can_spill_on_cap(
                         error_code=exc_code,
                         affinity_kind=bridge_session_key.affinity_kind,
@@ -2015,6 +2072,7 @@ class _HTTPBridgeStreamingMixin:
                             sleep_seconds=bounded_wait_seconds,
                             emit_keepalives=not propagate_http_errors,
                             request_state=request_state,
+                            capacity_release_event=capacity_release_event_for_error(capacity_release_events, exc),
                         ):
                             yield line
                         if _service_time().monotonic() >= request_deadline:
@@ -2203,6 +2261,7 @@ class _HTTPBridgeStreamingMixin:
                     owner_check_applied=True,
                 )
                 while True:
+                    capacity_release_events = self._load_balancer.capacity_release_events
                     try:
                         session = await self._get_or_create_http_bridge_session(
                             bridge_session_key,
@@ -2275,6 +2334,9 @@ class _HTTPBridgeStreamingMixin:
                             sleep_seconds=bounded_wait_seconds,
                             emit_keepalives=not propagate_http_errors,
                             request_state=request_state,
+                            capacity_release_event=capacity_release_event_for_error(
+                                capacity_release_events, capacity_exc
+                            ),
                         ):
                             yield line
                         if _service_time().monotonic() >= request_deadline:
@@ -2722,7 +2784,18 @@ class _HTTPBridgeStreamingMixin:
             request_deadline=request_deadline,
         )
         request_state.file_required_preferred_account = file_required_preferred_account
-        request_state.bridge_soft_capacity_reroute_allowed = (
+        original_full_resend_allowed = original_request_can_escape_capacity(
+            capacity_escape_original_payload,
+            request_state,
+            client_turn_state=capacity_escape_client_turn_state,
+            forwarded=forwarded_request,
+            file_owner_required=file_required_preferred_account,
+            stored_input_count=durable_full_resend_anchor_count or session.last_completed_input_count,
+            stored_input_fingerprint=(
+                durable_full_resend_anchor_fingerprint or session.last_completed_input_prefix_fingerprint
+            ),
+        )
+        request_state.bridge_soft_capacity_reroute_allowed = original_full_resend_allowed or (
             bridge_session_key.strength == "soft"
             and request_state.previous_response_id is None
             and not file_required_preferred_account
@@ -2801,6 +2874,7 @@ class _HTTPBridgeStreamingMixin:
                     # request_state.
                     request_state.excluded_account_ids.add(session.account.id)
                 while True:
+                    capacity_release_events = self._load_balancer.capacity_release_events
                     try:
                         replacement_session = await self._get_or_create_http_bridge_session(
                             bridge_session_key,
@@ -2856,6 +2930,9 @@ class _HTTPBridgeStreamingMixin:
                             sleep_seconds=bounded_wait_seconds,
                             emit_keepalives=not propagate_http_errors,
                             request_state=request_state,
+                            capacity_release_event=capacity_release_event_for_error(
+                                capacity_release_events, capacity_exc
+                            ),
                         ):
                             yield line
                         if _service_time().monotonic() >= request_deadline:
@@ -2895,8 +2972,11 @@ class _HTTPBridgeStreamingMixin:
                     exc,
                     key=bridge_session_key,
                     previous_response_id=effective_payload.previous_response_id,
+                    original_full_resend_allowed=original_full_resend_allowed,
                 )
                 and not file_required_preferred_account
+                and not request_was_enqueued
+                and request_is_unsent(request_state)
             ):
                 _log_http_bridge_event(
                     "internal_soft_affinity_reroute",
@@ -2914,14 +2994,28 @@ class _HTTPBridgeStreamingMixin:
                     bridge_session_key.api_key_id,
                     strength="soft",
                 )
+                if original_full_resend_allowed:
+                    previous_request_state = request_state
+                    request_state, text_data = prepare_bridge_request(capacity_escape_original_payload)
+                    request_state.started_at = previous_request_state.started_at
+                    request_state.enforce_openai_sdk_contract = enforce_openai_sdk_contract
+                    request_state.transport = _REQUEST_TRANSPORT_HTTP
+                    request_state.excluded_account_ids.update(previous_request_state.excluded_account_ids)
+                reroute_preferred_account_id = session.account.id
+                reroute_excluded_account_ids = set(request_state.excluded_account_ids)
+                last_local_capacity_error: ProxyResponseError | None = None
+                reroute_capacity_release_events = self._load_balancer.capacity_release_events
                 while True:
+                    reroute_session: _HTTPBridgeSession | None = None
+                    capacity_release_events = self._load_balancer.capacity_release_events
                     try:
                         reroute_session = await self._get_or_create_http_bridge_session(
                             reroute_key,
-                            headers=dict(session_creation_headers),
+                            headers=without_http_bridge_session_affinity_headers(session_creation_headers),
                             affinity=_AffinityPolicy(),
                             api_key=api_key,
                             request_model=effective_payload.model,
+                            request_service_tier=request_state.requested_service_tier,
                             idle_ttl_seconds=_effective_http_bridge_idle_ttl_seconds(
                                 affinity=_AffinityPolicy(),
                                 idle_ttl_seconds=idle_ttl_seconds,
@@ -2935,14 +3029,56 @@ class _HTTPBridgeStreamingMixin:
                             forwarded_request=forwarded_request,
                             durable_lookup=None,
                             request_stage=request_state.request_stage,
-                            preferred_account_id=None,
+                            preferred_account_id=reroute_preferred_account_id,
+                            fallback_on_preferred_account_unavailable=True,
                             request_usage_budget=request_state.request_usage_budget,
                             request_deadline=request_deadline,
-                            exclude_account_ids=request_state.excluded_account_ids or None,
+                            exclude_account_ids=reroute_excluded_account_ids or None,
                             deferred_account_backoff_lifecycle=request_state.deferred_account_backoff_lifecycle,
                             defer_account_health_writes=request_state.api_key_reservation is not None,
                         )
+                        request_state.bridge_soft_capacity_reroute_allowed = True
+                        retry_events = self._stream_http_bridge_session_events(
+                            reroute_session,
+                            request_state=request_state,
+                            text_data=text_data,
+                            queue_limit=queue_limit,
+                            propagate_http_errors=propagate_http_errors,
+                            downstream_turn_state=None,
+                            request_deadline=request_deadline,
+                        )
+                        try:
+                            async for event_block in retry_events:
+                                yield event_block
+                        finally:
+                            await retry_events.aclose()
+                        return
                     except ProxyResponseError as capacity_exc:
+                        if not request_is_unsent(request_state):
+                            raise
+                        capacity_code, _ = _proxy_error_code_message(capacity_exc)
+                        capped_account_id = (
+                            reroute_session.account.id if reroute_session is not None else reroute_preferred_account_id
+                        )
+                        if _is_local_account_cap_code(capacity_code) and capped_account_id is not None:
+                            last_local_capacity_error = capacity_exc
+                            reroute_excluded_account_ids.add(capped_account_id)
+                            reroute_preferred_account_id = None
+                            if reroute_session is not None:
+                                await self._close_http_bridge_session(reroute_session)
+                            reroute_key = _HTTPBridgeSessionKey(
+                                "internal_soft_affinity_reroute",
+                                uuid4().hex,
+                                bridge_session_key.api_key_id,
+                                strength="soft",
+                            )
+                            continue
+                        if capacity_code == "no_accounts" and last_local_capacity_error is not None:
+                            # Every eligible candidate may be temporarily capped.
+                            # Reconsider them after a release, within the original budget.
+                            capacity_exc = last_local_capacity_error
+                            capacity_release_events = reroute_capacity_release_events
+                        reroute_excluded_account_ids = set(request_state.excluded_account_ids)
                         wait_plan = _http_bridge_capacity_wait_plan(capacity_exc, request_deadline=request_deadline)
                         if wait_plan is None:
                             raise
@@ -2962,31 +3098,15 @@ class _HTTPBridgeStreamingMixin:
                             sleep_seconds=bounded_wait_seconds,
                             emit_keepalives=not propagate_http_errors,
                             request_state=request_state,
+                            capacity_release_event=capacity_release_event_for_error(
+                                capacity_release_events, capacity_exc
+                            ),
                         ):
                             yield line
                         if _service_time().monotonic() >= request_deadline:
                             raise
+                        reroute_capacity_release_events = self._load_balancer.capacity_release_events
                         continue
-                    break
-                retry_events: AsyncGenerator[str, None] = self._stream_http_bridge_session_events(
-                    reroute_session,
-                    request_state=request_state,
-                    text_data=text_data,
-                    queue_limit=queue_limit,
-                    propagate_http_errors=propagate_http_errors,
-                    downstream_turn_state=downstream_turn_state,
-                    request_deadline=request_deadline,
-                )
-                request_state.bridge_soft_capacity_reroute_allowed = False
-                try:
-                    async for event_block in retry_events:
-                        yield event_block
-                finally:
-                    try:
-                        await retry_events.aclose()
-                    except Exception:
-                        pass
-                return
             if (
                 durable_recovery_attempt_available
                 and durable_recovery_attempt_fingerprint is not None
@@ -3158,6 +3278,7 @@ class _HTTPBridgeStreamingMixin:
                 allow_previous_response_recovery_rebind = True
 
             while True:
+                capacity_release_events = self._load_balancer.capacity_release_events
                 try:
                     session = await self._get_or_create_http_bridge_session(
                         bridge_session_key,
@@ -3213,6 +3334,7 @@ class _HTTPBridgeStreamingMixin:
                         sleep_seconds=bounded_wait_seconds,
                         emit_keepalives=not propagate_http_errors,
                         request_state=request_state,
+                        capacity_release_event=capacity_release_event_for_error(capacity_release_events, capacity_exc),
                     ):
                         yield line
                     if _service_time().monotonic() >= request_deadline:
@@ -3489,7 +3611,16 @@ class _HTTPBridgeStreamingMixin:
             if startup_terminal_event is not None:
                 yield startup_terminal_event
                 return
+            capacity_release_events = self._load_balancer.capacity_release_events
             try:
+                if (
+                    request_state.bridge_soft_capacity_reroute_allowed
+                    and request_is_unsent(request_state)
+                    and session.response_create_gate.locked()
+                ):
+                    raise ProxyResponseError(
+                        429, openai_error("response_create_gate_timeout", "Preferred bridge is busy")
+                    )
                 if account_neutral_recovery:
                     await self._submit_http_bridge_request(
                         session,
@@ -3555,6 +3686,7 @@ class _HTTPBridgeStreamingMixin:
                         sleep_seconds=bounded_wait_seconds,
                         emit_keepalives=not propagate_http_errors,
                         request_state=request_state,
+                        capacity_release_event=capacity_release_event_for_error(capacity_release_events, exc),
                     ):
                         yield line
                 finally:

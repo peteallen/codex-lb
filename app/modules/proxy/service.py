@@ -1287,19 +1287,9 @@ class ProxyService(
             timeout_seconds = _http_bridge_admission_timeout_seconds(request_state, timeout_seconds, get_settings())
         request_state.response_create_gate = response_create_gate
         request_state.response_create_gate_wait_started_at = time.monotonic()
-        if account_id is not None:
-            settings = await get_settings_cache().get()
-            request_state.account_response_create_lease = await self._acquire_account_response_create_lease_or_overload(
-                account_id=account_id,
-                request_id=request_state.request_id,
-                surface=surface,
-                concurrency_caps=effective_account_concurrency_caps(settings),
-            )
-            request_state.account_response_create_release = self._load_balancer.release_account_lease
         try:
             await asyncio.wait_for(response_create_gate.acquire(), timeout=timeout_seconds)
         except TimeoutError as exc:
-            await self._release_request_state_account_response_create_lease(request_state)
             request_state.response_create_gate = None
             request_state.response_create_gate_acquired = False
             request_state.awaiting_response_created = False
@@ -1390,7 +1380,6 @@ class ProxyService(
                 code="response_create_gate_timeout",
             ) from exc
         except BaseException:
-            await self._release_request_state_account_response_create_lease(request_state)
             request_state.response_create_gate = None
             request_state.response_create_gate_acquired = False
             request_state.awaiting_response_created = False
@@ -1402,6 +1391,17 @@ class ProxyService(
                 max(0.0, time.monotonic() - request_state.response_create_gate_wait_started_at) * 1000
             )
         try:
+            if account_id is not None:
+                settings = await get_settings_cache().get()
+                request_state.account_response_create_lease = (
+                    await self._acquire_account_response_create_lease_or_overload(
+                        account_id=account_id,
+                        request_id=request_state.request_id,
+                        surface=surface,
+                        concurrency_caps=effective_account_concurrency_caps(settings),
+                    )
+                )
+                request_state.account_response_create_release = self._load_balancer.release_account_lease
             request_state.response_create_admission = await self._get_work_admission().acquire_response_create(
                 compact=compact
             )

@@ -2418,10 +2418,11 @@ def _http_bridge_should_attempt_soft_affinity_reroute(
     *,
     key: "_HTTPBridgeSessionKey",
     previous_response_id: str | None,
+    original_full_resend_allowed: bool = False,
 ) -> bool:
     if exc.status_code != 429:
         return False
-    if key.strength == "hard" or previous_response_id is not None:
+    if not original_full_resend_allowed and (key.strength == "hard" or previous_response_id is not None):
         return False
     payload = exc.payload
     if not isinstance(payload, dict):

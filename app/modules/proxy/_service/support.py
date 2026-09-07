@@ -904,6 +904,7 @@ class _WebSocketRequestState:
     upstream_error_code_override: str | None = None
     error_http_status_override: int | None = None
     response_event_count: int = 0
+    last_response_event_type: str | None = None
     last_upstream_activity_at: float | None = None
     upstream_model_output_seen: bool = False
     previous_response_not_found_rewritten: bool = False
@@ -1293,6 +1294,28 @@ def _record_response_event(request_state: _WebSocketRequestState | None, event_t
     if request_state is None or event_type is None or not event_type.startswith("response."):
         return
     request_state.last_upstream_activity_at = time.monotonic()
+    request_state.last_response_event_type = (
+        event_type
+        if event_type
+        in {
+            "response.created",
+            "response.in_progress",
+            "response.completed",
+            "response.failed",
+            "response.incomplete",
+            "response.output_item.added",
+            "response.output_item.done",
+            "response.content_part.added",
+            "response.content_part.done",
+            "response.output_text.delta",
+            "response.output_text.done",
+            "response.reasoning_summary_text.delta",
+            "response.reasoning_summary_text.done",
+            "response.function_call_arguments.delta",
+            "response.function_call_arguments.done",
+        }
+        else "response.other"
+    )
     if event_type in {"response.failed", "response.incomplete"}:
         return
     request_state.response_event_count += 1

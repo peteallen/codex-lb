@@ -1183,6 +1183,7 @@ async def test_terminal_message_ownership_survives_relay_cancellation(
             "input_tokens": 12,
             "output_tokens": 7,
             "cached_input_tokens": 3,
+            "cache_write_tokens": 0,
             "service_tier": request_state.service_tier,
         }
     ]
