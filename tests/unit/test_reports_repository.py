@@ -16,6 +16,7 @@ from app.modules.reports.repository import (
     DailyReportRangeTooLargeError,
     ReportsRepository,
     _daily_speed_medians_stmt,
+    _hourly_bucket_ranges,
 )
 
 pytestmark = pytest.mark.unit
@@ -127,6 +128,110 @@ async def test_aggregate_daily_rows_groups_in_sql_and_returns_only_buckets_with_
     assert rows[1].median_tps == 0.5
     # No queue samples on this day: zero-filled rather than null.
     assert rows[1].median_queue_ms == 0.0
+
+
+@pytest.mark.asyncio
+async def test_aggregate_hourly_rows_preserves_filters_and_zero_fills_empty_hours(
+    async_session: AsyncSession,
+) -> None:
+    repo = ReportsRepository(async_session)
+    timezone_info = ZoneInfo("America/Los_Angeles")
+    account_id = "acc_reports_hourly"
+    async_session.add(_make_account(account_id, "reports-hourly@example.com"))
+    async_session.add_all(
+        [
+            RequestLog(
+                account_id=account_id,
+                api_key_id="key-hourly",
+                request_id="report-hourly-match",
+                requested_at=datetime(2026, 6, 1, 7, 15),
+                model="gpt-5.1",
+                useragent_group="opencode",
+                status="success",
+                input_tokens=10,
+                output_tokens=4,
+                cached_input_tokens=2,
+                cost_usd=0.25,
+                latency_ms=1100,
+                latency_first_token_ms=100,
+                latency_queue_ms=20,
+            ),
+            RequestLog(
+                account_id=account_id,
+                api_key_id="key-other",
+                request_id="report-hourly-filtered-out",
+                requested_at=datetime(2026, 6, 1, 7, 30),
+                model="gpt-5.1",
+                useragent_group="opencode",
+                status="error",
+                input_tokens=99,
+                output_tokens=99,
+                cached_input_tokens=99,
+                cost_usd=9.9,
+                latency_ms=2000,
+                latency_first_token_ms=500,
+                latency_queue_ms=500,
+            ),
+        ]
+    )
+    await async_session.commit()
+
+    rows = await repo.aggregate_hourly_rows(
+        date(2026, 6, 1),
+        date(2026, 6, 1),
+        timezone_info,
+        account_ids=[account_id],
+        model="gpt-5.1",
+        useragent_group="opencode",
+        api_key_ids=["key-hourly"],
+    )
+
+    assert len(rows) == 24
+    assert rows[0].hour.isoformat() == "2026-06-01T00:00:00-07:00"
+    assert rows[0].requests == 1
+    assert rows[0].input_tokens == 10
+    assert rows[0].output_tokens == 4
+    assert rows[0].cached_input_tokens == 2
+    assert rows[0].cost_usd == 0.25
+    assert rows[0].active_accounts == 1
+    assert rows[0].error_count == 0
+    assert rows[0].median_ttft_ms == 100
+    assert rows[0].median_tps == 4
+    assert rows[0].median_queue_ms == 20
+    assert rows[1].hour.isoformat() == "2026-06-01T01:00:00-07:00"
+    assert rows[1].requests == 0
+    assert rows[1].cost_usd == 0
+    assert rows[1].median_ttft_ms == 0
+
+
+@pytest.mark.parametrize(
+    ("selected_date", "expected_count", "repeated_hour_prefix"),
+    [
+        (date(2026, 3, 8), 23, None),
+        (date(2026, 11, 1), 25, "2026-11-01T01:00:00"),
+    ],
+)
+def test_hourly_bucket_ranges_follow_dst_elapsed_hours(
+    selected_date: date,
+    expected_count: int,
+    repeated_hour_prefix: str | None,
+) -> None:
+    ranges = _hourly_bucket_ranges(
+        selected_date,
+        selected_date,
+        ZoneInfo("America/New_York"),
+    )
+
+    assert len(ranges) == expected_count
+    labels = [label for label, _start, _end in ranges]
+    if repeated_hour_prefix is None:
+        assert not any(label.startswith("2026-03-08T02:00:00") for label in labels)
+    else:
+        repeated = [label for label in labels if label.startswith(repeated_hour_prefix)]
+        assert repeated == [
+            "2026-11-01T01:00:00-04:00",
+            "2026-11-01T01:00:00-05:00",
+        ]
 
 
 @pytest.mark.asyncio

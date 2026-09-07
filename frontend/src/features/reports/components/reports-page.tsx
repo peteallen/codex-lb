@@ -118,6 +118,7 @@ export function ReportsPage({ initialFilters }: ReportsPageProps = {}) {
   }, []);
 
   const reportsQuery = useReports(filters, reportsTimeZone);
+  const chartGranularity = reportsQuery.data?.chartGranularity ?? "day";
   const filterCatalogFilters = useMemo(
     () => ({ ...filters, model: "", useragent: "" }),
     [filters],
@@ -242,6 +243,7 @@ export function ReportsPage({ initialFilters }: ReportsPageProps = {}) {
         modelOptions={modelOptions}
         useragentOptions={useragentOptions}
         visibleChartIds={visibleChartIds}
+        chartGranularity={chartGranularity}
         onPresetSelect={handlePresetSelect}
         onFiltersChange={handleFiltersChange}
         onVisibleChartIdsChange={setVisibleChartIds}
@@ -298,6 +300,8 @@ export function ReportsPage({ initialFilters }: ReportsPageProps = {}) {
                     startDate={filters.startDate}
                     endDate={filters.endDate}
                     data={reportsQuery.data.daily}
+                    hourly={reportsQuery.data.hourly}
+                    chartGranularity={chartGranularity}
                   />
                 </Suspense>
               ) : null}
@@ -307,6 +311,8 @@ export function ReportsPage({ initialFilters }: ReportsPageProps = {}) {
                     startDate={filters.startDate}
                     endDate={filters.endDate}
                     data={reportsQuery.data.daily}
+                    hourly={reportsQuery.data.hourly}
+                    chartGranularity={chartGranularity}
                   />
                 </Suspense>
               ) : null}
@@ -316,6 +322,8 @@ export function ReportsPage({ initialFilters }: ReportsPageProps = {}) {
                     startDate={filters.startDate}
                     endDate={filters.endDate}
                     data={reportsQuery.data.daily}
+                    hourly={reportsQuery.data.hourly}
+                    chartGranularity={chartGranularity}
                   />
                 </Suspense>
               ) : null}
@@ -325,6 +333,8 @@ export function ReportsPage({ initialFilters }: ReportsPageProps = {}) {
                     startDate={filters.startDate}
                     endDate={filters.endDate}
                     data={reportsQuery.data.daily}
+                    hourly={reportsQuery.data.hourly}
+                    chartGranularity={chartGranularity}
                   />
                 </Suspense>
               ) : null}
@@ -334,6 +344,8 @@ export function ReportsPage({ initialFilters }: ReportsPageProps = {}) {
                     startDate={filters.startDate}
                     endDate={filters.endDate}
                     data={reportsQuery.data.daily}
+                    hourly={reportsQuery.data.hourly}
+                    chartGranularity={chartGranularity}
                   />
                 </Suspense>
               ) : null}

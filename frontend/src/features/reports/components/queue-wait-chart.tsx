@@ -9,14 +9,24 @@ import {
   Tooltip,
   ResponsiveContainer,
 } from "@/components/lazy-recharts";
-import type { DailyReportRow } from "../schemas";
-import { buildContinuousDailyRows } from "../daily-series";
+import type {
+  DailyReportRow,
+  HourlyReportRow,
+  ReportChartGranularity,
+} from "../schemas";
+import {
+  buildReportChartRows,
+  formatReportBucketHour,
+  formatReportBucketTooltip,
+} from "../daily-series";
 import { ChartTooltip } from "./chart-tooltip";
 
 export type QueueWaitChartProps = {
   startDate: string;
   endDate: string;
   data: DailyReportRow[];
+  hourly: HourlyReportRow[];
+  chartGranularity: ReportChartGranularity;
 };
 
 function formatQueueMs(value: number): string {
@@ -26,11 +36,17 @@ function formatQueueMs(value: number): string {
   return `${Math.round(value)}ms`;
 }
 
-export function QueueWaitChart({ startDate, endDate, data }: QueueWaitChartProps) {
+export function QueueWaitChart({
+  startDate,
+  endDate,
+  data,
+  hourly,
+  chartGranularity,
+}: QueueWaitChartProps) {
   const { t } = useTranslation();
-  const chartData = buildContinuousDailyRows(startDate, endDate, data).map((d) => ({
-    date: d.date.slice(5),
-    queue: d.medianQueueMs ?? 0,
+  const chartData = buildReportChartRows(startDate, endDate, chartGranularity, data, hourly).map((d) => ({
+    date: d.date,
+    queue: d.medianQueueMs,
   }));
 
   return (
@@ -48,6 +64,7 @@ export function QueueWaitChart({ startDate, endDate, data }: QueueWaitChartProps
             <CartesianGrid strokeDasharray="3 3" stroke="hsl(var(--border))" vertical={false} />
             <XAxis
               dataKey="date"
+              tickFormatter={formatReportBucketHour}
               tick={{ fontSize: 10, fill: "var(--muted-foreground)" }}
               axisLine={false}
               tickLine={false}
@@ -60,7 +77,13 @@ export function QueueWaitChart({ startDate, endDate, data }: QueueWaitChartProps
             />
             <Tooltip
               content={
-                <ChartTooltip names={{ queue: t("reports.charts.medianQueueWait") }} formatValue={formatQueueMs} />
+                <ChartTooltip
+                  names={{ queue: t("reports.charts.medianQueueWait") }}
+                  formatLabel={
+                    chartGranularity === "hour" ? formatReportBucketTooltip : undefined
+                  }
+                  formatValue={formatQueueMs}
+                />
               }
             />
             <Area

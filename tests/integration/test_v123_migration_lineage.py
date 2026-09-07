@@ -41,7 +41,11 @@ def test_v123_compatibility_merge_has_exact_parents_and_single_head(tmp_path: Pa
     config = _build_alembic_config(db_url)
     script_directory = ScriptDirectory.from_config(config)
 
-    assert script_directory.get_heads() == [_MERGED_HEAD]
+    current_head = script_directory.get_current_head()
+    assert current_head is not None
+    assert _MERGED_HEAD in {
+        revision.revision for revision in script_directory.walk_revisions(base="base", head=current_head)
+    }
     merge_revision = script_directory.get_revision(_MERGED_HEAD)
     assert merge_revision is not None
     assert isinstance(merge_revision.down_revision, tuple)
@@ -75,9 +79,10 @@ def test_deployed_realtime_binding_revision_upgrade_and_downgrade(tmp_path: Path
         engine.dispose()
 
 
-def test_deployed_fork_head_upgrades_to_v123_merged_head(tmp_path: Path) -> None:
+def test_deployed_fork_head_upgrades_to_current_head(tmp_path: Path) -> None:
     db_url = f"sqlite+aiosqlite:///{tmp_path / 'deployed-fork-upgrade.sqlite'}"
     sync_url = to_sync_database_url(db_url)
+    current_head = ScriptDirectory.from_config(_build_alembic_config(db_url)).get_current_head()
 
     deployed = run_upgrade(db_url, _DEPLOYED_FORK_HEAD, bootstrap_legacy=False)
     assert deployed.current_revision == _DEPLOYED_FORK_HEAD
@@ -88,7 +93,7 @@ def test_deployed_fork_head_upgrades_to_v123_merged_head(tmp_path: Path) -> None
             assert inspect(connection).has_table("realtime_call_bindings")
 
         upgraded = run_upgrade(db_url, "head", bootstrap_legacy=False)
-        assert upgraded.current_revision == _MERGED_HEAD
+        assert upgraded.current_revision == current_head
 
         with engine.connect() as connection:
             tables_at_head = set(inspect(connection).get_table_names())
@@ -96,7 +101,7 @@ def test_deployed_fork_head_upgrades_to_v123_merged_head(tmp_path: Path) -> None
                 str(row[0]) for row in connection.execute(text("SELECT version_num FROM alembic_version"))
             }
         assert "realtime_call_bindings" in tables_at_head
-        assert current_revisions == {_MERGED_HEAD}
+        assert current_revisions == {current_head}
         assert check_schema_drift(db_url) == ()
 
     finally:
@@ -120,7 +125,7 @@ def test_v123_compatibility_merge_is_noop_from_both_parents(tmp_path: Path) -> N
             }
         assert parent_revisions == {_DEPLOYED_FORK_HEAD, _V123_HEAD}
 
-        command.upgrade(config, "head")
+        command.upgrade(config, _MERGED_HEAD)
         with engine.connect() as connection:
             tables_after_merge = set(inspect(connection).get_table_names())
             final_revisions = {

@@ -2,6 +2,7 @@ import type { TooltipContentProps } from "recharts";
 
 export type ChartTooltipProps = Partial<TooltipContentProps<number, string>> & {
   formatValue?: (value: number, dataKey: string) => string;
+  formatLabel?: (label: string) => string;
   names?: Record<string, string>;
 };
 
@@ -10,15 +11,22 @@ export function ChartTooltip({
   payload,
   label,
   formatValue,
+  formatLabel,
   names,
 }: ChartTooltipProps) {
   if (!active || !payload?.length) return null;
+  const displayLabel =
+    label == null
+      ? label
+      : formatLabel
+        ? formatLabel(String(label))
+        : label;
 
   return (
     <div className="rounded-xl border border-border bg-popover p-2.5 shadow-md">
-      {label != null && (
+      {displayLabel != null && (
         <p className="mb-1.5 px-2 text-[11px] font-medium text-muted-foreground">
-          {label}
+          {displayLabel}
         </p>
       )}
       <div className="space-y-1">

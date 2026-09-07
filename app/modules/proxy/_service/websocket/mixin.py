@@ -491,6 +491,9 @@ def _facade() -> Any:
 logger = logging.getLogger(__name__)
 
 _WEBSOCKET_PINNED_REFRESH_UNAVAILABLE_MESSAGE = "Account refresh is temporarily unavailable; retry later."
+# Scope teardown coordinates several request/lease finalizers; keep its normal
+# observation budget separate from the short generic child-task cancel bound.
+_WEBSOCKET_SCOPE_CLEANUP_TIMEOUT_SECONDS = 5.0
 _CAPABILITY_REQUIRED_NO_AUTHORIZED_ACCOUNTS_MESSAGE = (
     "This request requires Trusted Access for Cyber, but no eligible account is marked as "
     "security-work-authorized. codex-lb did not fall back to an ordinary account."
@@ -2690,9 +2693,15 @@ class _WebSocketMixin:
             scope_cancelled = True
             raise
         finally:
-            cleanup_timeout = shutdown_state.remaining_drain_timeout_seconds()
-            if cleanup_timeout is None:
-                cleanup_timeout = _facade()._TASK_CANCEL_TIMEOUT_SECONDS
+            remaining_drain_timeout = shutdown_state.remaining_drain_timeout_seconds()
+            cleanup_timeout = (
+                _WEBSOCKET_SCOPE_CLEANUP_TIMEOUT_SECONDS
+                if remaining_drain_timeout is None
+                else max(float(remaining_drain_timeout), 0.0)
+            )
+            task_cleanup_timeout = (
+                _facade()._TASK_CANCEL_TIMEOUT_SECONDS if remaining_drain_timeout is None else cleanup_timeout
+            )
 
             async def finalize_websocket_scope() -> None:
                 nonlocal replay_request_state
@@ -2737,7 +2746,7 @@ class _WebSocketMixin:
                     try:
                         await _facade()._await_cancelled_task(
                             retired_create_lease_release_task,
-                            timeout_seconds=cleanup_timeout,
+                            timeout_seconds=task_cleanup_timeout,
                             label="proxy websocket retired create lease release",
                             cancel=False,
                         )
@@ -2751,7 +2760,7 @@ class _WebSocketMixin:
                     try:
                         await _facade()._await_cancelled_task(
                             request_state_failure_task,
-                            timeout_seconds=cleanup_timeout,
+                            timeout_seconds=task_cleanup_timeout,
                             label="proxy websocket unsent request finalization",
                             cancel=False,
                         )
@@ -2853,7 +2862,12 @@ class _WebSocketMixin:
                 timeout=max(float(cleanup_timeout), 0.0),
             )
             if not done:
-                _facade().logger.warning("Websocket scope cleanup exceeded its remaining drain budget")
+                _facade().logger.warning(
+                    "Websocket scope cleanup exceeded its cleanup budget "
+                    "timeout_seconds=%.3f background_cleanup_tasks=%d",
+                    max(float(cleanup_timeout), 0.0),
+                    sum(1 for task in proxy._background_cleanup_tasks if not task.done()),
+                )
 
     async def _relay_websocket_response_create_over_http(
         self,
@@ -6027,6 +6041,9 @@ class _WebSocketMixin:
             cached_input_tokens=(
                 usage.input_tokens_details.cached_tokens if usage and usage.input_tokens_details else None
             ),
+            cache_write_tokens=(
+                usage.input_tokens_details.cache_write_tokens if usage and usage.input_tokens_details else None
+            ),
             error_code=error_code,
             error_message=error_message,
             error=error_payload,
@@ -6118,6 +6135,7 @@ class _WebSocketMixin:
                     input_tokens=usage.input_tokens if usage else None,
                     output_tokens=usage.output_tokens if usage else None,
                     cached_input_tokens=cached_input_tokens,
+                    cache_write_tokens=settlement.cache_write_tokens,
                     reasoning_tokens=reasoning_tokens,
                     reasoning_effort=request_state.reasoning_effort,
                     transport=request_state.transport,

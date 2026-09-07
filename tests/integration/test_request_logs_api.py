@@ -484,3 +484,31 @@ async def test_request_log_total_count_is_cached_per_filter_signature(async_clie
     # One COUNT for the shared default signature (page 2 reuses it), one for
     # the status-filtered signature.
     assert len(count_statements) == 2
+
+
+@pytest.mark.asyncio
+async def test_astra_cache_write_estimate_reaches_request_log_api(async_client, db_setup):
+    async with SessionLocal() as session:
+        log = await RequestLogsRepository(session).add_log(
+            account_id=None,
+            request_id="astra-cost",
+            model="gpt-6-astra",
+            input_tokens=200_000,
+            output_tokens=100_000,
+            cached_input_tokens=100_000,
+            cache_write_tokens=40_000,
+            latency_ms=10,
+            status="success",
+            error_code=None,
+        )
+        assert log.cache_write_tokens == 40_000
+        assert log.cost_usd == pytest.approx(6.2)
+    response = await async_client.get("/api/request-logs")
+    assert response.status_code == 200
+    row = response.json()["requests"][0]
+    assert row["costBreakdown"] == {
+        "inputUsd": pytest.approx(1.1),
+        "cachedInputUsd": pytest.approx(0.1),
+        "outputUsd": pytest.approx(5),
+        "totalUsd": pytest.approx(6.2),
+    }

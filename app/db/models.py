@@ -437,6 +437,7 @@ class RequestLog(Base):
     input_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     output_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     cached_input_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    cache_write_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     reasoning_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     cost_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
     reasoning_effort: Mapped[str | None] = mapped_column(String, nullable=True)

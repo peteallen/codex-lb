@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from datetime import datetime
+from typing import Literal
+
 from pydantic import Field
 
 from app.modules.shared.schemas import DashboardModel
@@ -14,6 +17,20 @@ class DailyReportRow(DashboardModel):
     cost_usd: float
     active_accounts: int
     conversations: int = 0
+    error_count: int = 0
+    median_ttft_ms: float = 0.0
+    median_tps: float = 0.0
+    median_queue_ms: float = 0.0
+
+
+class HourlyReportRow(DashboardModel):
+    hour: datetime
+    requests: int
+    input_tokens: int
+    output_tokens: int
+    cached_input_tokens: int
+    cost_usd: float
+    active_accounts: int
     error_count: int = 0
     median_ttft_ms: float = 0.0
     median_tps: float = 0.0
@@ -68,6 +85,8 @@ class ReportComparison(DashboardModel):
 class ReportsResponse(DashboardModel):
     summary: ReportSummary
     comparison: ReportComparison
+    chart_granularity: Literal["hour", "day"] = "day"
+    hourly: list[HourlyReportRow] = Field(default_factory=list)
     daily: list[DailyReportRow] = Field(default_factory=list)
     by_model: list[ModelCostEntry] = Field(default_factory=list)
     by_account: list[AccountCostEntry] = Field(default_factory=list)

@@ -4043,3 +4043,62 @@ async def test_stream_without_api_key_auth_skips_settlement(async_client, monkey
         assert response.status_code == 200
         lines = [line async for line in response.aiter_lines() if line]
         assert len(lines) >= 1  # stream completed without error
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("compact", [False, True])
+@pytest.mark.parametrize("service_tier, expected", [("default", 6.2), ("priority", 12.4), ("flex", 3.1)])
+async def test_astra_cache_writes_charge_same_cost_in_proxy_logs_and_key_limit(
+    async_client,
+    monkeypatch,
+    compact,
+    service_tier,
+    expected,
+):
+    await async_client.put("/api/settings", json={"apiKeyAuthEnabled": True, "stickyThreadsEnabled": False})
+    created = await async_client.post(
+        "/api/api-keys/",
+        json={
+            "name": "astra-write-cost",
+            "limits": [{"limitType": "cost_usd", "limitWindow": "weekly", "maxValue": 100_000_000}],
+        },
+    )
+    assert created.status_code == 200
+    key = created.json()
+    await _import_account(async_client, "astra-cost-account", "astra-cost@example.com")
+    response_payload = {
+        "id": "resp_astra_write_cost",
+        "model": "gpt-6-astra",
+        "status": "completed",
+        "service_tier": service_tier,
+        "output": [],
+        "usage": {
+            "input_tokens": 200_000,
+            "output_tokens": 100_000,
+            "total_tokens": 300_000,
+            "input_tokens_details": {"cached_tokens": 100_000, "cache_write_tokens": 40_000},
+        },
+    }
+
+    async def fake_compact(*args, **kwargs):
+        return OpenAIResponsePayload.model_validate(response_payload)
+
+    async def fake_stream(*args, **kwargs):
+        yield f"data: {json.dumps({'type': 'response.completed', 'response': response_payload})}\n\n"
+
+    monkeypatch.setattr(proxy_module, "core_compact_responses", fake_compact)
+    monkeypatch.setattr(proxy_module, "core_stream_responses", fake_stream)
+    response = await async_client.post(
+        "/v1/responses/compact" if compact else "/backend-api/codex/responses",
+        headers={"Authorization": f"Bearer {key['key']}"},
+        json={"model": "gpt-6-astra", "input": [], "instructions": "hi", "service_tier": "priority"},
+    )
+    assert response.status_code == 200
+    # Request-log tasks and stream settlement are tracked by the service lifecycle.
+    async with SessionLocal() as session:
+        limits = await ApiKeysRepository(session).get_limits_by_key(key["id"])
+        assert limits[0].current_value == int(expected * 1_000_000)
+        logs = list((await session.scalars(select(RequestLog).where(RequestLog.model == "gpt-6-astra"))).all())
+        assert len(logs) == 1
+        assert logs[0].cache_write_tokens == 40_000
+        assert logs[0].cost_usd == pytest.approx(expected)

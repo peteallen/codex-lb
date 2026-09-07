@@ -9,26 +9,48 @@ import {
   Tooltip,
   ResponsiveContainer,
 } from "@/components/lazy-recharts";
-import type { DailyReportRow } from "../schemas";
-import { buildContinuousDailyRows } from "../daily-series";
+import type {
+  DailyReportRow,
+  HourlyReportRow,
+  ReportChartGranularity,
+} from "../schemas";
+import {
+  buildReportChartRows,
+  formatReportBucketHour,
+  formatReportBucketTooltip,
+} from "../daily-series";
 import { ChartTooltip } from "./chart-tooltip";
 
 export type CostPerDayChartProps = {
   startDate: string;
   endDate: string;
   data: DailyReportRow[];
+  hourly: HourlyReportRow[];
+  chartGranularity: ReportChartGranularity;
 };
 
-export function CostPerDayChart({ startDate, endDate, data }: CostPerDayChartProps) {
+export function CostPerDayChart({
+  startDate,
+  endDate,
+  data,
+  hourly,
+  chartGranularity,
+}: CostPerDayChartProps) {
   const { t } = useTranslation();
-  const chartData = buildContinuousDailyRows(startDate, endDate, data).map((d) => ({
-    date: d.date.slice(5),
+  const chartData = buildReportChartRows(startDate, endDate, chartGranularity, data, hourly).map((d) => ({
+    date: d.date,
     cost: d.costUsd,
   }));
 
   return (
     <div className="rounded-xl border bg-card p-5">
-      <div className="text-sm font-semibold text-foreground">{t("reports.charts.costByDay")}</div>
+      <div className="text-sm font-semibold text-foreground">
+        {t(
+          chartGranularity === "hour"
+            ? "reports.charts.costByHour"
+            : "reports.charts.costByDay",
+        )}
+      </div>
       <div className="mt-4 h-[200px]">
         <ResponsiveContainer width="100%" height="100%">
           <AreaChart data={chartData} margin={{ top: 5, right: 10, left: 10, bottom: 0 }}>
@@ -41,6 +63,7 @@ export function CostPerDayChart({ startDate, endDate, data }: CostPerDayChartPro
             <CartesianGrid strokeDasharray="3 3" stroke="hsl(var(--border))" vertical={false} />
             <XAxis
               dataKey="date"
+              tickFormatter={formatReportBucketHour}
               tick={{ fontSize: 10, fill: "var(--muted-foreground)" }}
               axisLine={false}
               tickLine={false}
@@ -52,7 +75,15 @@ export function CostPerDayChart({ startDate, endDate, data }: CostPerDayChartPro
               tickFormatter={(v: number) => `$${v}`}
             />
             <Tooltip
-              content={<ChartTooltip names={{ cost: t("reports.dailyBreakdown.columns.cost") }} formatValue={(v) => `$${v.toFixed(2)}`} />}
+              content={
+                <ChartTooltip
+                  names={{ cost: t("reports.dailyBreakdown.columns.cost") }}
+                  formatLabel={
+                    chartGranularity === "hour" ? formatReportBucketTooltip : undefined
+                  }
+                  formatValue={(v) => `$${v.toFixed(2)}`}
+                />
+              }
             />
             <Area
               type="monotone"

@@ -9,25 +9,41 @@ import {
   Tooltip,
   ResponsiveContainer,
 } from "@/components/lazy-recharts";
-import type { DailyReportRow } from "../schemas";
-import { buildContinuousDailyRows } from "../daily-series";
+import type {
+  DailyReportRow,
+  HourlyReportRow,
+  ReportChartGranularity,
+} from "../schemas";
+import {
+  buildReportChartRows,
+  formatReportBucketHour,
+  formatReportBucketTooltip,
+} from "../daily-series";
 import { ChartTooltip } from "./chart-tooltip";
 
 export type TimeToFirstTokenChartProps = {
   startDate: string;
   endDate: string;
   data: DailyReportRow[];
+  hourly: HourlyReportRow[];
+  chartGranularity: ReportChartGranularity;
 };
 
 function formatSeconds(value: number): string {
   return `${(value / 1000).toFixed(1)}s`;
 }
 
-export function TimeToFirstTokenChart({ startDate, endDate, data }: TimeToFirstTokenChartProps) {
+export function TimeToFirstTokenChart({
+  startDate,
+  endDate,
+  data,
+  hourly,
+  chartGranularity,
+}: TimeToFirstTokenChartProps) {
   const { t } = useTranslation();
-  const chartData = buildContinuousDailyRows(startDate, endDate, data).map((d) => ({
-    date: d.date.slice(5),
-    ttft: d.medianTtftMs ?? 0,
+  const chartData = buildReportChartRows(startDate, endDate, chartGranularity, data, hourly).map((d) => ({
+    date: d.date,
+    ttft: d.medianTtftMs,
   }));
 
   return (
@@ -45,6 +61,7 @@ export function TimeToFirstTokenChart({ startDate, endDate, data }: TimeToFirstT
             <CartesianGrid strokeDasharray="3 3" stroke="hsl(var(--border))" vertical={false} />
             <XAxis
               dataKey="date"
+              tickFormatter={formatReportBucketHour}
               tick={{ fontSize: 10, fill: "var(--muted-foreground)" }}
               axisLine={false}
               tickLine={false}
@@ -56,7 +73,15 @@ export function TimeToFirstTokenChart({ startDate, endDate, data }: TimeToFirstT
               tickFormatter={formatSeconds}
             />
             <Tooltip
-              content={<ChartTooltip names={{ ttft: t("reports.charts.medianTtft") }} formatValue={formatSeconds} />}
+              content={
+                <ChartTooltip
+                  names={{ ttft: t("reports.charts.medianTtft") }}
+                  formatLabel={
+                    chartGranularity === "hour" ? formatReportBucketTooltip : undefined
+                  }
+                  formatValue={formatSeconds}
+                />
+              }
             />
             <Area
               type="monotone"

@@ -62,6 +62,7 @@ async def test_get_reports_averages_use_inclusive_local_calendar_days(
     repo = SimpleNamespace(
         aggregate_summary=AsyncMock(side_effect=[summary, summary]),
         aggregate_daily_rows=AsyncMock(return_value=[]),
+        aggregate_hourly_rows=AsyncMock(return_value=[]),
         aggregate_by_model=AsyncMock(return_value=[]),
         aggregate_by_account=AsyncMock(return_value=[]),
         aggregate_by_useragent=AsyncMock(return_value=[]),
@@ -77,6 +78,8 @@ async def test_get_reports_averages_use_inclusive_local_calendar_days(
 
     assert result.summary.avg_cost_per_day == 30.0
     assert result.summary.avg_requests_per_day == 15.0
+    assert result.chart_granularity == "hour"
+    repo.aggregate_hourly_rows.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -86,6 +89,7 @@ async def test_get_reports_rejects_oversized_range_after_applying_default_end_da
     repo = SimpleNamespace(
         aggregate_summary=AsyncMock(),
         aggregate_daily_rows=AsyncMock(),
+        aggregate_hourly_rows=AsyncMock(),
         aggregate_by_model=AsyncMock(),
         aggregate_by_account=AsyncMock(),
         earliest_report_activity_at=AsyncMock(),
@@ -99,6 +103,7 @@ async def test_get_reports_rejects_oversized_range_after_applying_default_end_da
 
     repo.aggregate_summary.assert_not_awaited()
     repo.aggregate_daily_rows.assert_not_awaited()
+    repo.aggregate_hourly_rows.assert_not_awaited()
     repo.aggregate_by_model.assert_not_awaited()
     repo.aggregate_by_account.assert_not_awaited()
     repo.earliest_report_activity_at.assert_not_awaited()
@@ -111,6 +116,7 @@ async def test_get_reports_rejects_inverted_defaulted_range_before_repository_wo
     repo = SimpleNamespace(
         aggregate_summary=AsyncMock(),
         aggregate_daily_rows=AsyncMock(),
+        aggregate_hourly_rows=AsyncMock(),
         aggregate_by_model=AsyncMock(),
         aggregate_by_account=AsyncMock(),
         aggregate_by_useragent=AsyncMock(),
@@ -128,6 +134,7 @@ async def test_get_reports_rejects_inverted_defaulted_range_before_repository_wo
 
     repo.aggregate_summary.assert_not_awaited()
     repo.aggregate_daily_rows.assert_not_awaited()
+    repo.aggregate_hourly_rows.assert_not_awaited()
     repo.aggregate_by_model.assert_not_awaited()
     repo.aggregate_by_account.assert_not_awaited()
     repo.aggregate_by_useragent.assert_not_awaited()
@@ -179,6 +186,23 @@ async def test_get_reports_serializes_conversation_and_breakdown_request_counts(
                 )
             ]
         ),
+        aggregate_hourly_rows=AsyncMock(
+            return_value=[
+                SimpleNamespace(
+                    hour=datetime(2026, 6, 1, 10, 0, tzinfo=timezone.utc),
+                    requests=2,
+                    input_tokens=12,
+                    output_tokens=6,
+                    cached_input_tokens=2,
+                    cost_usd=1.2,
+                    active_accounts=1,
+                    error_count=0,
+                    median_ttft_ms=123.456,
+                    median_tps=78.901,
+                    median_queue_ms=45.678,
+                )
+            ]
+        ),
         aggregate_by_model=AsyncMock(return_value=[SimpleNamespace(model="gpt-5.1", cost_usd=1.2, request_count=2)]),
         aggregate_by_account=AsyncMock(
             return_value=[SimpleNamespace(account_id="acc_reports", alias="Reports", cost_usd=1.2, request_count=2)]
@@ -206,6 +230,15 @@ async def test_get_reports_serializes_conversation_and_breakdown_request_counts(
         api_key_ids=["key-a", "key-b"],
     )
     repo.aggregate_daily_rows.assert_awaited_once_with(
+        date(2026, 6, 1),
+        date(2026, 6, 1),
+        timezone.utc,
+        None,
+        None,
+        "opencode",
+        api_key_ids=["key-a", "key-b"],
+    )
+    repo.aggregate_hourly_rows.assert_awaited_once_with(
         date(2026, 6, 1),
         date(2026, 6, 1),
         timezone.utc,
@@ -249,9 +282,61 @@ async def test_get_reports_serializes_conversation_and_breakdown_request_counts(
     assert result.daily[0].conversations == 1
     assert result.daily[0].median_tps == 78.9
     assert result.daily[0].median_queue_ms == 45.68
+    assert result.chart_granularity == "hour"
+    assert result.hourly[0].hour == datetime(2026, 6, 1, 10, 0, tzinfo=timezone.utc)
+    assert result.hourly[0].median_ttft_ms == 123.46
+    assert result.hourly[0].median_tps == 78.9
+    assert result.hourly[0].median_queue_ms == 45.68
     assert result.by_model[0].model == "gpt-5.1"
     assert result.summary.total_conversations == 1
     assert result.by_model[0].requests == 2
     assert result.by_useragent[0].useragent == "opencode"
     assert result.by_useragent[0].requests == 2
     assert result.by_useragent[0].percentage == 100.0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("end_date", "expected_granularity", "expects_hourly_query"),
+    [
+        (date(2026, 6, 2), "hour", True),
+        (date(2026, 6, 3), "day", False),
+    ],
+)
+async def test_get_reports_switches_chart_granularity_at_three_days(
+    end_date: date,
+    expected_granularity: str,
+    expects_hourly_query: bool,
+) -> None:
+    summary = SimpleNamespace(
+        total_cost_usd=0.0,
+        total_input_tokens=0,
+        total_output_tokens=0,
+        total_cached_tokens=0,
+        total_requests=0,
+        conversation_count=0,
+        total_errors=0,
+        active_accounts=0,
+    )
+    repo = SimpleNamespace(
+        aggregate_summary=AsyncMock(side_effect=[summary, summary]),
+        aggregate_daily_rows=AsyncMock(return_value=[]),
+        aggregate_hourly_rows=AsyncMock(),
+        aggregate_by_model=AsyncMock(return_value=[]),
+        aggregate_by_account=AsyncMock(return_value=[]),
+        aggregate_by_useragent=AsyncMock(return_value=[]),
+        earliest_report_activity_at=AsyncMock(return_value=None),
+    )
+    service = ReportsService(cast(ReportsRepository, repo))
+
+    result = await service.get_reports(
+        start_date=date(2026, 6, 1),
+        end_date=end_date,
+    )
+
+    assert result.chart_granularity == expected_granularity
+    assert result.hourly == []
+    if expects_hourly_query:
+        repo.aggregate_hourly_rows.assert_awaited_once()
+    else:
+        repo.aggregate_hourly_rows.assert_not_awaited()

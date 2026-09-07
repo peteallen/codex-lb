@@ -28,6 +28,9 @@ class RequestLogLike(Protocol):
     def cached_input_tokens(self) -> int | None: ...
 
     @property
+    def cache_write_tokens(self) -> int | None: ...
+
+    @property
     def reasoning_tokens(self) -> int | None: ...
 
     @property
@@ -57,6 +60,7 @@ def usage_tokens_from_log(log: RequestLogLike) -> UsageTokens | None:
         input_tokens=float(input_tokens),
         output_tokens=float(output_tokens),
         cached_input_tokens=float(cached_tokens),
+        cache_write_tokens=float(log.cache_write_tokens or 0),
     )
 
 
@@ -138,6 +142,7 @@ def cost_breakdown_from_log(log: RequestLogLike, *, precision: int | None = None
                         input_tokens=float(input_tokens),
                         output_tokens=0.0,
                         cached_input_tokens=float(cached_tokens),
+                        cache_write_tokens=float(log.cache_write_tokens or 0),
                     ),
                     price,
                     service_tier=log.service_tier,

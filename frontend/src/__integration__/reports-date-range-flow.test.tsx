@@ -30,6 +30,8 @@ const EMPTY_REPORT: ReportsResponse = {
       totalRequests: 0,
     },
   },
+  chartGranularity: "day",
+  hourly: [],
   daily: [],
   byModel: [],
   byUseragent: [],

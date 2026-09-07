@@ -1,9 +1,25 @@
 import { z } from "zod";
 
+export const ReportChartGranularitySchema = z.enum(["hour", "day"]);
+
 const DailyReportRowSchema = z.object({
   date: z.string(),
   requests: z.number(),
   conversations: z.number(),
+  inputTokens: z.number(),
+  outputTokens: z.number(),
+  cachedInputTokens: z.number(),
+  costUsd: z.number(),
+  activeAccounts: z.number(),
+  errorCount: z.number(),
+  medianTtftMs: z.number().optional().default(0),
+  medianTps: z.number().optional().default(0),
+  medianQueueMs: z.number().optional().default(0),
+});
+
+export const HourlyReportRowSchema = z.object({
+  hour: z.iso.datetime({ offset: true }),
+  requests: z.number(),
   inputTokens: z.number(),
   outputTokens: z.number(),
   cachedInputTokens: z.number(),
@@ -63,6 +79,8 @@ const ReportComparisonSchema = z.object({
 export const ReportsResponseSchema = z.object({
   summary: ReportSummarySchema,
   comparison: ReportComparisonSchema,
+  chartGranularity: ReportChartGranularitySchema,
+  hourly: z.array(HourlyReportRowSchema),
   daily: z.array(DailyReportRowSchema),
   byModel: z.array(ModelCostEntrySchema),
   byUseragent: z.array(UseragentCostEntrySchema),
@@ -70,6 +88,8 @@ export const ReportsResponseSchema = z.object({
 });
 
 export type DailyReportRow = z.input<typeof DailyReportRowSchema>;
+export type HourlyReportRow = z.input<typeof HourlyReportRowSchema>;
+export type ReportChartGranularity = z.infer<typeof ReportChartGranularitySchema>;
 export type ModelCostEntry = z.infer<typeof ModelCostEntrySchema>;
 export type UseragentCostEntry = z.infer<typeof UseragentCostEntrySchema>;
 export type AccountCostEntry = z.infer<typeof AccountCostEntrySchema>;

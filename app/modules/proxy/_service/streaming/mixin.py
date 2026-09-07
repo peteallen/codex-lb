@@ -1046,6 +1046,9 @@ class _StreamingMixin(_StreamingRetryMixin):
             settlement.input_tokens = input_tokens
             settlement.output_tokens = output_tokens
             settlement.cached_input_tokens = cached_input_tokens
+            settlement.cache_write_tokens = (
+                usage.input_tokens_details.cache_write_tokens if usage and usage.input_tokens_details else None
+            )
             settlement.error_code = error_code
             settlement.error_message = error_message
             await proxy._write_request_log(
@@ -1061,6 +1064,7 @@ class _StreamingMixin(_StreamingRetryMixin):
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
                 cached_input_tokens=cached_input_tokens,
+                cache_write_tokens=settlement.cache_write_tokens,
                 reasoning_tokens=reasoning_tokens,
                 reasoning_effort=reasoning_effort,
                 transport=request_transport,

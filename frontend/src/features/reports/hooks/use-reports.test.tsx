@@ -27,6 +27,8 @@ vi.mock("@/lib/api-client", () => ({
         totalRequests: 0,
       },
     },
+    chartGranularity: "day",
+    hourly: [],
     daily: [],
     byModel: [],
     byUseragent: [],

@@ -31,6 +31,7 @@ class ModelPrice:
     priority_long_context_input_per_1m: float | None = None
     priority_long_context_output_per_1m: float | None = None
     priority_long_context_cached_input_per_1m: float | None = None
+    cache_write_multiplier: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -38,6 +39,7 @@ class UsageTokens:
     input_tokens: float
     output_tokens: float
     cached_input_tokens: float = 0.0
+    cache_write_tokens: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -69,10 +71,12 @@ def _normalize_usage(usage: UsageTokens | ResponseUsage | None) -> UsageTokens |
         if input_tokens is None or output_tokens is None:
             return None
         cached_tokens = max(0.0, min(cached_tokens or 0.0, input_tokens))
+        write_tokens = max(0.0, min(usage.cache_write_tokens, input_tokens - cached_tokens))
         return UsageTokens(
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             cached_input_tokens=cached_tokens,
+            cache_write_tokens=write_tokens,
         )
     if not usage:
         return None
@@ -83,18 +87,49 @@ def _normalize_usage(usage: UsageTokens | ResponseUsage | None) -> UsageTokens |
     if input_tokens is None or output_tokens is None:
         return None
     cached_tokens = 0.0
+    write_tokens = 0.0
     if usage.input_tokens_details is not None:
         cached_tokens = _as_number(usage.input_tokens_details.cached_tokens) or 0.0
+        write_tokens = _as_number(usage.input_tokens_details.cache_write_tokens) or 0.0
     cached_tokens = max(0.0, min(cached_tokens, input_tokens))
+    write_tokens = max(0.0, min(write_tokens, input_tokens - cached_tokens))
     return UsageTokens(
         input_tokens=input_tokens,
         output_tokens=output_tokens,
         cached_input_tokens=cached_tokens,
+        cache_write_tokens=write_tokens,
     )
 
 
+# Official API token rates verified 2026-09-04:
+# https://developers.openai.com/api/docs/pricing
+# https://developers.openai.com/api/docs/models/gpt-6-astra
+# Sol promotional rates are published through at least 2026-11-21.
 DEFAULT_PRICING_MODELS: dict[str, ModelPrice] = {
+    "gpt-6-astra": ModelPrice(
+        input_per_1m=10.0,
+        cached_input_per_1m=1.0,
+        output_per_1m=50.0,
+        cache_write_multiplier=1.25,
+        priority_input_per_1m=20.0,
+        priority_cached_input_per_1m=2.0,
+        priority_output_per_1m=100.0,
+        priority_long_context_input_per_1m=40.0,
+        priority_long_context_cached_input_per_1m=4.0,
+        priority_long_context_output_per_1m=150.0,
+        flex_input_per_1m=5.0,
+        flex_cached_input_per_1m=0.5,
+        flex_output_per_1m=25.0,
+        flex_long_context_input_per_1m=10.0,
+        flex_long_context_cached_input_per_1m=1.0,
+        flex_long_context_output_per_1m=37.5,
+        long_context_threshold_tokens=272_000,
+        long_context_input_per_1m=20.0,
+        long_context_cached_input_per_1m=2.0,
+        long_context_output_per_1m=75.0,
+    ),
     "gpt-5.6-sol": ModelPrice(
+        cache_write_multiplier=1.25,
         input_per_1m=4.0,
         cached_input_per_1m=0.4,
         output_per_1m=20.0,
@@ -116,6 +151,7 @@ DEFAULT_PRICING_MODELS: dict[str, ModelPrice] = {
         long_context_output_per_1m=30.0,
     ),
     "gpt-5.6-terra": ModelPrice(
+        cache_write_multiplier=1.25,
         input_per_1m=2.0,
         cached_input_per_1m=0.2,
         output_per_1m=12.0,
@@ -137,6 +173,7 @@ DEFAULT_PRICING_MODELS: dict[str, ModelPrice] = {
         long_context_output_per_1m=18.0,
     ),
     "gpt-5.6-luna": ModelPrice(
+        cache_write_multiplier=1.25,
         input_per_1m=0.2,
         cached_input_per_1m=0.02,
         output_per_1m=1.2,
@@ -192,7 +229,7 @@ DEFAULT_PRICING_MODELS: dict[str, ModelPrice] = {
         priority_cached_input_per_1m=0.5,
         priority_output_per_1m=30.0,
         flex_input_per_1m=1.25,
-        flex_cached_input_per_1m=0.125,
+        flex_cached_input_per_1m=0.13,
         flex_output_per_1m=7.5,
         flex_long_context_input_per_1m=2.5,
         flex_long_context_cached_input_per_1m=0.25,
@@ -329,6 +366,148 @@ DEFAULT_PRICING_MODELS: dict[str, ModelPrice] = {
         priority_cached_input_per_1m=0.25,
         priority_output_per_1m=20.0,
     ),
+    "gpt-5.6-cyber": ModelPrice(
+        input_per_1m=12.5,
+        cached_input_per_1m=1.25,
+        output_per_1m=75,
+        cache_write_multiplier=1.25,
+    ),
+    "gpt-5.5-cyber": ModelPrice(
+        input_per_1m=12.5,
+        cached_input_per_1m=1.25,
+        output_per_1m=75,
+    ),
+    "chat-latest": ModelPrice(
+        input_per_1m=5,
+        cached_input_per_1m=0.5,
+        output_per_1m=30,
+    ),
+    "gpt-5-mini": ModelPrice(
+        input_per_1m=0.25,
+        cached_input_per_1m=0.025,
+        output_per_1m=2,
+        priority_input_per_1m=0.45,
+        priority_cached_input_per_1m=0.045,
+        priority_output_per_1m=3.6,
+        flex_input_per_1m=0.125,
+        flex_cached_input_per_1m=0.0125,
+        flex_output_per_1m=1,
+    ),
+    "gpt-5-nano": ModelPrice(
+        input_per_1m=0.05,
+        cached_input_per_1m=0.005,
+        output_per_1m=0.4,
+        flex_input_per_1m=0.025,
+        flex_cached_input_per_1m=0.0025,
+        flex_output_per_1m=0.2,
+    ),
+    "gpt-5-pro": ModelPrice(
+        input_per_1m=15,
+        output_per_1m=120,
+    ),
+    "gpt-5.2-pro": ModelPrice(
+        input_per_1m=21,
+        output_per_1m=168,
+    ),
+    "gpt-4.1": ModelPrice(
+        input_per_1m=2,
+        cached_input_per_1m=0.5,
+        output_per_1m=8,
+        priority_input_per_1m=3.5,
+        priority_cached_input_per_1m=0.875,
+        priority_output_per_1m=14,
+    ),
+    "gpt-4.1-mini": ModelPrice(
+        input_per_1m=0.4,
+        cached_input_per_1m=0.1,
+        output_per_1m=1.6,
+        priority_input_per_1m=0.7,
+        priority_cached_input_per_1m=0.175,
+        priority_output_per_1m=2.8,
+    ),
+    "gpt-4.1-nano": ModelPrice(
+        input_per_1m=0.1,
+        cached_input_per_1m=0.025,
+        output_per_1m=0.4,
+        priority_input_per_1m=0.2,
+        priority_cached_input_per_1m=0.05,
+        priority_output_per_1m=0.8,
+    ),
+    "gpt-4o": ModelPrice(
+        input_per_1m=2.5,
+        cached_input_per_1m=1.25,
+        output_per_1m=10,
+        priority_input_per_1m=4.25,
+        priority_cached_input_per_1m=2.125,
+        priority_output_per_1m=17,
+    ),
+    "gpt-4o-2024-05-13": ModelPrice(
+        input_per_1m=5,
+        output_per_1m=15,
+        priority_input_per_1m=8.75,
+        priority_output_per_1m=26.25,
+    ),
+    "gpt-4o-mini": ModelPrice(
+        input_per_1m=0.15,
+        cached_input_per_1m=0.075,
+        output_per_1m=0.6,
+        priority_input_per_1m=0.25,
+        priority_cached_input_per_1m=0.125,
+        priority_output_per_1m=1,
+    ),
+    "o1": ModelPrice(
+        input_per_1m=15,
+        cached_input_per_1m=7.5,
+        output_per_1m=60,
+    ),
+    "o1-pro": ModelPrice(
+        input_per_1m=150,
+        output_per_1m=600,
+    ),
+    "o3": ModelPrice(
+        input_per_1m=2,
+        cached_input_per_1m=0.5,
+        output_per_1m=8,
+        priority_input_per_1m=3.5,
+        priority_cached_input_per_1m=0.875,
+        priority_output_per_1m=14,
+        flex_input_per_1m=1,
+        flex_cached_input_per_1m=0.25,
+        flex_output_per_1m=4,
+    ),
+    "o3-pro": ModelPrice(
+        input_per_1m=20,
+        output_per_1m=80,
+    ),
+    "o3-mini": ModelPrice(
+        input_per_1m=1.1,
+        cached_input_per_1m=0.55,
+        output_per_1m=4.4,
+    ),
+    "o4-mini": ModelPrice(
+        input_per_1m=1.1,
+        cached_input_per_1m=0.275,
+        output_per_1m=4.4,
+        priority_input_per_1m=2,
+        priority_cached_input_per_1m=0.5,
+        priority_output_per_1m=8,
+        flex_input_per_1m=0.55,
+        flex_cached_input_per_1m=0.138,
+        flex_output_per_1m=2.2,
+    ),
+    "gpt-5-search-api": ModelPrice(
+        input_per_1m=1.25,
+        cached_input_per_1m=0.125,
+        output_per_1m=10,
+    ),
+    "gpt-4-turbo-2024-04-09": ModelPrice(input_per_1m=10, output_per_1m=30),
+    "gpt-4-0613": ModelPrice(input_per_1m=30, output_per_1m=60),
+    "gpt-3.5-turbo": ModelPrice(input_per_1m=0.5, output_per_1m=1.5),
+    "gpt-3.5-turbo-0125": ModelPrice(input_per_1m=0.5, output_per_1m=1.5),
+    "gpt-3.5-turbo-1106": ModelPrice(input_per_1m=1, output_per_1m=2),
+    "gpt-3.5-turbo-instruct": ModelPrice(input_per_1m=1.5, output_per_1m=2),
+    "davinci-002": ModelPrice(input_per_1m=2, output_per_1m=2),
+    "babbage-002": ModelPrice(input_per_1m=0.4, output_per_1m=0.4),
     # OpenAI Images token-based pricing (per 1M tokens, USD).
     # gpt-image-2 (August 2026):
     #   text input  $5.00, image input $8.00, image cached input $2.00,
@@ -372,6 +551,27 @@ DEFAULT_PRICING_MODELS: dict[str, ModelPrice] = {
 }
 
 DEFAULT_MODEL_ALIASES: dict[str, str] = {
+    "gpt-5.6-cyber-20*": "gpt-5.6-cyber",
+    "gpt-5.5-cyber-20*": "gpt-5.5-cyber",
+    "gpt-5-mini-20*": "gpt-5-mini",
+    "gpt-5-nano-20*": "gpt-5-nano",
+    "gpt-5-pro-20*": "gpt-5-pro",
+    "gpt-5.2-pro-20*": "gpt-5.2-pro",
+    "gpt-4.1-20*": "gpt-4.1",
+    "gpt-4.1-mini-20*": "gpt-4.1-mini",
+    "gpt-4.1-nano-20*": "gpt-4.1-nano",
+    "gpt-4o-20*": "gpt-4o",
+    "gpt-4o-mini-20*": "gpt-4o-mini",
+    "o1-20*": "o1",
+    "o1-pro-20*": "o1-pro",
+    "o3-20*": "o3",
+    "o3-pro-20*": "o3-pro",
+    "o3-mini-20*": "o3-mini",
+    "o4-mini-20*": "o4-mini",
+    "gpt-5-search-api-20*": "gpt-5-search-api",
+    "gpt-6-astra-20*": "gpt-6-astra",
+    "gpt-daybreak-blue-latest": "gpt-5.6-sol",
+    "gpt-daybreak-red-latest": "gpt-5.6-cyber",
     "gpt-5.6": "gpt-5.6-sol",
     # Wildcards only accept dated snapshots. Broad family wildcards can
     # otherwise make a distinct public model (for example ``gpt-5-pro`` or
@@ -391,8 +591,6 @@ DEFAULT_MODEL_ALIASES: dict[str, str] = {
     "gpt-5.4-mini-20*": "gpt-5.4-mini",
     "gpt-5.4-nano-20*": "gpt-5.4-nano",
     "gpt-5.4-20*": "gpt-5.4",
-    "gpt-5.3-codex-spark": "gpt-5.3-codex",
-    "gpt-5.3-codex-spark-20*": "gpt-5.3-codex",
     "gpt-5.3-codex-20*": "gpt-5.3-codex",
     "gpt-5.3-chat-latest-20*": "gpt-5.3-chat-latest",
     "gpt-5.2-codex-20*": "gpt-5.2-codex",
@@ -577,7 +775,8 @@ def calculate_cost_breakdown_from_usage(
         service_tier=service_tier,
     )
 
-    input_usd = (billable_input / 1_000_000) * input_rate
+    weighted_input = billable_input + normalized.cache_write_tokens * (price.cache_write_multiplier - 1.0)
+    input_usd = (weighted_input / 1_000_000) * input_rate
     cached_input_usd = (normalized.cached_input_tokens / 1_000_000) * cached_rate
     output_usd = (normalized.output_tokens / 1_000_000) * output_rate
 

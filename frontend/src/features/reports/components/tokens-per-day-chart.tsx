@@ -9,14 +9,24 @@ import {
   Tooltip,
   ResponsiveContainer,
 } from "@/components/lazy-recharts";
-import type { DailyReportRow } from "../schemas";
-import { buildContinuousDailyRows } from "../daily-series";
+import type {
+  DailyReportRow,
+  HourlyReportRow,
+  ReportChartGranularity,
+} from "../schemas";
+import {
+  buildReportChartRows,
+  formatReportBucketHour,
+  formatReportBucketTooltip,
+} from "../daily-series";
 import { ChartTooltip } from "./chart-tooltip";
 
 export type TokensPerDayChartProps = {
   startDate: string;
   endDate: string;
   data: DailyReportRow[];
+  hourly: HourlyReportRow[];
+  chartGranularity: ReportChartGranularity;
 };
 
 function formatTokens(v: number): string {
@@ -26,17 +36,29 @@ function formatTokens(v: number): string {
   return String(v);
 }
 
-export function TokensPerDayChart({ startDate, endDate, data }: TokensPerDayChartProps) {
+export function TokensPerDayChart({
+  startDate,
+  endDate,
+  data,
+  hourly,
+  chartGranularity,
+}: TokensPerDayChartProps) {
   const { t } = useTranslation();
-  const chartData = buildContinuousDailyRows(startDate, endDate, data).map((d) => ({
-    date: d.date.slice(5),
+  const chartData = buildReportChartRows(startDate, endDate, chartGranularity, data, hourly).map((d) => ({
+    date: d.date,
     input: d.inputTokens,
     output: d.outputTokens,
   }));
 
   return (
     <div className="rounded-xl border bg-card p-5">
-      <div className="text-sm font-semibold text-foreground">{t("reports.charts.tokensByDay")}</div>
+      <div className="text-sm font-semibold text-foreground">
+        {t(
+          chartGranularity === "hour"
+            ? "reports.charts.tokensByHour"
+            : "reports.charts.tokensByDay",
+        )}
+      </div>
       <div className="mt-4 h-[200px]">
         <ResponsiveContainer width="100%" height="100%">
           <AreaChart data={chartData} margin={{ top: 5, right: 10, left: 10, bottom: 0 }}>
@@ -53,6 +75,7 @@ export function TokensPerDayChart({ startDate, endDate, data }: TokensPerDayChar
             <CartesianGrid strokeDasharray="3 3" stroke="hsl(var(--border))" vertical={false} />
             <XAxis
               dataKey="date"
+              tickFormatter={formatReportBucketHour}
               tick={{ fontSize: 10, fill: "var(--muted-foreground)" }}
               axisLine={false}
               tickLine={false}
@@ -64,7 +87,15 @@ export function TokensPerDayChart({ startDate, endDate, data }: TokensPerDayChar
               tickFormatter={formatTokens}
             />
             <Tooltip
-              content={<ChartTooltip names={{ input: t("reports.charts.input"), output: t("reports.charts.output") }} formatValue={(v) => formatTokens(v)} />}
+              content={
+                <ChartTooltip
+                  names={{ input: t("reports.charts.input"), output: t("reports.charts.output") }}
+                  formatLabel={
+                    chartGranularity === "hour" ? formatReportBucketTooltip : undefined
+                  }
+                  formatValue={(v) => formatTokens(v)}
+                />
+              }
             />
             <Area
               type="monotone"

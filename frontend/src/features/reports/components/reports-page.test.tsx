@@ -66,10 +66,48 @@ const EMPTY_REPORT: ReportsResponse = {
       totalRequests: 0,
     },
   },
+  chartGranularity: "day",
+  hourly: [],
   daily: [],
   byModel: [],
   byUseragent: [],
   byAccount: [],
+};
+
+const HOURLY_REPORT: ReportsResponse = {
+  ...EMPTY_REPORT,
+  chartGranularity: "hour",
+  hourly: [
+    {
+      hour: "2026-06-05T01:00:00-07:00",
+      requests: 2,
+      inputTokens: 100,
+      outputTokens: 40,
+      cachedInputTokens: 10,
+      costUsd: 0.25,
+      activeAccounts: 1,
+      errorCount: 0,
+      medianTtftMs: 120,
+      medianTps: 24,
+      medianQueueMs: 30,
+    },
+  ],
+  daily: [
+    {
+      date: "2026-06-05",
+      requests: 2,
+      conversations: 1,
+      inputTokens: 100,
+      outputTokens: 40,
+      cachedInputTokens: 10,
+      costUsd: 0.25,
+      activeAccounts: 1,
+      errorCount: 0,
+      medianTtftMs: 120,
+      medianTps: 24,
+      medianQueueMs: 30,
+    },
+  ],
 };
 
 const useReportsMock = vi.mocked(useReports);
@@ -712,6 +750,38 @@ describe("ReportsPage", () => {
     ]) {
       expect(await screen.findByText(heading)).toBeInTheDocument();
     }
+  });
+
+  it("renders hourly chart titles and keeps the daily breakdown for short ranges", async () => {
+    const user = userEvent.setup();
+    useReportsMock.mockReturnValue(
+      asUseReportsResult({
+        data: HOURLY_REPORT,
+        isLoading: false,
+        isError: false,
+        refetch: vi.fn(),
+      }),
+    );
+
+    renderWithProviders(
+      <ReportsPage
+        initialFilters={{ startDate: "2026-06-05", endDate: "2026-06-05" }}
+      />,
+    );
+
+    expect(await screen.findByText("Cost by Hour")).toBeInTheDocument();
+    expect(screen.getByText("Tokens by Hour")).toBeInTheDocument();
+    expect(screen.getByText("Daily Breakdown")).toBeInTheDocument();
+    expect(screen.queryByText("Cost by Day")).not.toBeInTheDocument();
+    expect(screen.queryByText("Tokens by Day")).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "Charts (5)" }));
+    expect(
+      screen.getByRole("menuitemcheckbox", { name: "Cost by Hour" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("menuitemcheckbox", { name: "Tokens by Hour" }),
+    ).toBeInTheDocument();
   });
 
   it("renders the selected Cost by Day and Queue Wait charts", async () => {

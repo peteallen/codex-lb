@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import type { ReportChartGranularity } from "../schemas";
 
 export const REPORT_CHART_DEFINITIONS = [
   { id: "costByDay", labelKey: "reports.charts.costByDay" },
@@ -9,6 +10,22 @@ export const REPORT_CHART_DEFINITIONS = [
 ] as const;
 
 export type ReportChartId = (typeof REPORT_CHART_DEFINITIONS)[number]["id"];
+
+const REPORT_CHART_HOURLY_LABEL_KEYS: Partial<Record<ReportChartId, string>> = {
+  costByDay: "reports.charts.costByHour",
+  tokensByDay: "reports.charts.tokensByHour",
+};
+
+export function getReportChartLabelKey(
+  definition: (typeof REPORT_CHART_DEFINITIONS)[number],
+  chartGranularity: ReportChartGranularity,
+): string {
+  if (chartGranularity === "hour") {
+    return REPORT_CHART_HOURLY_LABEL_KEYS[definition.id] ?? definition.labelKey;
+  }
+
+  return definition.labelKey;
+}
 
 export const REPORT_CHART_VISIBILITY_STORAGE_KEY =
   "codex-lb-reports-visible-charts";

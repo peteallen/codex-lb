@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta, timezone
+from typing import Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from app.core.utils.time import to_utc_naive, utcnow
@@ -8,6 +9,7 @@ from app.modules.reports.repository import MAX_DAILY_REPORT_DAYS, DailyReportRan
 from app.modules.reports.schemas import (
     AccountCostEntry,
     DailyReportRow,
+    HourlyReportRow,
     ModelCostEntry,
     ReportComparison,
     ReportComparisonPrevious,
@@ -15,6 +17,8 @@ from app.modules.reports.schemas import (
     ReportSummary,
     UserAgentCostEntry,
 )
+
+REPORT_CHART_HOURLY_THRESHOLD_DAYS = 3
 
 
 class InvalidReportDateRangeError(ValueError):
@@ -102,6 +106,35 @@ class ReportsService:
             )
             for row in daily_rows
         ]
+        chart_granularity: Literal["hour", "day"] = "day"
+        hourly: list[HourlyReportRow] = []
+        if window_days < REPORT_CHART_HOURLY_THRESHOLD_DAYS:
+            chart_granularity = "hour"
+            hourly_rows = await self._repository.aggregate_hourly_rows(
+                start_date,
+                end_date,
+                timezone_info,
+                account_ids,
+                model,
+                useragent_group,
+                api_key_ids=api_key_ids,
+            )
+            hourly = [
+                HourlyReportRow(
+                    hour=row.hour,
+                    requests=row.requests,
+                    input_tokens=row.input_tokens,
+                    output_tokens=row.output_tokens,
+                    cached_input_tokens=row.cached_input_tokens,
+                    cost_usd=round(row.cost_usd, 4),
+                    active_accounts=row.active_accounts,
+                    error_count=row.error_count,
+                    median_ttft_ms=round(row.median_ttft_ms, 2),
+                    median_tps=round(row.median_tps, 2),
+                    median_queue_ms=round(row.median_queue_ms, 2),
+                )
+                for row in hourly_rows
+            ]
         by_model = await self._repository.aggregate_by_model(
             start_at,
             end_at,
@@ -152,6 +185,8 @@ class ReportsService:
                 avg_requests_per_day=round(summary.total_requests / window_days, 2),
             ),
             comparison=comparison,
+            chart_granularity=chart_granularity,
+            hourly=hourly,
             daily=daily,
             by_model=[
                 ModelCostEntry(

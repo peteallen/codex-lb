@@ -51,6 +51,8 @@ describe("QueueWaitChart", () => {
           { ...BASE_ROW, date: "2026-07-14", medianQueueMs: 420 },
           { ...BASE_ROW, date: "2026-07-15", medianQueueMs: 60 },
         ]}
+        hourly={[]}
+        chartGranularity="day"
       />,
     );
 
@@ -66,6 +68,8 @@ describe("QueueWaitChart", () => {
         startDate="2026-07-14"
         endDate="2026-07-16"
         data={[{ ...BASE_ROW, date: "2026-07-15", medianQueueMs: 90 }]}
+        hourly={[]}
+        chartGranularity="day"
       />,
     );
 

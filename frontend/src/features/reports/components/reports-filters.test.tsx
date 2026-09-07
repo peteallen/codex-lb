@@ -331,6 +331,35 @@ describe("ReportsFilters", () => {
     );
   });
 
+  it("switches cost and token chart options to hourly labels", async () => {
+    const user = userEvent.setup();
+    render(
+      <ReportsFilters
+        filters={FILTERS}
+        selectedPresetDays={1}
+        accountOptions={[]}
+        apiKeyOptions={[]}
+        modelOptions={[]}
+        useragentOptions={[]}
+        visibleChartIds={ALL_CHART_IDS}
+        chartGranularity="hour"
+        onVisibleChartIdsChange={vi.fn()}
+        onPresetSelect={vi.fn()}
+        onFiltersChange={vi.fn()}
+      />,
+    );
+
+    await user.click(screen.getByRole("button", { name: "Charts (5)" }));
+
+    expect(screen.getAllByRole("menuitemcheckbox").map((item) => item.textContent)).toEqual([
+      "Cost by Hour",
+      "Tokens by Hour",
+      "Time to First Token",
+      "Tokens per Second",
+      "Queue Wait",
+    ]);
+  });
+
   it("returns the other four chart IDs when Queue Wait is toggled off", async () => {
     const user = userEvent.setup();
     const onVisibleChartIdsChange = vi.fn();

@@ -44,6 +44,37 @@ class DailyReportAggregateRow:
 
 
 @dataclass(frozen=True)
+class HourlyReportAggregateRow:
+    hour: datetime
+    requests: int
+    input_tokens: int
+    output_tokens: int
+    cached_input_tokens: int
+    cost_usd: float
+    active_accounts: int
+    error_count: int
+    median_ttft_ms: float
+    median_tps: float
+    median_queue_ms: float
+
+
+@dataclass(frozen=True)
+class _ReportBucketAggregateRow:
+    label: str
+    requests: int
+    input_tokens: int
+    output_tokens: int
+    cached_input_tokens: int
+    cost_usd: float
+    active_accounts: int
+    error_count: int
+    median_ttft_ms: float
+    median_tps: float
+    median_queue_ms: float
+    conversation_count: int = 0
+
+
+@dataclass(frozen=True)
 class SummaryAggregateRow:
     total_cost_usd: float
     total_input_tokens: int
@@ -99,21 +130,83 @@ class ReportsRepository:
         if window_days > MAX_DAILY_REPORT_DAYS:
             raise DailyReportRangeTooLargeError(f"report date range must be {MAX_DAILY_REPORT_DAYS} days or less")
         day_ranges = list(_daily_bucket_ranges(start_date, end_date, timezone_info))
-        if not day_ranges:
+        rows = await self._aggregate_bucket_rows(
+            day_ranges,
+            account_ids,
+            model,
+            useragent_group,
+            api_key_ids,
+            include_conversations=True,
+        )
+        return [
+            DailyReportAggregateRow(
+                date=row.label,
+                requests=row.requests,
+                input_tokens=row.input_tokens,
+                output_tokens=row.output_tokens,
+                cached_input_tokens=row.cached_input_tokens,
+                cost_usd=row.cost_usd,
+                active_accounts=row.active_accounts,
+                error_count=row.error_count,
+                median_ttft_ms=row.median_ttft_ms,
+                median_tps=row.median_tps,
+                median_queue_ms=row.median_queue_ms,
+                conversation_count=row.conversation_count,
+            )
+            for row in rows
+        ]
+
+    async def aggregate_hourly_rows(
+        self,
+        start_date: date,
+        end_date: date,
+        timezone_info: ZoneInfo | timezone,
+        account_ids: list[str] | None = None,
+        model: str | None = None,
+        useragent_group: str | None = None,
+        api_key_ids: list[str] | None = None,
+    ) -> list[HourlyReportAggregateRow]:
+        hour_ranges = _hourly_bucket_ranges(start_date, end_date, timezone_info)
+        populated_rows = await self._aggregate_bucket_rows(
+            hour_ranges,
+            account_ids,
+            model,
+            useragent_group,
+            api_key_ids,
+            include_conversations=False,
+        )
+        rows_by_label = {row.label: row for row in populated_rows}
+
+        return [
+            _hourly_report_row(datetime.fromisoformat(label), rows_by_label.get(label))
+            for label, _hour_start, _hour_end in hour_ranges
+        ]
+
+    async def _aggregate_bucket_rows(
+        self,
+        bucket_ranges: list[tuple[str, datetime, datetime]],
+        account_ids: list[str] | None,
+        model: str | None,
+        useragent_group: str | None,
+        api_key_ids: list[str] | None,
+        *,
+        include_conversations: bool,
+    ) -> list[_ReportBucketAggregateRow]:
+        if not bucket_ranges:
             return []
 
         # Same filtered-vs-unfiltered split as `aggregate_summary`: only the
-        # unfiltered per-day conversation counts are served from the
+        # unfiltered per-bucket conversation counts are served from the
         # conversation satellite (one extra statement per batch, replacing
         # the raw COUNT(DISTINCT ...) column in the main statement).
-        use_rollup = not (account_ids or api_key_ids or model or useragent_group)
-        rows: list[DailyReportAggregateRow] = []
+        use_conversation_rollup = include_conversations and not (account_ids or api_key_ids or model or useragent_group)
+        rows: list[_ReportBucketAggregateRow] = []
         # SQLite caps compound SELECTs at 500 terms, so long report ranges are
         # executed in chunks instead of building a single oversized UNION ALL.
-        for day_ranges_batch in batched(day_ranges, _SQLITE_COMPOUND_SELECT_LIMIT):
-            day_ranges_list = list(day_ranges_batch)
+        for bucket_ranges_batch in batched(bucket_ranges, _SQLITE_COMPOUND_SELECT_LIMIT):
+            bucket_ranges_list = list(bucket_ranges_batch)
             speed_result = await self._session.execute(
-                _daily_speed_medians_stmt(day_ranges_list, account_ids, model, useragent_group, api_key_ids)
+                _daily_speed_medians_stmt(bucket_ranges_list, account_ids, model, useragent_group, api_key_ids)
             )
             speed_values = {
                 speed_row.report_date: (
@@ -124,10 +217,10 @@ class ReportsRepository:
                 for speed_row in speed_result.all()
             }
             conversation_values: dict[str, int] = {}
-            if use_rollup:
+            if use_conversation_rollup:
                 union = conversation_labeled_presence_union(
                     self._session,
-                    day_ranges_list,
+                    bucket_ranges_list,
                     raw_conditions=(_normal_traffic_clause(),),
                 ).subquery()
                 conversation_result = await self._session.execute(
@@ -137,17 +230,17 @@ class ReportsRepository:
 
             result = await self._session.execute(
                 _daily_rows_stmt(
-                    day_ranges_list,
+                    bucket_ranges_list,
                     account_ids,
                     model,
                     useragent_group,
                     api_key_ids,
-                    include_conversations=not use_rollup,
+                    include_conversations=include_conversations and not use_conversation_rollup,
                 )
             )
             rows.extend(
-                DailyReportAggregateRow(
-                    date=row.report_date,
+                _ReportBucketAggregateRow(
+                    label=row.report_date,
                     requests=int(row.requests or 0),
                     input_tokens=int(row.input_tokens or 0),
                     output_tokens=int(row.output_tokens or 0),
@@ -159,7 +252,9 @@ class ReportsRepository:
                     median_tps=speed_values.get(row.report_date, (0.0, 0.0, 0.0))[1],
                     median_queue_ms=speed_values.get(row.report_date, (0.0, 0.0, 0.0))[2],
                     conversation_count=(
-                        conversation_values.get(row.report_date, 0) if use_rollup else int(row.conversation_count or 0)
+                        conversation_values.get(row.report_date, 0)
+                        if use_conversation_rollup
+                        else int(row.conversation_count or 0)
                     ),
                 )
                 for row in result.all()
@@ -618,6 +713,8 @@ def _daily_rows_stmt(
     ]
     if include_conversations:
         columns.append(func.count(func.distinct(ReportsRepository._conversation_id_expr())).label("conversation_count"))
+    else:
+        columns.append(literal(0).label("conversation_count"))
     return (
         select(*columns)
         .select_from(
@@ -658,3 +755,56 @@ def _daily_bucket_ranges(
         )
         current_date += timedelta(days=1)
     return ranges
+
+
+def _hourly_bucket_ranges(
+    start_date: date,
+    end_date: date,
+    timezone_info: ZoneInfo | timezone,
+) -> list[tuple[str, datetime, datetime]]:
+    start_at = datetime.combine(start_date, datetime.min.time(), tzinfo=timezone_info)
+    end_at = datetime.combine(end_date + timedelta(days=1), datetime.min.time(), tzinfo=timezone_info)
+    current = start_at.astimezone(timezone.utc).replace(tzinfo=None)
+    final = end_at.astimezone(timezone.utc).replace(tzinfo=None)
+    ranges: list[tuple[str, datetime, datetime]] = []
+
+    while current < final:
+        next_hour = min(current + timedelta(hours=1), final)
+        local_hour = current.replace(tzinfo=timezone.utc).astimezone(timezone_info)
+        ranges.append((local_hour.isoformat(), current, next_hour))
+        current = next_hour
+
+    return ranges
+
+
+def _hourly_report_row(
+    hour: datetime,
+    row: _ReportBucketAggregateRow | None,
+) -> HourlyReportAggregateRow:
+    if row is None:
+        return HourlyReportAggregateRow(
+            hour=hour,
+            requests=0,
+            input_tokens=0,
+            output_tokens=0,
+            cached_input_tokens=0,
+            cost_usd=0.0,
+            active_accounts=0,
+            error_count=0,
+            median_ttft_ms=0.0,
+            median_tps=0.0,
+            median_queue_ms=0.0,
+        )
+    return HourlyReportAggregateRow(
+        hour=hour,
+        requests=row.requests,
+        input_tokens=row.input_tokens,
+        output_tokens=row.output_tokens,
+        cached_input_tokens=row.cached_input_tokens,
+        cost_usd=row.cost_usd,
+        active_accounts=row.active_accounts,
+        error_count=row.error_count,
+        median_ttft_ms=row.median_ttft_ms,
+        median_tps=row.median_tps,
+        median_queue_ms=row.median_queue_ms,
+    )

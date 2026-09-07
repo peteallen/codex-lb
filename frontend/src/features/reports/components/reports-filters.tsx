@@ -12,8 +12,10 @@ import {
 import { isReportDateRangeValid, localDateISO } from "../date";
 import {
   REPORT_CHART_DEFINITIONS,
+  getReportChartLabelKey,
   type ReportChartId,
 } from "../hooks/use-report-chart-visibility";
+import type { ReportChartGranularity } from "../schemas";
 
 export type ReportsFiltersState = {
   startDate: string;
@@ -32,6 +34,7 @@ export type ReportsFiltersProps = {
   modelOptions: MultiSelectOption[];
   useragentOptions: MultiSelectOption[];
   visibleChartIds: ReportChartId[];
+  chartGranularity?: ReportChartGranularity;
   onPresetSelect: (days: number) => void;
   onFiltersChange: (filters: ReportsFiltersState) => void;
   onVisibleChartIdsChange: (ids: string[]) => void;
@@ -51,14 +54,15 @@ export function ReportsFilters({
   modelOptions,
   useragentOptions,
   visibleChartIds,
+  chartGranularity = "day",
   onPresetSelect,
   onFiltersChange,
   onVisibleChartIdsChange,
 }: ReportsFiltersProps) {
   const { t } = useTranslation();
-  const chartOptions = REPORT_CHART_DEFINITIONS.map(({ id, labelKey }) => ({
-    value: id,
-    label: t(labelKey),
+  const chartOptions = REPORT_CHART_DEFINITIONS.map((definition) => ({
+    value: definition.id,
+    label: t(getReportChartLabelKey(definition, chartGranularity)),
   }));
   const maxDate = localDateISO();
   const dateRangeErrorId = useId();

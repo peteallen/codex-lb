@@ -317,6 +317,11 @@ class _ApiKeyUsageMixin:
                             input_tokens=input_tokens,
                             output_tokens=output_tokens,
                             cached_input_tokens=cached_input_tokens or 0,
+                            cache_write_tokens=(
+                                usage.input_tokens_details.cache_write_tokens or 0
+                                if usage and usage.input_tokens_details
+                                else 0
+                            ),
                             service_tier=service_tier,
                         )
                     else:
@@ -404,6 +409,7 @@ class _ApiKeyUsageMixin:
                             input_tokens=settlement.input_tokens,
                             output_tokens=settlement.output_tokens,
                             cached_input_tokens=settlement.cached_input_tokens or 0,
+                            cache_write_tokens=settlement.cache_write_tokens or 0,
                             service_tier=settlement.service_tier,
                         )
                     else:

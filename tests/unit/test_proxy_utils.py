@@ -27930,6 +27930,7 @@ async def test_stream_api_key_settlement_detaches_and_closes_repo(monkeypatch):
             "input_tokens": 12,
             "output_tokens": 34,
             "cached_input_tokens": 5,
+            "cache_write_tokens": 0,
             "service_tier": "default",
         }
     ]
@@ -34836,6 +34837,7 @@ async def test_compact_usage_settlement_surfaces_when_fail_safe_release_fails(mo
         input_tokens=7,
         output_tokens=3,
         cached_input_tokens=0,
+        cache_write_tokens=0,
         service_tier=None,
     )
     primary_service.release_usage_reservation.assert_not_awaited()
@@ -43225,3 +43227,53 @@ async def test_inline_http_bridge_image_urls_rejects_when_fetch_fails(monkeypatc
 
     assert exc_info.value.status_code == 400
     assert "image_download_failed" in json.dumps(exc_info.value.payload)
+
+
+@pytest.mark.asyncio
+async def test_websocket_completion_preserves_astra_cache_writes_for_log_and_settlement(monkeypatch):
+    request_logs = _RequestLogsRecorder()
+    service = proxy_service.ProxyService(_repo_factory(request_logs))
+    settle = AsyncMock(return_value=True)
+    monkeypatch.setattr(service, "_settle_stream_api_key_usage", settle)
+    monkeypatch.setattr(service._load_balancer, "record_success", AsyncMock())
+    account = _make_account("astra-ws")
+    state = proxy_service._WebSocketRequestState(
+        request_id="astra-ws-request",
+        response_id="resp_astra_ws",
+        model="gpt-6-astra",
+        service_tier="priority",
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=time.monotonic(),
+    )
+    pending = deque([state])
+    payload = {
+        "type": "response.completed",
+        "response": {
+            "id": "resp_astra_ws",
+            "status": "completed",
+            "service_tier": "default",
+            "usage": {
+                "input_tokens": 200_000,
+                "output_tokens": 100_000,
+                "input_tokens_details": {"cached_tokens": 100_000, "cache_write_tokens": 40_000},
+            },
+        },
+    }
+    await service._process_upstream_websocket_text(
+        json.dumps(payload),
+        account=account,
+        account_id_value=account.id,
+        pending_requests=pending,
+        pending_lock=anyio.Lock(),
+        api_key=None,
+        upstream_control=proxy_service._WebSocketUpstreamControl(),
+        response_create_gate=asyncio.Semaphore(1),
+    )
+    assert await service.drain_persistence_tasks(timeout_seconds=1)
+    assert len(request_logs.calls) == 1
+    assert request_logs.calls[0]["cache_write_tokens"] == 40_000
+    assert settle.await_args is not None
+    settlement = settle.await_args.args[2]
+    assert settlement.cache_write_tokens == 40_000
+    assert settlement.service_tier == "default"

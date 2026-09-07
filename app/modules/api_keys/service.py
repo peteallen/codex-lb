@@ -895,6 +895,7 @@ class ApiKeysService:
         input_tokens: int,
         output_tokens: int,
         cached_input_tokens: int = 0,
+        cache_write_tokens: int = 0,
         service_tier: str | None = None,
         cost_microdollars: int | None = None,
     ) -> None:
@@ -906,6 +907,7 @@ class ApiKeysService:
                     input_tokens=input_tokens,
                     output_tokens=output_tokens,
                     cached_input_tokens=cached_input_tokens,
+                    cache_write_tokens=cache_write_tokens,
                     service_tier=service_tier,
                     status="finalized",
                     cost_microdollars_override=cost_microdollars,
@@ -960,6 +962,7 @@ class ApiKeysService:
         service_tier: str | None,
         status: str,
         cost_microdollars_override: int | None = None,
+        cache_write_tokens: int = 0,
     ) -> None:
         async with sqlite_writer_section():
             reservation = await self._repository.get_usage_reservation(reservation_id)
@@ -987,6 +990,7 @@ class ApiKeysService:
                     effective_output_tokens,
                     effective_cached_input_tokens,
                     service_tier,
+                    cache_write_tokens=cache_write_tokens,
                 )
             )
 
@@ -1846,6 +1850,8 @@ def _calculate_cost_microdollars(
     output_tokens: int,
     cached_input_tokens: int,
     service_tier: str | None = None,
+    *,
+    cache_write_tokens: int = 0,
 ) -> int:
     resolved = get_pricing_for_model(model)
     if resolved is None:
@@ -1855,6 +1861,7 @@ def _calculate_cost_microdollars(
         input_tokens=float(input_tokens),
         output_tokens=float(output_tokens),
         cached_input_tokens=float(cached_input_tokens),
+        cache_write_tokens=float(cache_write_tokens),
     )
     cost_usd = calculate_cost_from_usage(usage, price, service_tier=service_tier)
     if cost_usd is None:

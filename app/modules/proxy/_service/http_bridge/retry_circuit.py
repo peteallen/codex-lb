@@ -146,7 +146,11 @@ class _HTTPBridgeRetryCircuitMixin:
             return True
 
         cooldown_remaining = max(0.0, persisted.cooldown_until_epoch - now_epoch)
-        persisted_cooldown_until = now_monotonic + cooldown_remaining
+        # ``cooldown_until`` doubles as the "cooldown is armed" sentinel (tested as
+        # ``> 0``), and ``now_monotonic`` is a large positive float. Rehydrating an
+        # already-expired row as ``now_monotonic + 0.0`` therefore reads as armed and
+        # spuriously leases a half-open window. Keep 0.0 meaning "not armed".
+        persisted_cooldown_until = now_monotonic + cooldown_remaining if cooldown_remaining > 0.0 else 0.0
         async with self._http_bridge_retry_circuit_lock:
             self._http_bridge_retry_circuit_persisted_keys.add(session.key)
             state = self._http_bridge_retry_circuits.get(session.key)
@@ -212,7 +216,10 @@ class _HTTPBridgeRetryCircuitMixin:
                 ),
             )
             if persisted is not None:
-                persisted_cooldown_until = now_monotonic + max(0.0, persisted.cooldown_until_epoch - now_wall)
+                persisted_cooldown_remaining = max(0.0, persisted.cooldown_until_epoch - now_wall)
+                persisted_cooldown_until = (
+                    now_monotonic + persisted_cooldown_remaining if persisted_cooldown_remaining > 0.0 else 0.0
+                )
                 async with self._http_bridge_retry_circuit_lock:
                     current = self._http_bridge_retry_circuits.get(session.key)
                     if current is state:

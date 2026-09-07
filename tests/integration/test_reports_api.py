@@ -669,6 +669,26 @@ async def test_reports_api_interprets_dates_in_requested_timezone(async_client, 
     assert payload["summary"]["totalRequests"] == 2
     assert payload["summary"]["totalInputTokens"] == 5
     assert payload["summary"]["totalCostUsd"] == 0.5
+    assert payload["chartGranularity"] == "hour"
+    assert len(payload["hourly"]) == 24
+    assert payload["hourly"][0] == {
+        "hour": "2026-06-01T00:00:00-07:00",
+        "requests": 1,
+        "inputTokens": 2,
+        "outputTokens": 1,
+        "cachedInputTokens": 0,
+        "costUsd": 0.2,
+        "activeAccounts": 1,
+        "errorCount": 0,
+        "medianTtftMs": 0.0,
+        "medianTps": 0.0,
+        "medianQueueMs": 0.0,
+    }
+    assert payload["hourly"][1]["hour"] == "2026-06-01T01:00:00-07:00"
+    assert payload["hourly"][1]["requests"] == 0
+    assert payload["hourly"][-1]["hour"] == "2026-06-01T23:00:00-07:00"
+    assert payload["hourly"][-1]["requests"] == 1
+    assert payload["hourly"][-1]["inputTokens"] == 3
     assert payload["daily"] == [
         {
             "activeAccounts": 1,
@@ -1022,6 +1042,9 @@ async def test_reports_api_uses_dst_aware_boundaries_for_requested_timezone(asyn
     assert payload["summary"]["totalRequests"] == 2
     assert payload["summary"]["totalInputTokens"] == 5
     assert payload["summary"]["totalCostUsd"] == 0.5
+    assert payload["chartGranularity"] == "hour"
+    assert len(payload["hourly"]) == 23
+    assert not any(row["hour"].startswith("2026-03-08T02:00:00") for row in payload["hourly"])
     assert payload["daily"] == [
         {
             "activeAccounts": 1,
@@ -1597,6 +1620,8 @@ async def test_reports_api_summary_counts_range_accounts_and_calendar_days(async
     assert payload["summary"]["activeAccounts"] == 2
     assert payload["summary"]["avgCostPerDay"] == 0.5
     assert payload["summary"]["avgRequestsPerDay"] == 0.67
+    assert payload["chartGranularity"] == "day"
+    assert payload["hourly"] == []
 
 
 async def test_reports_api_supports_useragent_group_filter_and_breakdown(async_client, db_setup):

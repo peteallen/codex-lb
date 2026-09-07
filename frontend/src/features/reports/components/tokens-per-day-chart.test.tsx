@@ -47,6 +47,8 @@ describe("TokensPerDayChart", () => {
             errorCount: 0,
           },
         ]}
+        hourly={[]}
+        chartGranularity="day"
       />,
     );
 
@@ -82,6 +84,8 @@ describe("TokensPerDayChart", () => {
             errorCount: 0,
           },
         ]}
+        hourly={[]}
+        chartGranularity="day"
       />,
     );
 
