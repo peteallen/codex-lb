@@ -3486,6 +3486,7 @@ async def test_http_bridge_model_capacity_waits_before_retrying_safe_injected_an
         assert kwargs == {
             "emit_keepalives": True,
             "error_message": capacity_message,
+            "error_code": "rate_limit_exceeded",
             "cancel_when_detached": True,
         }
         assert request_state.previous_response_id == "resp-proxy-injected"

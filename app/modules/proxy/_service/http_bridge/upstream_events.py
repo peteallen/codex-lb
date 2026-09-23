@@ -446,7 +446,9 @@ async def _wait_before_http_bridge_model_capacity_retry(
         return False
     if request_state.overload_recovery_pending:
         # Account selection applies the cooldown and tries alternate capacity
-        # before waiting. Keep the deadline and detach checks here.
+        # before waiting. Keep propagated HTTP errors hidden while the retry
+        # owns the request, just as the bounded wait below does.
+        request_state.account_capacity_wait_suppress_keepalive = not emit_keepalives
         return not cancel_when_detached or (
             request_state.event_queue is not None and not request_state.draining_until_terminal
         )
@@ -1877,6 +1879,7 @@ class _HTTPBridgeUpstreamEventsMixin:
                     status_request_state,
                     emit_keepalives=not status_request_state.propagate_http_errors,
                     error_message=retry_error_message,
+                    error_code=retry_upstream_error_code,
                     cancel_when_detached=True,
                 )
                 if wait_request_had_event_queue and status_request_state.event_queue is None:

@@ -30,4 +30,3 @@ Recovery MUST preserve file and upstream-state ownership unless a complete accou
 #### Scenario: Cancelled overload waiter releases resources
 - **WHEN** the downstream cancels while overload recovery is waiting
 - **THEN** waiting stops promptly and admission, stream leases, and the logical API-key reservation are released or settled exactly once
-

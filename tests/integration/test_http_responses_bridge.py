@@ -12384,9 +12384,10 @@ async def test_v1_responses_http_bridge_surfaces_upstream_error_event_as_http_40
             prefer_earlier_reset_accounts,
             routing_strategy,
             model,
-            exclude_account_ids,
             additional_limit_name,
         )
+        if exclude_account_ids and account.id in exclude_account_ids:
+            return AccountSelection(account=None, error_message="No accounts available", error_code="no_accounts")
         return AccountSelection(account=account, error_message=None, error_code=None)
 
     async def fake_ensure_fresh_with_budget(self, target, *, force=False, timeout_seconds):

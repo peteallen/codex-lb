@@ -25195,7 +25195,9 @@ async def test_process_upstream_websocket_text_retries_account_model_rejection_w
     assert upstream_control.replay_request_state is pending_request
     assert pending_request.excluded_account_ids == {account.id}
     assert pending_request.replay_count == 0
-    assert pending_request.affinity_policy.reallocate_sticky is True
+    # The fresh request body is proven account-neutral, so recovery drops any
+    # owner affinity and relies on the request-local exclusion instead.
+    assert pending_request.affinity_policy.reallocate_sticky is False
     assert pending_request.precreated_replay_reason == "account_model_unsupported"
     assert pending_request.precreated_replay_account_id == account.id
     assert pending_request.error_http_status_override == 400
