@@ -267,7 +267,7 @@ export function RecentRequestsTable({
               const firstToken = firstTokenDisplay(request);
 
               return (
-                <TableRow key={request.requestId}>
+                <TableRow key={request.logId}>
                   <TableCell className="dashboard-table-time pl-4 align-top" data-mobile-label={t("dashboard.requests.columns.time")}>
                     <span className="dashboard-mobile-label" aria-hidden="true">{t("dashboard.requests.columns.time")}</span>
                     <div className="leading-tight">

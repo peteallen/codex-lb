@@ -175,6 +175,7 @@ const RequestLogCostBreakdownSchema = z.object({
 });
 
 export const RequestLogSchema = z.object({
+  logId: z.string().min(1),
   requestedAt: z.iso.datetime({ offset: true }),
   accountId: z.string().nullable(),
   planType: z.string().nullable().optional().default(null),

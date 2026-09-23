@@ -226,6 +226,7 @@ describe("RequestLogsResponseSchema", () => {
     const parsed = RequestLogsResponseSchema.parse({
       requests: [
         {
+          logId: "log-1",
           requestedAt: ISO,
           accountId: "acc-1",
           planType: "plus",
@@ -296,6 +297,7 @@ describe("RequestLogsResponseSchema", () => {
     const parsed = RequestLogsResponseSchema.parse({
       requests: [
         {
+          logId: "log-2",
           requestedAt: ISO,
           accountId: "acc-1",
           requestId: "req-1",
@@ -321,6 +323,7 @@ describe("RequestLogsResponseSchema", () => {
     const parsed = RequestLogsResponseSchema.parse({
       requests: [
         {
+          logId: "log-3",
           requestedAt: ISO,
           accountId: "acc-1",
           planType: "plus",
@@ -353,6 +356,7 @@ describe("RequestLogsResponseSchema", () => {
     const parsed = RequestLogsResponseSchema.parse({
       requests: [
         {
+          logId: "log-4",
           requestedAt: ISO,
           accountId: "acc-live",
           planType: "plus",
@@ -409,6 +413,7 @@ describe("RequestLogsResponseSchema", () => {
     const parsed = RequestLogsResponseSchema.parse({
       requests: [
         {
+          logId: "log-5",
           requestedAt: ISO,
           accountId: "acc-1",
           planType: "plus",
@@ -445,6 +450,7 @@ describe("RequestLogsResponseSchema", () => {
     const parsed = RequestLogsResponseSchema.parse({
       requests: [
         {
+          logId: "log-6",
           requestedAt: ISO,
           accountId: "acc-1",
           planType: "plus",
@@ -479,6 +485,7 @@ describe("RequestLogsResponseSchema", () => {
     const parsed = RequestLogsResponseSchema.parse({
       requests: [
         {
+          logId: "log-7",
           requestedAt: ISO,
           accountId: "acc-1",
           requestId: "req-cid",
@@ -494,6 +501,7 @@ describe("RequestLogsResponseSchema", () => {
           conversationId: "conv_abc123",
         },
         {
+          logId: "log-8",
           requestedAt: ISO,
           accountId: null,
           requestId: "req-no-cid",
@@ -526,6 +534,7 @@ describe("RequestLogsResponseSchema", () => {
     const parsed = RequestLogsResponseSchema.parse({
       requests: [
         {
+          logId: "log-9",
           requestedAt: ISO,
           accountId: "acc-1",
           requestId: "req-cid-null",
@@ -552,6 +561,7 @@ describe("RequestLogsResponseSchema", () => {
     const parsed = RequestLogsResponseSchema.parse({
       requests: [
         {
+          logId: "log-10",
           requestedAt: ISO,
           accountId: "acc-1",
           requestId: "req-no-conv-key",
@@ -577,6 +587,7 @@ describe("RequestLogsResponseSchema", () => {
     const parsed = RequestLogsResponseSchema.parse({
       requests: [
         {
+          logId: "log-11",
           requestedAt: ISO,
           accountId: "acc-1",
           planType: "plus",
