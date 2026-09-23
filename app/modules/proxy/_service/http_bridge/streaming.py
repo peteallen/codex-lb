@@ -1515,6 +1515,10 @@ class _HTTPBridgeStreamingMixin:
                 and payload.previous_response_id is None
                 and not payload.conversation
                 and bridge_session_key.strength == "hard"
+                # A hard session-header key also isolates ordinary OpenAI
+                # requests. It does not by itself grant conversation continuity
+                # that the same request would lack on a live connection.
+                and (affinity.kind == StickySessionKind.CODEX_SESSION or durable_anchor_trimmable)
                 and durable_lookup.latest_response_id is not None
                 and (not payload_looks_like_full_resend or durable_anchor_trimmable)
             )

@@ -147,6 +147,7 @@ from app.modules.proxy._service.support import (
     _request_log_client_fields,
     _websocket_request_can_replay_before_visible_output,
     _WebSocketRequestState,
+    overload_replay_is_account_neutral,
 )
 from app.modules.proxy._service.support import (
     _websocket_route_log_kwargs as _websocket_route_log_kwargs,
@@ -188,7 +189,10 @@ from app.modules.proxy.affinity import (
     _sticky_key_from_turn_state_header,
 )
 from app.modules.proxy.api_key_usage import estimate_api_key_request_usage
-from app.modules.proxy.continuity import is_http_bridge_account_neutral_replay
+from app.modules.proxy.continuity import (
+    is_http_bridge_account_neutral_replay,
+    without_http_bridge_session_affinity_headers,
+)
 from app.modules.proxy.durable_bridge_repository import (
     DurableBridgeAliasRegistration,
     DurableBridgeAliasRegistrationReceipt,
@@ -2011,7 +2015,10 @@ class _HTTPBridgeRequestSubmitMixin:
         )
 
         def request_is_retryable(request_state: _WebSocketRequestState) -> bool:
-            if _websocket_request_can_replay_before_visible_output(request_state):
+            if _websocket_request_can_replay_before_visible_output(
+                request_state,
+                allow_overload_retry=request_state.overload_recovery_pending,
+            ):
                 return True
             if (
                 clean_close_retry_max_count <= 0
@@ -2028,10 +2035,12 @@ class _HTTPBridgeRequestSubmitMixin:
             return _websocket_request_can_replay_before_visible_output(
                 request_state,
                 allow_clean_close_retry=True,
+                allow_overload_retry=request_state.overload_recovery_pending,
             )
 
         fresh_hard_request_account_switch_candidate = False
         proof_gated_continuity_replay_candidate = False
+        overload_retry_candidate = False
         if session.key.strength == "hard":
             async with session.pending_lock:
                 retryable_candidates = [
@@ -2047,7 +2056,10 @@ class _HTTPBridgeRequestSubmitMixin:
                         and not candidate.proxy_injected_previous_response_id
                         and not candidate.file_required_preferred_account
                         and candidate.response_event_count == 0
-                        and candidate.replay_count == 0
+                        and (
+                            candidate.replay_count == 0
+                            or candidate.precreated_replay_reason == _ACCOUNT_MODEL_UNSUPPORTED_ERROR_CODE
+                        )
                     )
                     proof_gated_continuity_replay_candidate = (
                         candidate.previous_response_id is not None
@@ -2056,7 +2068,20 @@ class _HTTPBridgeRequestSubmitMixin:
                         and candidate.response_event_count == 0
                         and candidate.replay_count == 0
                     )
-        if not await self._http_bridge_precreated_retry_allowed(
+                    if candidate.overload_recovery_pending:
+                        overload_retry_candidate = True
+                        # An explicit overload is held separately from the
+                        # ordinary replay circuit. The account cooldown is
+                        # the temporary exclusion; preserving an ID in the
+                        # request set would make a single-account bridge
+                        # permanently unroutable after the cooldown expires.
+                        fresh_hard_request_account_switch_candidate = (
+                            candidate.previous_response_id is None
+                            and not candidate.hard_continuity_anchor
+                            and not candidate.proxy_injected_previous_response_id
+                            and not candidate.file_required_preferred_account
+                        )
+        if not overload_retry_candidate and not await self._http_bridge_precreated_retry_allowed(
             session,
             allow_fresh_hard_account_switch=fresh_hard_request_account_switch_candidate,
             allow_proof_gated_continuity_replay=proof_gated_continuity_replay_candidate,
@@ -2088,8 +2113,26 @@ class _HTTPBridgeRequestSubmitMixin:
                     return False
                 request_state = retryable_requests[0]
             model_fallback_replay = request_state.precreated_replay_reason == _ACCOUNT_MODEL_UNSUPPORTED_ERROR_CODE
-            if request_state.previous_response_id is not None and not (
-                request_state.fresh_upstream_request_is_retry_safe and request_state.fresh_upstream_request_text
+            overload_recovery = request_state.overload_recovery_pending
+            movable_overload = overload_recovery and overload_replay_is_account_neutral(request_state)
+            if overload_recovery:
+                hard_owner_bound = not movable_overload
+                if movable_overload:
+                    _prepare_websocket_request_state_for_account_switch(request_state)
+                    request_state.preferred_account_id = None
+                    request_state.affinity_policy = _AffinityPolicy()
+                    session.affinity = _AffinityPolicy()
+                    session.upstream_turn_state = None
+                    session.downstream_turn_state = None
+                    session.headers = without_http_bridge_session_affinity_headers(session.headers)
+                else:
+                    request_state.preferred_account_id = session.account.id
+            if (
+                request_state.previous_response_id is not None
+                and not (
+                    request_state.fresh_upstream_request_is_retry_safe and request_state.fresh_upstream_request_text
+                )
+                and not (overload_recovery and request_state.preferred_account_id is not None)
             ):
                 # Once a continuation is pending upstream, reconnecting without
                 # replay cannot complete the current request, while replaying it
@@ -2105,11 +2148,12 @@ class _HTTPBridgeRequestSubmitMixin:
             close_generation = session.last_upstream_close_generation
             hard_session_affinity = session.key.strength == "hard"
             fresh_hard_request_account_switch_allowed = (
-                hard_session_affinity
+                (movable_overload or hard_session_affinity)
                 and request_state.previous_response_id is None
                 and not request_state.hard_continuity_anchor
                 and not request_state.proxy_injected_previous_response_id
                 and not request_state.file_required_preferred_account
+                and (not overload_recovery or movable_overload)
             )
             clean_close_hard_continuation = (
                 close_classification == "clean"
@@ -2130,7 +2174,12 @@ class _HTTPBridgeRequestSubmitMixin:
                 and request_state.response_event_count == 0
                 and request_state.clean_close_replay_count < clean_close_retry_max_count
             )
-            if request_state.replay_count >= 1 and not additional_clean_close_retry:
+            if (
+                request_state.replay_count >= 1
+                and not additional_clean_close_retry
+                and not overload_recovery
+                and not model_fallback_replay
+            ):
                 return False
             if request_state.previous_response_id is not None:
                 require_preferred_reconnect = False
@@ -2147,24 +2196,33 @@ class _HTTPBridgeRequestSubmitMixin:
                     fresh_retry_safe = request_state.fresh_upstream_request_is_retry_safe
                     request_state.fresh_upstream_request_is_retry_safe = False
                     try:
-                        request_text = _prepare_websocket_request_state_for_visible_output_replay(request_state)
+                        request_text = _prepare_websocket_request_state_for_visible_output_replay(
+                            request_state,
+                            overload_recovery=overload_recovery,
+                        )
                     finally:
                         request_state.fresh_upstream_request_is_retry_safe = fresh_retry_safe
                     if request_text is None:
                         return False
                     require_preferred_reconnect = request_state.preferred_account_id is not None
                 else:
-                    request_text = _prepare_websocket_request_state_for_visible_output_replay(request_state)
+                    request_text = _prepare_websocket_request_state_for_visible_output_replay(
+                        request_state,
+                        overload_recovery=overload_recovery,
+                    )
                     if request_text is None:
                         return False
-                    if not hard_owner_bound:
+                    if (model_fallback_replay or not hard_owner_bound) and not overload_recovery:
                         request_state.excluded_account_ids.add(session.account.id)
             else:
                 # Account-scoped uploaded files cannot be replayed on a
                 # different owner. Keep the preferred account mandatory for
                 # both silent recovery and clean-close recovery.
                 require_preferred_reconnect = account_neutral_recovery or request_state.file_required_preferred_account
-                request_text = _prepare_websocket_request_state_for_visible_output_replay(request_state)
+                request_text = _prepare_websocket_request_state_for_visible_output_replay(
+                    request_state,
+                    overload_recovery=overload_recovery,
+                )
                 if request_text is None:
                     return False
                 if account_neutral_recovery:
@@ -2174,7 +2232,8 @@ class _HTTPBridgeRequestSubmitMixin:
                         request_state.preferred_account_id = session.account.id
                     else:
                         request_state.preferred_account_id = None
-                        request_state.excluded_account_ids.add(session.account.id)
+                        if not overload_recovery:
+                            request_state.excluded_account_ids.add(session.account.id)
             if session.account.id in request_state.excluded_account_ids:
                 session.upstream_turn_state = None
                 session.downstream_turn_state = None
@@ -2204,6 +2263,9 @@ class _HTTPBridgeRequestSubmitMixin:
         )
         reconnect_reader_kwargs = {"restart_reader": True} if restart_reader else {}
         try:
+            if overload_recovery and session.account_lease is not None:
+                await self._load_balancer.release_account_lease(session.account_lease)
+                session.account_lease = None
             if retry_jitter_seconds > 0:
                 logger.info(
                     "HTTP bridge clean-close retry jitter request_id=%s sleep_seconds=%.3f",

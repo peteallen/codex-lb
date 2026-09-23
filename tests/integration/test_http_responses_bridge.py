@@ -21,6 +21,7 @@ from sqlalchemy import select
 
 import app.modules.proxy.load_balancer as load_balancer_module
 import app.modules.proxy.service as proxy_module
+from app.core.balancer import UPSTREAM_OVERLOAD_COOLDOWN_ERROR_CODE
 from app.core.config.settings import Settings
 from app.core.openai.model_registry import ModelRegistry
 from app.core.utils.request_id import (
@@ -34,6 +35,7 @@ from app.db.models import Account, AccountStatus, DashboardSettings, HttpBridgeS
 from app.db.session import SessionLocal
 from app.dependencies import get_proxy_service_for_app
 from app.modules.proxy._service import support as proxy_support
+from app.modules.proxy._service.http_bridge import mixin as http_bridge_mixin
 from app.modules.proxy._service.http_bridge import quarantine as http_bridge_quarantine_module
 from app.modules.proxy._service.http_bridge import streaming as http_bridge_streaming_module
 from app.modules.proxy._service.http_bridge.helpers import (
@@ -817,6 +819,18 @@ class _CompleteThenReasoningAbruptCloseUpstreamWebSocket(_ReasoningThenAbruptClo
 
 
 class _ErrorOnlyUpstreamWebSocket(_FakeBridgeUpstreamWebSocket):
+    def __init__(
+        self,
+        *,
+        error_code: str = "invalid_request_error",
+        error_message: str = (
+            "The 'gpt-5.3-codex-spark' model is not supported when using Codex with a ChatGPT account."
+        ),
+    ) -> None:
+        super().__init__()
+        self._error_code = error_code
+        self._error_message = error_message
+
     async def send_text(self, text: str) -> None:
         self.sent_text.append(text)
         await self._messages.put(
@@ -828,11 +842,8 @@ class _ErrorOnlyUpstreamWebSocket(_FakeBridgeUpstreamWebSocket):
                         "status": 400,
                         "error": {
                             "type": "invalid_request_error",
-                            "code": "invalid_request_error",
-                            "message": (
-                                "The 'gpt-5.3-codex-spark' model is not supported when using Codex "
-                                "with a ChatGPT account."
-                            ),
+                            "code": self._error_code,
+                            "message": self._error_message,
                         },
                     },
                     separators=(",", ":"),
@@ -1678,6 +1689,80 @@ class _FailingSendThenCloseUpstreamWebSocket(_FakeBridgeUpstreamWebSocket):
         self.sent_text.append(text)
         await self._messages.put(_FakeUpstreamMessage("close", close_code=1011))
         raise RuntimeError("socket closed during send")
+
+
+@pytest.mark.asyncio
+async def test_http_bridge_creation_waits_for_upstream_overload_recovery(
+    async_client,
+    app_instance,
+    monkeypatch,
+):
+    _install_bridge_settings_with_limits(monkeypatch, enabled=True)
+    account_id = await _import_account(
+        async_client,
+        "acc_http_bridge_overload_selection",
+        "http-bridge-overload-selection@example.com",
+    )
+    account = await _get_account(account_id)
+    service = get_proxy_service_for_app(app_instance)
+    payload = proxy_module.ResponsesRequest.model_validate(
+        {"model": "gpt-5.4", "instructions": "Be helpful.", "input": [{"role": "user", "content": "hello"}]}
+    )
+    affinity = proxy_module._AffinityPolicy()
+    key = proxy_module._make_http_bridge_session_key(
+        payload,
+        headers={},
+        affinity=affinity,
+        api_key=None,
+        request_id="req_bridge_overload_selection",
+    )
+    selections = 0
+    waits: list[str | None] = []
+
+    async def select_account(deadline, **kwargs):
+        nonlocal selections
+        del deadline, kwargs
+        selections += 1
+        if selections == 1:
+            return proxy_module.AccountSelection(
+                account=None,
+                error_message="Upstream accounts are overloaded. Try again in 1s",
+                error_code=UPSTREAM_OVERLOAD_COOLDOWN_ERROR_CODE,
+            )
+        return proxy_module.AccountSelection(account=account, error_message=None, error_code=None)
+
+    async def wait_for_recovery(selection, **kwargs):
+        del kwargs
+        waits.append(selection.error_code)
+        return True
+
+    async def ensure_fresh(target, **kwargs):
+        del kwargs
+        return target
+
+    async def open_upstream(target, headers, **kwargs):
+        del target, headers, kwargs
+        return _FakeBridgeUpstreamWebSocket("resp_bridge_overload_selection")
+
+    monkeypatch.setattr(service, "_select_account_with_budget_compatible", select_account)
+    monkeypatch.setattr(http_bridge_mixin, "_sleep_for_account_selection_recovery", wait_for_recovery)
+    monkeypatch.setattr(service, "_ensure_fresh_with_budget", ensure_fresh)
+    monkeypatch.setattr(service, "_open_upstream_websocket_with_budget", open_upstream)
+
+    session = await service._create_http_bridge_session(
+        key,
+        headers={},
+        affinity=affinity,
+        api_key=None,
+        request_model=payload.model,
+        idle_ttl_seconds=120.0,
+    )
+    try:
+        assert selections == 2
+        assert waits == [UPSTREAM_OVERLOAD_COOLDOWN_ERROR_CODE]
+        assert session.account.id == account.id
+    finally:
+        await service._close_http_bridge_session(session)
 
 
 def _make_dummy_bridge_session(session_key: proxy_module._HTTPBridgeSessionKey) -> proxy_module._HTTPBridgeSession:
@@ -8996,6 +9081,90 @@ async def test_v1_responses_http_bridge_prefers_session_header_for_isolation(asy
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("continuity", ["none", "previous_response", "turn_state"])
+async def test_v1_session_isolation_does_not_inject_stale_anchor_after_reconnect(
+    async_client, app_instance, monkeypatch, stream, continuity
+):
+    _install_bridge_settings(monkeypatch, enabled=True)
+    account = await _get_account(
+        await _import_account(async_client, "implicit-continuity", "implicit-continuity@example.com")
+    )
+    service = get_proxy_service_for_app(app_instance)
+    upstreams = []
+
+    class RejectUnexpectedAnchor(_FakeBridgeUpstreamWebSocket):
+        async def send_text(self, text):
+            if continuity == "none" and json.loads(text).get("previous_response_id"):
+                self.sent_text.append(text)
+                await self._messages.put(
+                    _FakeUpstreamMessage(
+                        "text",
+                        text=json.dumps(
+                            {
+                                "type": "error",
+                                "error": {
+                                    "code": "previous_response_not_found",
+                                    "message": "Previous response not found",
+                                    "param": "previous_response_id",
+                                },
+                            }
+                        ),
+                    )
+                )
+                return
+            await super().send_text(text)
+
+    async def select_account(deadline, **kwargs):
+        return AccountSelection(account=account, error_message=None, error_code=None)
+
+    async def ensure_fresh(target, **kwargs):
+        return target
+
+    async def connect(headers, access_token, account_id_header, **kwargs):
+        upstream = RejectUnexpectedAnchor(f"resp_isolation_{len(upstreams)}")
+        upstreams.append(upstream)
+        return upstream
+
+    monkeypatch.setattr(service, "_select_account_with_budget", select_account)
+    monkeypatch.setattr(service, "_ensure_fresh_with_budget", ensure_fresh)
+    monkeypatch.setattr(proxy_module, "connect_responses_websocket", connect)
+    headers = {"session_id": "independent-http-session"}
+    body = {"model": "gpt-5.1", "input": [{"role": "user", "content": "first request"}], "stream": stream}
+
+    async def submit():
+        response = await async_client.post("/v1/responses", json=body, headers=headers)
+        assert response.status_code == 200, response.text
+        if stream:
+            events = [json.loads(line[6:]) for line in response.text.splitlines() if line.startswith("data: {")]
+            assert events[-1]["type"] == "response.completed", events
+            return events[-1]["response"]["id"], response.headers
+        return response.json()["id"], response.headers
+
+    first_id, first_headers = await submit()
+    if continuity == "previous_response":
+        body["previous_response_id"] = first_id
+    elif continuity == "turn_state":
+        headers["x-codex-turn-state"] = first_headers["x-codex-turn-state"]
+    body["input"] = [{"role": "user", "content": "second request"}]
+    second_id, _ = await submit()
+    assert len(upstreams) == 1
+    if continuity == "previous_response":
+        body["previous_response_id"] = second_id
+    session = next(iter(service._http_bridge_sessions.values()))
+    await service._close_http_bridge_session(session)
+    body["input"] = [{"role": "user", "content": "third request"}]
+    await submit()
+    assert len(upstreams) == 2
+    sent = json.loads(upstreams[-1].sent_text[0])
+    assert sent["input"] == body["input"]
+    if continuity == "none":
+        assert "previous_response_id" not in sent
+    else:
+        assert sent["previous_response_id"] == second_id
+
+
+@pytest.mark.asyncio
 async def test_v1_responses_http_bridge_retries_once_when_upstream_closes_before_response_created(
     async_client,
     monkeypatch,
@@ -12261,9 +12430,35 @@ async def test_v1_responses_http_bridge_surfaces_upstream_error_event_as_http_40
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("replacement_available", [True, False], ids=["replacement", "no-replacement"])
+@pytest.mark.parametrize(
+    ("model", "error_code", "error_message"),
+    [
+        (
+            "gpt-5.3-codex-spark",
+            "invalid_request_error",
+            "The 'gpt-5.3-codex-spark' model is not supported when using Codex with a ChatGPT account.",
+        ),
+        (
+            "gpt-6-sol",
+            "model_not_found",
+            "The model `gpt-6-sol` does not exist or you do not have access to it.",
+        ),
+        (
+            "gpt-6-luna",
+            "model_not_found",
+            "The model `gpt-6-luna` does not exist or you do not have access to it.",
+        ),
+    ],
+    ids=["legacy", "gpt-6-sol", "gpt-6-luna"],
+)
 async def test_v1_responses_http_bridge_retries_stale_account_model_route_on_another_account(
     async_client,
     monkeypatch,
+    replacement_available,
+    model,
+    error_code,
+    error_message,
 ):
     _install_bridge_settings(monkeypatch, enabled=True)
     first_account_id = await _import_account(
@@ -12278,7 +12473,7 @@ async def test_v1_responses_http_bridge_retries_stale_account_model_route_on_ano
     )
     first_account = await _get_account(first_account_id)
     second_account = await _get_account(second_account_id)
-    first_upstream = _ErrorOnlyUpstreamWebSocket()
+    first_upstream = _ErrorOnlyUpstreamWebSocket(error_code=error_code, error_message=error_message)
     second_upstream = _FakeBridgeUpstreamWebSocket()
     connect_calls: list[str | None] = []
     selection_exclusions: list[set[str]] = []
@@ -12288,8 +12483,15 @@ async def test_v1_responses_http_bridge_retries_stale_account_model_route_on_ano
         del self, deadline
         excluded = set(cast(set[str], kwargs.get("exclude_account_ids") or set()))
         selection_exclusions.append(excluded)
-        account = second_account if first_account.id in excluded else first_account
-        return AccountSelection(account=account, error_message=None, error_code=None)
+        if first_account.id in excluded:
+            if not replacement_available:
+                return AccountSelection(
+                    account=None,
+                    error_message="No available accounts",
+                    error_code="no_accounts",
+                )
+            return AccountSelection(account=second_account, error_message=None, error_code=None)
+        return AccountSelection(account=first_account, error_message=None, error_code=None)
 
     async def fake_ensure_fresh_with_budget(self, target, *, force=False, timeout_seconds):
         del self, force, timeout_seconds
@@ -12312,30 +12514,148 @@ async def test_v1_responses_http_bridge_retries_stale_account_model_route_on_ano
     monkeypatch.setattr(proxy_module.ProxyService, "_handle_stream_error", handle_stream_error)
     monkeypatch.setattr(proxy_module, "connect_responses_websocket", fake_connect_responses_websocket)
 
-    events = await _collect_sse_events(
-        async_client,
-        "/v1/responses",
-        json_body={
-            "model": "gpt-5.3-codex-spark",
-            "instructions": "Return exactly OK.",
-            "input": "hello",
-            "prompt_cache_key": "http-bridge-account-model-retry-key",
-            "stream": True,
-        },
-    )
+    request_body = {
+        "model": model,
+        "instructions": "Return exactly OK.",
+        "input": "hello",
+        "prompt_cache_key": "http-bridge-account-model-retry-key",
+        "stream": True,
+    }
+    if replacement_available:
+        events = await _collect_sse_events(async_client, "/v1/responses", json_body=request_body)
+        response_error = None
+    else:
+        response = await async_client.post("/v1/responses", json=request_body)
+        assert response.status_code == 400
+        events = []
+        response_error = response.json()["error"]
 
-    _assert_created_text_delta_completed(events)
-    assert len(connect_calls) == 2
     assert selection_exclusions[0] == set()
     assert first_account.id in selection_exclusions[-1]
-    assert first_upstream.closed is True
+    assert len(connect_calls) == (2 if replacement_available else 1)
     assert len(first_upstream.sent_text) == 1
-    assert len(second_upstream.sent_text) == 1
-    first_payload = json.loads(first_upstream.sent_text[0])
-    second_payload = json.loads(second_upstream.sent_text[0])
-    first_payload.get("client_metadata", {}).pop("x-codex-installation-id", None)
-    second_payload.get("client_metadata", {}).pop("x-codex-installation-id", None)
-    assert first_payload == second_payload
+    if replacement_available:
+        _assert_created_text_delta_completed(events)
+        assert first_upstream.closed is True
+        assert len(second_upstream.sent_text) == 1
+        first_payload = json.loads(first_upstream.sent_text[0])
+        second_payload = json.loads(second_upstream.sent_text[0])
+        first_payload.get("client_metadata", {}).pop("x-codex-installation-id", None)
+        second_payload.get("client_metadata", {}).pop("x-codex-installation-id", None)
+        assert first_payload == second_payload
+        handle_stream_error.assert_not_awaited()
+    else:
+        assert response_error == {
+            "type": "invalid_request_error",
+            "code": error_code,
+            "message": error_message,
+        }
+        assert len(second_upstream.sent_text) == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("all_rejected", [False, True], ids=["third-account-succeeds", "all-accounts-reject"])
+@pytest.mark.parametrize("hard_affinity", [False, True], ids=["soft-session", "hard-prompt-cache"])
+@pytest.mark.parametrize("model", ["gpt-6-sol", "gpt-6-luna"])
+async def test_v1_responses_http_bridge_exhausts_consecutive_account_model_rejections(
+    async_client,
+    monkeypatch,
+    all_rejected,
+    hard_affinity,
+    model,
+):
+    _install_bridge_settings(monkeypatch, enabled=True)
+    account_ids = [
+        await _import_account(
+            async_client,
+            f"acc_http_bridge_{model.replace('-', '_')}_{index}",
+            f"http-bridge-{model}-{index}@example.com",
+        )
+        for index in range(3)
+    ]
+    accounts = [await _get_account(account_id) for account_id in account_ids]
+    error_message = f"The model `{model}` does not exist or you do not have access to it."
+    upstreams = [
+        _ErrorOnlyUpstreamWebSocket(error_code="model_not_found", error_message=error_message),
+        _ErrorOnlyUpstreamWebSocket(error_code="model_not_found", error_message=error_message),
+        (
+            _ErrorOnlyUpstreamWebSocket(error_code="model_not_found", error_message=error_message)
+            if all_rejected
+            else _FakeBridgeUpstreamWebSocket()
+        ),
+    ]
+    connect_calls: list[str | None] = []
+    selection_exclusions: list[set[str]] = []
+    selection_api_keys: list[Any] = []
+    handle_stream_error = AsyncMock()
+
+    async def fake_select_account_with_budget(self, deadline, **kwargs):
+        del self, deadline
+        excluded = set(cast(set[str], kwargs.get("exclude_account_ids") or set()))
+        selection_exclusions.append(excluded)
+        selection_api_keys.append(kwargs.get("api_key"))
+        account = next((candidate for candidate in accounts if candidate.id not in excluded), None)
+        if account is None:
+            return AccountSelection(
+                account=None,
+                error_message="No available accounts",
+                error_code="no_accounts",
+            )
+        return AccountSelection(account=account, error_message=None, error_code=None)
+
+    async def fake_ensure_fresh_with_budget(self, target, *, force=False, timeout_seconds):
+        del self, force, timeout_seconds
+        return target
+
+    async def fake_connect_responses_websocket(
+        headers,
+        access_token,
+        account_id_header,
+        *,
+        base_url=None,
+        session=None,
+    ):
+        del headers, access_token, base_url, session
+        connect_calls.append(account_id_header)
+        return upstreams[len(connect_calls) - 1]
+
+    monkeypatch.setattr(proxy_module.ProxyService, "_select_account_with_budget", fake_select_account_with_budget)
+    monkeypatch.setattr(proxy_module.ProxyService, "_ensure_fresh_with_budget", fake_ensure_fresh_with_budget)
+    monkeypatch.setattr(proxy_module.ProxyService, "_handle_stream_error", handle_stream_error)
+    monkeypatch.setattr(proxy_module, "connect_responses_websocket", fake_connect_responses_websocket)
+
+    request_body = {
+        "model": model,
+        "instructions": "Return exactly OK.",
+        "input": "hello",
+        "stream": True,
+    }
+    if hard_affinity:
+        request_body["prompt_cache_key"] = f"http-bridge-{model}-account-model-retry-key"
+
+    if all_rejected:
+        response = await async_client.post("/v1/responses", json=request_body)
+        assert response.status_code == 400
+        assert response.json()["error"] == {
+            "type": "invalid_request_error",
+            "code": "model_not_found",
+            "message": error_message,
+        }
+    else:
+        events = await _collect_sse_events(async_client, "/v1/responses", json_body=request_body)
+        _assert_created_text_delta_completed(events)
+
+    assert connect_calls == [account.chatgpt_account_id for account in accounts]
+    assert len(set(connect_calls)) == len(connect_calls)
+    if all_rejected:
+        assert all(account.id in selection_exclusions[-1] for account in accounts), selection_exclusions
+    else:
+        assert all(account.id in selection_exclusions[-1] for account in accounts[:2]), selection_exclusions
+    assert selection_api_keys
+    assert all(api_key == selection_api_keys[0] for api_key in selection_api_keys)
+    for account, upstream in zip(accounts, upstreams, strict=True):
+        assert len(upstream.sent_text) == 1
+        assert json.loads(upstream.sent_text[0])["model"] == model
     handle_stream_error.assert_not_awaited()
 
 

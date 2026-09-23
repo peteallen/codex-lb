@@ -16,6 +16,7 @@ import json
 import aiohttp
 import pytest
 
+import app.modules.proxy.load_balancer as load_balancer_module
 import app.modules.proxy.service as proxy_module
 from app.core.auth import generate_unique_account_id
 from app.core.clients.proxy import ProxyResponseError
@@ -194,8 +195,10 @@ async def test_stream_server_error_surfaces_without_replay(async_client, monkeyp
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("error_code", ["overloaded_error", "server_is_overloaded"])
-async def test_stream_overload_alias_surfaces_without_replay(async_client, monkeypatch, error_code):
+async def test_stream_overload_alias_retries_before_acceptance(async_client, monkeypatch, error_code):
     await _import_account(async_client, f"acc_{error_code}", f"{error_code}@example.com")
+    monkeypatch.setattr(load_balancer_module, "_OVERLOAD_COOLDOWN_SECONDS", 0.001)
+    monkeypatch.setattr(load_balancer_module, "_OVERLOAD_COOLDOWN_MAX_SECONDS", 0.001)
 
     call_count = 0
     seen_account_ids: list[str | None] = []
@@ -217,10 +220,44 @@ async def test_stream_overload_alias_surfaces_without_replay(async_client, monke
         lines = [line async for line in resp.aiter_lines() if line]
 
     events = _extract_events(lines)
+    completed = [event for event in events if event.get("type") == "response.completed"]
     failed = [event for event in events if event.get("type") == "response.failed"]
-    assert len(failed) == 1
-    assert failed[0]["response"]["error"]["code"] == error_code
-    assert seen_account_ids == [f"acc_{error_code}"]
+    assert len(completed) == 1
+    assert failed == []
+    assert seen_account_ids == [f"acc_{error_code}", f"acc_{error_code}"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_code", ["overloaded_error", "server_is_overloaded"])
+async def test_stream_overload_alias_fails_over_to_eligible_account(async_client, monkeypatch, error_code):
+    """An unaccepted overload can use another account before exposing an error."""
+    await _import_account(async_client, f"acc_{error_code}_a", f"{error_code}-a@example.com")
+    await _import_account(async_client, f"acc_{error_code}_b", f"{error_code}-b@example.com")
+
+    seen_account_ids: list[str | None] = []
+
+    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False):
+        del payload, headers, access_token, base_url, raise_for_status
+        seen_account_ids.append(account_id)
+        if account_id == f"acc_{error_code}_a":
+            yield _overload_sse_event(error_code)
+            return
+        yield _success_sse_event("resp_overload_failover_ok")
+
+    monkeypatch.setattr(proxy_module, "core_stream_responses", fake_stream)
+
+    payload = {"model": "gpt-5.1", "instructions": "hi", "input": [], "stream": True}
+    async with async_client.stream("POST", "/backend-api/codex/responses", json=payload) as resp:
+        assert resp.status_code == 200
+        lines = [line async for line in resp.aiter_lines() if line]
+
+    events = _extract_events(lines)
+    completed = [event for event in events if event.get("type") == "response.completed"]
+    failed = [event for event in events if event.get("type") == "response.failed"]
+    assert len(completed) == 1
+    assert failed == []
+    assert seen_account_ids[0] == f"acc_{error_code}_a"
+    assert f"acc_{error_code}_b" in seen_account_ids
 
 
 @pytest.mark.asyncio
@@ -255,9 +292,11 @@ async def test_stream_timeout_surfaces_without_replay(async_client, monkeypatch)
 
 
 @pytest.mark.asyncio
-async def test_stream_model_capacity_without_response_id_surfaces_without_replay(async_client, monkeypatch):
-    """An upstream terminal event is accepted work even when it omits a response id."""
+async def test_stream_model_capacity_without_response_id_retries_before_acceptance(async_client, monkeypatch):
+    """A recognized capacity rejection without a response id is replayable."""
     await _import_account(async_client, "acc_model_capacity_retry", "model-capacity@example.com")
+    monkeypatch.setattr(load_balancer_module, "_OVERLOAD_COOLDOWN_SECONDS", 0.001)
+    monkeypatch.setattr(load_balancer_module, "_OVERLOAD_COOLDOWN_MAX_SECONDS", 0.001)
 
     call_count = 0
     seen_account_ids: list[str | None] = []
@@ -269,6 +308,7 @@ async def test_stream_model_capacity_without_response_id_surfaces_without_replay
         if call_count == 1:
             yield _model_capacity_sse_event()
             return
+        yield _success_sse_event("resp_model_capacity_ok")
 
     monkeypatch.setattr(proxy_module, "core_stream_responses", fake_stream)
 
@@ -279,15 +319,18 @@ async def test_stream_model_capacity_without_response_id_surfaces_without_replay
 
     events = _extract_events(lines)
     failed = [event for event in events if event.get("type") == "response.failed"]
-    assert len(failed) == 1
-    assert failed[0]["response"]["error"]["code"] == "invalid_request_error"
-    assert seen_account_ids == ["acc_model_capacity_retry"]
+    completed = [event for event in events if event.get("type") == "response.completed"]
+    assert failed == []
+    assert len(completed) == 1
+    assert seen_account_ids == ["acc_model_capacity_retry", "acc_model_capacity_retry"]
 
 
 @pytest.mark.asyncio
-async def test_stream_raw_capacity_error_with_proxy_request_id_surfaces_without_replay(async_client, monkeypatch):
-    """A terminal upstream error remains terminal even with a proxy-generated id."""
+async def test_stream_raw_capacity_error_without_upstream_id_retries_before_acceptance(async_client, monkeypatch):
+    """A raw capacity rejection is replayable when it has no upstream id."""
     await _import_account(async_client, "acc_raw_model_capacity_retry", "raw-model-capacity@example.com")
+    monkeypatch.setattr(load_balancer_module, "_OVERLOAD_COOLDOWN_SECONDS", 0.001)
+    monkeypatch.setattr(load_balancer_module, "_OVERLOAD_COOLDOWN_MAX_SECONDS", 0.001)
 
     call_count = 0
     seen_account_ids: list[str | None] = []
@@ -305,6 +348,7 @@ async def test_stream_raw_capacity_error_with_proxy_request_id_surfaces_without_
                 }
             )
             return
+        yield _success_sse_event("resp_raw_model_capacity_ok")
 
     monkeypatch.setattr(proxy_module, "core_stream_responses", fake_stream)
 
@@ -314,10 +358,9 @@ async def test_stream_raw_capacity_error_with_proxy_request_id_surfaces_without_
         lines = [line async for line in resp.aiter_lines() if line]
 
     events = _extract_events(lines)
-    errors = [event for event in events if event.get("type") == "error"]
-    assert len(errors) == 1
-    assert errors[0]["code"] == "invalid_request_error"
-    assert seen_account_ids == ["acc_raw_model_capacity_retry"]
+    completed = [event for event in events if event.get("type") == "response.completed"]
+    assert len(completed) == 1
+    assert seen_account_ids == ["acc_raw_model_capacity_retry", "acc_raw_model_capacity_retry"]
 
 
 @pytest.mark.asyncio
@@ -354,6 +397,37 @@ async def test_stream_model_capacity_top_level_response_id_surfaces_without_repl
     assert len(failed) == 1
     assert failed[0]["response"]["error"]["code"] == "invalid_request_error"
     assert seen_account_ids == ["acc_model_capacity_accepted"]
+
+
+@pytest.mark.asyncio
+async def test_stream_overload_after_visible_progress_surfaces_without_replay(async_client, monkeypatch):
+    """Visible upstream progress makes a later overload unsafe to replay."""
+    await _import_account(async_client, "acc_visible_overload_a", "visible-overload-a@example.com")
+    await _import_account(async_client, "acc_visible_overload_b", "visible-overload-b@example.com")
+
+    seen_account_ids: list[str | None] = []
+
+    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False):
+        del payload, headers, access_token, base_url, raise_for_status
+        seen_account_ids.append(account_id)
+        if account_id == "acc_visible_overload_a":
+            yield _sse_event({"type": "response.in_progress", "response": {"id": "resp_visible_overload"}})
+            yield _overload_sse_event("server_is_overloaded")
+            return
+        yield _success_sse_event("resp_visible_overload_failover_should_not_happen")
+
+    monkeypatch.setattr(proxy_module, "core_stream_responses", fake_stream)
+
+    payload = {"model": "gpt-5.1", "instructions": "hi", "input": [], "stream": True}
+    async with async_client.stream("POST", "/backend-api/codex/responses", json=payload) as resp:
+        assert resp.status_code == 200
+        lines = [line async for line in resp.aiter_lines() if line]
+
+    events = _extract_events(lines)
+    failed = [event for event in events if event.get("type") == "response.failed"]
+    assert len(failed) == 1
+    assert failed[0]["response"]["error"]["code"] == "server_is_overloaded"
+    assert seen_account_ids == ["acc_visible_overload_a"]
 
 
 @pytest.mark.asyncio

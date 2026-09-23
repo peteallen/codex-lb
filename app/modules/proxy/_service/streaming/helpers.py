@@ -46,7 +46,7 @@ from app.core.errors import (
     PREVIOUS_RESPONSE_STREAM_INCOMPLETE_MESSAGE,
     response_failed_event,
 )
-from app.core.openai.models import OpenAIEvent
+from app.core.openai.models import OpenAIError, OpenAIEvent
 from app.core.openai.parsing import parse_sse_event
 from app.core.resilience.network_recovery import (
     PROCESS_NETWORK_UNAVAILABLE_CODE,
@@ -386,8 +386,10 @@ from app.modules.proxy.durable_bridge_coordinator import (
 )
 from app.modules.proxy.helpers import (
     _normalize_error_code,
+    _upstream_error_from_openai,
     classify_upstream_failure,
     is_upstream_model_capacity_error,
+    is_upstream_overload_error,
 )
 from app.modules.proxy.http_bridge_forwarding import (
     HTTPBridgeForwardContext as HTTPBridgeForwardContext,
@@ -461,6 +463,25 @@ def _should_retry_transient_stream_error(
     if any(marker in normalized_message for marker in _facade()._UPSTREAM_UNAVAILABLE_NON_TRANSIENT_MESSAGE_MARKERS):
         return False
     return any(marker in normalized_message for marker in _facade()._UPSTREAM_UNAVAILABLE_TRANSIENT_MESSAGE_MARKERS)
+
+
+def _should_retry_first_event_overload(
+    *,
+    allow_transient_retry: bool,
+    downstream_visible: bool,
+    event: OpenAIEvent | None,
+    event_payload: dict[str, JsonValue] | None,
+    code: str | None,
+    message: str | None,
+) -> bool:
+    """Return whether an unaccepted first-event overload may be replayed."""
+    if not allow_transient_retry or downstream_visible or not is_upstream_overload_error(code, message):
+        return False
+    return _should_retry_transient_stream_error(
+        code,
+        message,
+        response_id=_websocket_response_id(event, event_payload),
+    )
 
 
 def _classify_upstream_close(
@@ -556,6 +577,39 @@ def _raw_stream_error_fields(
         raw_error_message,
         raw_error_param,
         _normalize_error_code(_websocket_event_error_code(event_type, event_payload), raw_error_type),
+    )
+
+
+def _first_stream_error_details(
+    event_type: str | None,
+    event_payload: dict[str, JsonValue] | None,
+    error: OpenAIError | None,
+) -> tuple[str | None, str | None, str | None, str, UpstreamError]:
+    raw_error_type, raw_error_message, raw_error_param, raw_error_code = _raw_stream_error_fields(
+        event_type,
+        event_payload,
+    )
+    if error is None:
+        return (
+            raw_error_type,
+            raw_error_message,
+            raw_error_param,
+            _raw_stream_error_code_or_upstream(event_type, event_payload, raw_error_code),
+            {"message": raw_error_message or "Upstream error"},
+        )
+    raw_error_type = error.type or raw_error_type
+    raw_error_message = error.message or raw_error_message
+    raw_error_param = error.param or raw_error_param
+    return (
+        raw_error_type,
+        raw_error_message,
+        raw_error_param,
+        _raw_stream_error_code_or_upstream(
+            event_type,
+            event_payload,
+            _normalize_error_code(error.code or raw_error_code, raw_error_type),
+        ),
+        _upstream_error_from_openai(error),
     )
 
 
@@ -847,6 +901,8 @@ async def _handle_stream_error(
         await proxy._load_balancer.mark_quota_exceeded(account, error)
     elif code in PERMANENT_FAILURE_CODES:
         await proxy._load_balancer.mark_permanent_failure(account, code)
+    elif is_upstream_overload_error(code, error.get("message")):
+        await proxy._load_balancer.record_overload(account)
     else:
         await proxy._load_balancer.record_error(account)
         _facade().logger.info(

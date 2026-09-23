@@ -26,6 +26,11 @@ class RuntimeState:
     leased_tokens: float = 0.0
     leases: dict[str, AccountLease] | None = None
     stream_key_inflight: dict[str, int] | None = None
+    # Keep upstream overload state independent from generic error backoff so
+    # a concurrent success cannot erase an active overload hold.
+    overload_cooldown_until: float | None = None
+    overload_count: int = 0
+    last_overload_at: float | None = None
 
 
 @dataclass(frozen=True, slots=True)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import logging
 import re
 import time
@@ -15,6 +16,7 @@ from typing import Any, Literal, NoReturn, Protocol
 import anyio
 
 from app.core.auth.refresh import RefreshError, is_transient_refresh_contention, refresh_contention_kind
+from app.core.balancer import UPSTREAM_OVERLOAD_COOLDOWN_ERROR_CODE
 from app.core.balancer.types import UpstreamError
 from app.core.clients.proxy import CodexControlRequestPrivacyPolicy, ProxyResponseError
 from app.core.clients.proxy_websocket import UpstreamWebSocket
@@ -40,6 +42,7 @@ from app.modules.proxy.load_balancer import (
     AccountSelection,
     CatalogOmissionQuotaAdmission,
 )
+from app.modules.proxy.replay_safety import responses_payload_is_account_neutral_fresh_replay
 from app.modules.proxy.tool_call_dedupe import ToolCallDedupeKey
 from app.modules.proxy.work_admission import AdmissionLease
 
@@ -296,9 +299,23 @@ def _account_selection_recovery_sleep_seconds_from_message(
 ) -> float | None:
     message = (message or "").strip()
     if not message:
+        if error_code == UPSTREAM_OVERLOAD_COOLDOWN_ERROR_CODE:
+            return _ACCOUNT_SELECTION_RECOVERY_DEFAULT_SLEEP_SECONDS
         return None
 
     lowered = message.lower()
+    if error_code == UPSTREAM_OVERLOAD_COOLDOWN_ERROR_CODE:
+        retry_hint = _ACCOUNT_SELECTION_RETRY_HINT_RE.search(message)
+        if retry_hint is not None:
+            try:
+                hinted_seconds = float(retry_hint.group(1))
+            except ValueError:
+                hinted_seconds = _ACCOUNT_SELECTION_RECOVERY_DEFAULT_SLEEP_SECONDS
+            return min(
+                max(hinted_seconds, _ACCOUNT_SELECTION_RECOVERY_MIN_SLEEP_SECONDS),
+                _ACCOUNT_SELECTION_RECOVERY_MAX_SLEEP_SECONDS,
+            )
+        return _ACCOUNT_SELECTION_RECOVERY_DEFAULT_SLEEP_SECONDS
     if (
         "require re-authentication" in lowered
         or "all accounts are paused" in lowered
@@ -819,6 +836,12 @@ class _WebSocketRequestState:
     request_usage_budget: ApiKeyRequestUsageBudget | None = None
     request_text: str | None = None
     replay_count: int = 0
+    # Explicit upstream overload recovery is budgeted independently from the
+    # ordinary transparent replay count.  A request may encounter multiple
+    # pre-acceptance overloads while its deadline still has time remaining,
+    # but each round must still pass the normal pre-visible replay guards.
+    overload_recovery_count: int = 0
+    overload_recovery_pending: bool = False
     # Counts only the one extra replay permitted after the initial recovery
     # replay when the replacement upstream socket also closes cleanly before
     # producing any response event.
@@ -1321,20 +1344,51 @@ def _record_response_event(request_state: _WebSocketRequestState | None, event_t
     request_state.response_event_count += 1
 
 
+def overload_replay_is_account_neutral(request_state: _WebSocketRequestState) -> bool:
+    """Prove account mobility before mutating an owner-bound request."""
+    if (
+        request_state.file_required_preferred_account
+        or request_state.affinity_policy.codex_session_source == "turn_state"
+        or request_state.affinity_policy.require_unambiguous_account
+    ):
+        return False
+    replay_text = request_state.request_text
+    if request_state.previous_response_id is not None:
+        if not (
+            request_state.proxy_injected_previous_response_id and request_state.fresh_upstream_request_is_retry_safe
+        ):
+            return False
+        replay_text = request_state.fresh_upstream_request_text
+    try:
+        payload = json.loads(replay_text) if replay_text is not None else None
+    except (ValueError, TypeError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    payload.pop("type", None)
+    return responses_payload_is_account_neutral_fresh_replay(payload)
+
+
 def _websocket_request_can_replay_before_visible_output(
     request_state: _WebSocketRequestState,
     *,
     allow_clean_close_retry: bool = False,
+    allow_overload_retry: bool = False,
 ) -> bool:
     if not request_state.request_text:
         return False
     if request_state.transport == _REQUEST_TRANSPORT_WEBSOCKET and request_state.response_create_sent_at is None:
         return False
-    if request_state.replay_count >= 1 and not (
-        allow_clean_close_retry
-        and request_state.replay_count == 1
-        and request_state.response_event_count == 0
-        and request_state.clean_close_replay_count == 0
+    if (
+        request_state.replay_count >= 1
+        and not (
+            allow_clean_close_retry
+            and request_state.replay_count == 1
+            and request_state.response_event_count == 0
+            and request_state.clean_close_replay_count == 0
+        )
+        and not allow_overload_retry
+        and request_state.precreated_replay_reason != _ACCOUNT_MODEL_UNSUPPORTED_ERROR_CODE
     ):
         return False
     sequenced_created_only_prewarm = (
@@ -1355,7 +1409,12 @@ def _websocket_request_can_replay_before_visible_output(
         request_state.fresh_upstream_request_is_retry_safe and request_state.fresh_upstream_request_text is not None
     )
     precreated_pending = request_state.response_id is None and request_state.awaiting_response_created
-    if precreated_pending and request_state.previous_response_id is not None and not has_retry_safe_fresh_payload:
+    if (
+        precreated_pending
+        and request_state.previous_response_id is not None
+        and not has_retry_safe_fresh_payload
+        and not (allow_overload_retry and request_state.preferred_account_id is not None)
+    ):
         return False
     created_only_pending = (
         request_state.response_id is not None

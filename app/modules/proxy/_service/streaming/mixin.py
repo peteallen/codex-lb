@@ -266,12 +266,14 @@ from app.modules.proxy._service.observability import (
     _truncate_identifier as _truncate_identifier,
 )
 from app.modules.proxy._service.streaming.helpers import (
-    _handle_stream_error as _handle_stream_error_helper,
-)
-from app.modules.proxy._service.streaming.helpers import (
+    _first_stream_error_details,
     _mark_downstream_stream_cancelled,
     _mark_upstream_stream_incomplete,
     _raw_stream_error_code_or_upstream,
+    _should_retry_first_event_overload,
+)
+from app.modules.proxy._service.streaming.helpers import (
+    _handle_stream_error as _handle_stream_error_helper,
 )
 from app.modules.proxy._service.streaming.helpers import (
     _raw_stream_error_fields as _raw_error_fields,
@@ -296,6 +298,7 @@ from app.modules.proxy._service.support import (
     _RetryableStreamError,
     _StreamSettlement,
     _TerminalStreamError,
+    _TransientStreamError,
     _ttft_event_latency_ms,
     _WebSocketUpstreamControl,
 )
@@ -648,21 +651,11 @@ class _StreamingMixin(_StreamingRetryMixin):
                     if event.type == "response.failed" and event.response and event.response.id
                     else request_id
                 )
-                if preserve_raw_sse_line and error is None:
-                    raw_error_type, raw_error_message, raw_error_param, code = _raw_error_fields(
-                        event_type,
-                        first_payload,
-                    )
-                    settlement.error = cast(UpstreamError, {"message": raw_error_message or "Upstream error"})
-                else:
-                    raw_error_type = error.type if error else None
-                    raw_error_message = error.message if error else None
-                    raw_error_param = error.param if error else None
-                    code = _normalize_error_code(
-                        error.code if error else None,
-                        raw_error_type,
-                    )
-                code = _raw_stream_error_code_or_upstream(event_type, first_payload, code)
+                raw_error_type, raw_error_message, raw_error_param, code, upstream_error = _first_stream_error_details(
+                    event_type,
+                    first_payload,
+                    error,
+                )
                 rewritten_error = _facade()._rewrite_previous_response_stream_error(
                     previous_response_id=payload.previous_response_id,
                     preferred_account_id=preferred_account_id,
@@ -672,9 +665,7 @@ class _StreamingMixin(_StreamingRetryMixin):
                     error_param=raw_error_param,
                 )
                 status = "error"
-                if not (preserve_raw_sse_line and error is None):
-                    settlement.error = _upstream_error_from_openai(error)
-                upstream_error: UpstreamError = settlement.error or cast(UpstreamError, {"message": "Upstream error"})
+                settlement.error = upstream_error
                 settlement.record_success = False
                 if rewritten_error is not None:
                     rewritten_code, rewritten_message, upstream_error_code = rewritten_error
@@ -714,6 +705,15 @@ class _StreamingMixin(_StreamingRetryMixin):
                         )
                     if allow_retry and _facade()._should_retry_stream_error(code):
                         raise _RetryableStreamError(code, upstream_error, exclude_account=True)
+                    if _should_retry_first_event_overload(
+                        allow_transient_retry=allow_transient_retry,
+                        downstream_visible=settlement.downstream_visible,
+                        event=event,
+                        event_payload=first_payload,
+                        code=code,
+                        message=error_message,
+                    ):
+                        raise _TransientStreamError(code, upstream_error)
                 terminal_stream_error = _TerminalStreamError(
                     error_code or code,
                     upstream_error,

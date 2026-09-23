@@ -54,6 +54,7 @@ from app.modules.proxy._service.compact import (
 )
 from app.modules.proxy._service.http_bridge.helpers import (
     _HTTP_BRIDGE_MISSING_RESPONSE_CREATED_TIMEOUT_DETAIL,
+    _await_task_deferring_cancellation,
     _http_bridge_durable_lease_ttl_seconds,
     _http_bridge_eventless_precreated_deadline,
     _http_bridge_request_budget_seconds,
@@ -185,6 +186,7 @@ from app.modules.proxy.continuity import is_http_bridge_account_neutral_replay
 from app.modules.proxy.helpers import (
     _normalize_error_code,
     is_upstream_model_capacity_error,
+    is_upstream_overload_error,
 )
 from app.modules.proxy.tool_call_dedupe import (
     mark_duplicate_tool_call_downstream_event,
@@ -428,9 +430,12 @@ async def _wait_before_http_bridge_model_capacity_retry(
     *,
     emit_keepalives: bool,
     error_message: str | None,
+    error_code: str | None = None,
     cancel_when_detached: bool = False,
 ) -> bool:
-    if request_state is None or not is_upstream_model_capacity_error(error_message):
+    if request_state is None or not (
+        is_upstream_model_capacity_error(error_message) or is_upstream_overload_error(error_code, error_message)
+    ):
         return True
 
     deadline = request_state.bridge_request_deadline
@@ -439,6 +444,12 @@ async def _wait_before_http_bridge_model_capacity_retry(
     remaining_budget_seconds = max(0.0, deadline - _service_time().monotonic())
     if remaining_budget_seconds <= 0:
         return False
+    if request_state.overload_recovery_pending:
+        # Account selection applies the cooldown and tries alternate capacity
+        # before waiting. Keep the deadline and detach checks here.
+        return not cancel_when_detached or (
+            request_state.event_queue is not None and not request_state.draining_until_terminal
+        )
 
     sleep_seconds = min(_ACCOUNT_SELECTION_RECOVERY_DEFAULT_SLEEP_SECONDS, remaining_budget_seconds)
     request_state.account_capacity_waiting = True
@@ -500,10 +511,17 @@ async def _release_http_bridge_model_capacity_retry_admission(
         request_state.response_create_admission_reacquire_required = True
     account_response_create_lease = request_state.account_response_create_lease
     account_response_create_release = request_state.account_response_create_release
-    request_state.account_response_create_lease = None
-    request_state.account_response_create_release = None
+    cancellation = None
     if account_response_create_lease is not None and account_response_create_release is not None:
-        await account_response_create_release(account_response_create_lease)
+        with anyio.CancelScope(shield=True):
+            _, cancellation = await _await_task_deferring_cancellation(
+                asyncio.create_task(account_response_create_release(account_response_create_lease))
+            )
+    if request_state.account_response_create_lease is account_response_create_lease:
+        request_state.account_response_create_lease = None
+        request_state.account_response_create_release = None
+    if cancellation is not None:
+        raise cancellation
 
 
 def _signal_http_bridge_model_capacity_retry_ready(
@@ -1459,8 +1477,29 @@ class _HTTPBridgeUpstreamEventsMixin:
                     and early_retry_error_code is not None
                     and early_retry_error_code != _ACCOUNT_MODEL_UNSUPPORTED_ERROR_CODE
                     and not is_previous_response_not_found_event
-                    and is_upstream_model_capacity_error(error_message)
-                    and _websocket_request_can_replay_before_visible_output(matched_request_state)
+                    and (
+                        is_upstream_model_capacity_error(error_message)
+                        or is_upstream_overload_error(
+                            _normalize_error_code(
+                                _websocket_event_error_code(event_type, payload),
+                                _websocket_event_error_type(event_type, payload),
+                            ),
+                            error_message,
+                        )
+                    )
+                    and _websocket_request_can_replay_before_visible_output(
+                        matched_request_state,
+                        allow_overload_retry=(
+                            is_upstream_overload_error(
+                                _normalize_error_code(
+                                    _websocket_event_error_code(event_type, payload),
+                                    _websocket_event_error_type(event_type, payload),
+                                ),
+                                error_message,
+                            )
+                            or matched_request_state.overload_recovery_pending
+                        ),
+                    )
                 )
                 if reserve_terminal_for_model_capacity_retry:
                     terminal_request_state = matched_request_state
@@ -1725,13 +1764,25 @@ class _HTTPBridgeUpstreamEventsMixin:
             payload=payload,
         )
         retry_error_message = _websocket_event_error_message(event_type, payload)
+        retry_upstream_error_code = _normalize_error_code(
+            _websocket_event_error_code(event_type, payload),
+            _websocket_event_error_type(event_type, payload),
+        )
+        retry_is_upstream_overload = is_upstream_overload_error(
+            retry_upstream_error_code,
+            retry_error_message,
+        )
+        retry_is_model_capacity = is_upstream_model_capacity_error(retry_error_message)
         wait_for_model_capacity_retry = bool(
             retry_error_code is not None
             and retry_error_code != _ACCOUNT_MODEL_UNSUPPORTED_ERROR_CODE
             and not is_previous_response_not_found_event
             and status_request_state is not None
-            and is_upstream_model_capacity_error(retry_error_message)
-            and _websocket_request_can_replay_before_visible_output(status_request_state)
+            and (retry_is_model_capacity or retry_is_upstream_overload)
+            and _websocket_request_can_replay_before_visible_output(
+                status_request_state,
+                allow_overload_retry=(retry_is_upstream_overload or status_request_state.overload_recovery_pending),
+            )
         )
         if (
             auth_error_code is not None
@@ -1784,6 +1835,8 @@ class _HTTPBridgeUpstreamEventsMixin:
                 {"message": retry_error_message or "Upstream error"},
                 retry_error_code,
             )
+            if retry_is_upstream_overload:
+                status_request_state.overload_recovery_pending = True
             setattr(status_request_state, "account_health_error_handled", True)
             retry_consumer_attached = (
                 retry_consumer_attached
@@ -1796,8 +1849,30 @@ class _HTTPBridgeUpstreamEventsMixin:
                     status_request_state.response_create_admission is not None
                     or status_request_state.account_response_create_lease is not None
                 ):
-                    await _release_http_bridge_model_capacity_retry_admission(status_request_state)
+                    try:
+                        await _release_http_bridge_model_capacity_retry_admission(status_request_state)
+                    except BaseException:
+                        # This attempt was explicitly rejected. If its reader
+                        # aborts while releasing capacity, reclaim pending
+                        # ownership so the outer terminal cleanup settles it.
+                        with anyio.CancelScope(shield=True):
+                            async with session.pending_lock:
+                                if status_request_state in session.pending_requests:
+                                    session.pending_requests.remove(status_request_state)
+                                    session.queued_request_count = max(0, session.queued_request_count - 1)
+                                status_request_state.terminal_settlement_phase = "claimed"
+                                if status_request_state not in claimed_terminal_request_states:
+                                    claimed_terminal_request_states.append(status_request_state)
+                            await _release_websocket_response_create_gate(
+                                status_request_state, session.response_create_gate
+                            )
+                            if session.account_lease is not None:
+                                await self._load_balancer.release_account_lease(session.account_lease)
+                                session.account_lease = None
+                        raise
                     status_request_state.awaiting_response_created = True
+                # The selector excludes cooling accounts and waits only if
+                # there is no eligible alternate capacity.
                 retry_after_wait = await _wait_before_http_bridge_model_capacity_retry(
                     status_request_state,
                     emit_keepalives=not status_request_state.propagate_http_errors,

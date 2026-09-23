@@ -14,6 +14,7 @@ import anyio
 
 from app.core import shutdown as shutdown_state
 from app.core.auth.refresh import RefreshError
+from app.core.balancer import UPSTREAM_OVERLOAD_COOLDOWN_ERROR_CODE
 from app.core.clients.files import create_file as core_create_file  # noqa: F401
 from app.core.clients.files import finalize_file as core_finalize_file  # noqa: F401
 from app.core.clients.proxy import CodexControlResponse as CodexControlResponse
@@ -1740,6 +1741,22 @@ class _HTTPBridgeMixin(
                     preferred_account_id=preferred_account_id,
                     selected_account_id=None,
                 )
+                # A newly created bridge has no session queue yet, but the
+                # logical request still owns the bridge request budget. Keep
+                # explicit recoverable capacity failures pending so an
+                # upstream overload cooldown (or another bounded capacity
+                # transition) can recover before turning into a terminal 503.
+                if selection.error_code == UPSTREAM_OVERLOAD_COOLDOWN_ERROR_CODE:
+                    if await _sleep_for_account_selection_recovery(
+                        selection,
+                        request_id=request_state.request_log_id or request_state.request_id,
+                        kind="http_bridge",
+                        request_stage=request_stage,
+                        model=request_model,
+                        max_sleep_seconds=_remaining_budget_seconds(deadline),
+                        request_state=request_state,
+                    ):
+                        continue
                 if proxy_connect_failover.last_error is not None:
                     # No eligible replacement exists after a confirmed
                     # pre-dispatch route failure: preserve the original

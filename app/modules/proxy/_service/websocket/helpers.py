@@ -77,6 +77,9 @@ from app.modules.proxy._service.http_bridge.helpers import (
     _active_http_bridge_instance_ring as _active_http_bridge_instance_ring,
 )
 from app.modules.proxy._service.http_bridge.helpers import (
+    _await_task_deferring_cancellation as _await_task_deferring_cancellation,
+)
+from app.modules.proxy._service.http_bridge.helpers import (
     _build_http_bridge_prewarm_text as _build_http_bridge_prewarm_text,
 )
 from app.modules.proxy._service.http_bridge.helpers import (
@@ -333,6 +336,7 @@ from app.modules.proxy.helpers import (
     _normalize_error_code,
     _parse_openai_error,
     is_upstream_model_capacity_error,
+    is_upstream_overload_error,
 )
 from app.modules.proxy.http_bridge_forwarding import (
     HTTPBridgeForwardContext as HTTPBridgeForwardContext,
@@ -348,6 +352,8 @@ def _facade() -> Any:
 
 def _prepare_websocket_request_state_for_visible_output_replay(
     request_state: "_WebSocketRequestState",
+    *,
+    overload_recovery: bool = False,
 ) -> str | None:
     downstream_response_id = None
     if request_state.response_id is not None and not request_state.awaiting_response_created:
@@ -362,7 +368,11 @@ def _prepare_websocket_request_state_for_visible_output_replay(
     request_text = request_state.request_text
     if not isinstance(request_text, str):
         return None
-    request_state.replay_count += 1
+    if overload_recovery:
+        request_state.overload_recovery_count += 1
+        request_state.overload_recovery_pending = False
+    elif request_state.precreated_replay_reason != _ACCOUNT_MODEL_UNSUPPORTED_ERROR_CODE:
+        request_state.replay_count += 1
     request_state.awaiting_response_created = True
     request_state.response_id = None
     request_state.response_event_count = 0
@@ -676,8 +686,6 @@ def _websocket_precreated_retry_error_code(
         return None
     if not request_state.request_text:
         return None
-    if request_state.replay_count >= 1:
-        return None
     if event_type not in {"error", "response.failed"}:
         return None
 
@@ -687,18 +695,9 @@ def _websocket_precreated_retry_error_code(
     )
     error_param = _websocket_event_error_param(event_type, payload)
     error_message = _websocket_event_error_message(event_type, payload)
-    if _facade()._is_previous_response_not_found_error(
-        code=error_code,
-        param=error_param,
-        message=error_message,
-    ):
-        return "stream_incomplete"
-    if _facade()._is_missing_tool_output_error(
-        code=error_code,
-        param=error_param,
-        message=error_message,
-    ):
-        return None
+    overload_error = is_upstream_overload_error(error_code, error_message)
+    # Explicit account/model rejections are bounded by the request's excluded
+    # account set and deadline, independently of ambiguous transient replays.
     if _is_account_model_unsupported_error(
         code=error_code,
         message=error_message,
@@ -711,7 +710,26 @@ def _websocket_precreated_retry_error_code(
         if _websocket_response_id(None, payload) is not None:
             return None
         return _ACCOUNT_MODEL_UNSUPPORTED_ERROR_CODE
-    if is_upstream_model_capacity_error(error_message):
+    # Overload rounds are separately budgeted, so every recognized
+    # pre-acceptance overload remains recoverable even after an earlier generic
+    # replay. Accepted work is still excluded above by response/visibility
+    # checks. Quota codes are excluded by ``is_upstream_overload_error`` and
+    # retain their existing capacity semantics.
+    if request_state.replay_count >= 1 and not overload_error:
+        return None
+    if _facade()._is_previous_response_not_found_error(
+        code=error_code,
+        param=error_param,
+        message=error_message,
+    ):
+        return "stream_incomplete"
+    if _facade()._is_missing_tool_output_error(
+        code=error_code,
+        param=error_param,
+        message=error_message,
+    ):
+        return None
+    if overload_error:
         if error_code in {
             "rate_limit_exceeded",
             "usage_limit_reached",
@@ -722,7 +740,7 @@ def _websocket_precreated_retry_error_code(
             return error_code
         if _websocket_response_id(None, payload) is not None:
             return None
-        return "server_is_overloaded"
+        return "server_is_overloaded" if is_upstream_model_capacity_error(error_message) else error_code
     if error_code not in _facade()._WEBSOCKET_TRANSPARENT_REPLAY_ERROR_CODES:
         return None
     return error_code
@@ -1579,25 +1597,42 @@ def _pop_matching_websocket_request_states(
     return popped_requests
 
 
+async def _release_websocket_account_response_create_lease(
+    request_state: _WebSocketRequestState,
+) -> asyncio.CancelledError | None:
+    account_response_create_lease = request_state.account_response_create_lease
+    account_response_create_release = request_state.account_response_create_release
+    cancellation: asyncio.CancelledError | None = None
+    if account_response_create_lease is not None and account_response_create_release is not None:
+        # Keep the lease reference until the release finishes. A cancelled
+        # cleanup must leave ownership discoverable by its outer finalizer.
+        release_task = asyncio.create_task(
+            account_response_create_release(account_response_create_lease),
+            name="proxy-websocket-account-response-create-lease-release",
+        )
+        with anyio.CancelScope(shield=True):
+            _, cancellation = await _await_task_deferring_cancellation(release_task)
+    if request_state.account_response_create_lease is account_response_create_lease:
+        request_state.account_response_create_lease = None
+        request_state.account_response_create_release = None
+    return cancellation
+
+
 async def _release_websocket_response_create_gate(
     request_state: _WebSocketRequestState,
     response_create_gate: asyncio.Semaphore,
 ) -> None:
-    account_response_create_lease = request_state.account_response_create_lease
-    account_response_create_release = request_state.account_response_create_release
-    request_state.account_response_create_lease = None
-    request_state.account_response_create_release = None
     if request_state.response_create_admission is not None:
         request_state.response_create_admission.release()
         request_state.response_create_admission = None
-    if account_response_create_lease is not None and account_response_create_release is not None:
-        await account_response_create_release(account_response_create_lease)
+    cancellation = await _release_websocket_account_response_create_lease(request_state)
     request_state.awaiting_response_created = False
     request_state.response_create_gate = None
-    if not request_state.response_create_gate_acquired:
-        return
-    request_state.response_create_gate_acquired = False
-    response_create_gate.release()
+    if request_state.response_create_gate_acquired:
+        request_state.response_create_gate_acquired = False
+        response_create_gate.release()
+    if cancellation is not None:
+        raise cancellation
 
 
 def _pop_terminal_websocket_request_state(
@@ -1797,7 +1832,11 @@ def _serialize_websocket_error_event(payload: dict[str, JsonValue]) -> str:
     return json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
 
 
-def _trim_websocket_previous_response_input_items(input_items: list[JsonValue]) -> list[JsonValue]:
+def _trim_websocket_previous_response_input_items(
+    input_items: list[JsonValue],
+    *,
+    confirmed_tool_call_types: dict[str, str] | None = None,
+) -> list[JsonValue]:
     first_output_index = next(
         (
             index
@@ -1812,7 +1851,20 @@ def _trim_websocket_previous_response_input_items(input_items: list[JsonValue]) 
     prefix = input_items[:first_output_index]
     if not all(_is_websocket_previous_response_output_item(item) for item in prefix):
         return input_items
-    return input_items[first_output_index:]
+    # Client-created calls (for example visualization state) aren't necessarily
+    # stored in previous_response_id. Only remove calls observed in that response.
+    retained_calls: list[JsonValue] = []
+    for item in prefix:
+        item_type = _websocket_input_item_type(item)
+        if isinstance(item, dict) and item_type in {"function_call", "custom_tool_call", "apply_patch_call"}:
+            call_id = item.get("call_id")
+            if (
+                not isinstance(call_id, str)
+                or not confirmed_tool_call_types
+                or confirmed_tool_call_types.get(call_id) != item_type
+            ):
+                retained_calls.append(item)
+    return retained_calls + input_items[first_output_index:]
 
 
 def _is_websocket_previous_response_output_item(item: JsonValue) -> bool:

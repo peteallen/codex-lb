@@ -227,3 +227,39 @@ OpenSpec change first.
 - Post-deploy: correlate retry-circuit `opened`, `half_open`, and `reset` events with bridge `pending` and `response_events_seen` diagnostics. An idle `pending=0` retirement must not precede an immediate two-failure cooldown.
 - Post-deploy: monitor `previous_response_not_found` on `/backend-api/codex/responses`; recurring spikes show repeated continuity failures, which may come from malformed client identifiers, server-side invalidation, or connection lifecycle. Clients should perform the documented full-context retry without `previous_response_id`. Investigate socket-lifecycle remediation only when a separate close-reason, reconnect, or transport diagnostic correlates with the failures.
 - Websocket/Codex CLI tier verification runbook: `openspec/specs/responses-api-compat/ops.md`
+
+## Explicit upstream overload recovery
+
+An explicit `overloaded_error`, `server_is_overloaded`, or recognized model-capacity rejection before upstream acceptance can be recovered within the original request deadline. Raw HTTP, bridged HTTP, and direct WebSocket requests first seek another eligible account, then wait with existing capacity keepalives if capacity is temporarily unavailable. These rejections do not consume the generic account-attempt limit.
+
+For example, if account A rejects a complete fresh request with `server_is_overloaded` and B is healthy, B can complete the same client request even when A owns its soft prompt-cache affinity. If the request references a file owned by A or requires A's stored response state without a proven complete replay, it waits for A. Any actual upstream response id or visible model/tool output preserves the no-replay guard. Generic timeouts and 5xx failures do not become safe merely because another account is available.
+
+Waiting ends on cancellation or the existing request deadline. Attempt leases are released before waiting; the logical API-key reservation remains held until completion or cancellation/terminal settlement. This improves recovery from explicit rejections without claiming that accepted work or an indefinitely unavailable upstream can always complete.
+
+## HTTP session isolation after reconnect
+
+A session-header bridge key isolates HTTP traffic, but ordinary OpenAI requests
+do not implicitly continue the previous response. Previously, idle reconnect
+injected a durable anchor even though live reuse stayed unanchored. A stale
+anchor then produced repeated `previous_response_not_found` failures masked as
+`stream_incomplete`. Durable injection now requires Codex continuity affinity
+or a verified stored input prefix. Explicit previous-response IDs and turn-state
+headers retain their existing ownership behavior.
+
+For example, two independent short `/v1/responses` requests sharing `session_id`
+remain independent even if the upstream socket closes between them. Neither
+request needs to provide the other request's conversation history.
+
+## Client-created calls in anchored WebSocket follow-ups
+
+A client can append a synthetic tool call (for example `visualization_state_...`) that was never emitted by the referenced upstream response. A request containing that call, its result, and a user message must retain the pair. Previously, replay trimming treated every leading call as upstream output, which could leave an orphaned result.
+
+The trimmer now uses the existing completed-response continuity record: only matching response ID, call ID, and call type establish that a leading call is a duplicate. Missing or stale continuity preserves calls; mixed prefixes retain unconfirmed calls in order. This avoids name-specific exceptions and adds no persistent state or settings. Assistant/reasoning prefix handling is unchanged. See the requirement “Anchored WebSocket trimming preserves unproven tool calls” in [spec.md](spec.md).
+
+The September 21 incident logged a three-to-two-item trim followed by `No tool call found`, but no input body was retained. Route-level regressions demonstrate the defect independently. Deploying requires loading the updated proxy code; successful local tests do not establish that the remote client task has recovered.
+
+## Model access during staged rollout
+
+An upstream catalog can advertise a newly released model before every account can execute it. On September 22, GPT-6 Sol requests succeeded on one account while another returned the canonical `model_not_found` message. Adding a static model alias would not address that mismatch.
+
+The exact message naming the requested model enters account/model recovery. A fresh `gpt-6-sol` request can encounter multiple rejecting accounts before reaching one that serves it, as happened in the LAN-scoped pool on September 22. Recovery tries remaining eligible accounts within the original request deadline and excludes each rejecting account for that request. These explicit rejections do not spend the separate generic transient replay allowance. If every candidate rejects the model, the last upstream model rejection reaches the client. File ownership, stored response continuity, accepted work, and upstream output still constrain replay. No durable model ban or new setting is introduced, because a rollout rejection need not describe lasting entitlement. See “Canonical model-not-found rejection uses safe account recovery” in [spec.md](spec.md).

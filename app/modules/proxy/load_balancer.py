@@ -23,6 +23,8 @@ from app.core.balancer import (
     ROUTING_POLICY_PRESERVE,
     TRAFFIC_CLASS_FOREGROUND,
     TRAFFIC_CLASS_OPPORTUNISTIC,
+    UPSTREAM_OVERLOAD_COOLDOWN_MAX_SECONDS,
+    UPSTREAM_OVERLOAD_COOLDOWN_MIN_SECONDS,
     USAGE_LIMIT_REACHED,
     AccountState,
     ResetPreferenceWindow,
@@ -147,6 +149,14 @@ _SIBLING_FETCH_MARGIN_SECONDS = 5.0
 _UsageWindowEntry = UsageHistory | AdditionalUsageHistory
 
 _ACCOUNT_STREAM_LEASE_STALE_GRACE_SECONDS = 60.0
+
+# Explicit upstream overloads use a separate runtime-only cooldown. Keep the
+# aliases local to this module so tests and operational probes can use a short
+# clock window without changing deployment settings.
+_OVERLOAD_COOLDOWN_SECONDS = UPSTREAM_OVERLOAD_COOLDOWN_MIN_SECONDS
+_OVERLOAD_COOLDOWN_MAX_SECONDS = UPSTREAM_OVERLOAD_COOLDOWN_MAX_SECONDS
+_OVERLOAD_COOLDOWN_MAX_LEVEL = 4
+_OVERLOAD_RECURRENCE_WINDOW_SECONDS = 15 * 60
 
 _DEFAULT_USAGE_REFRESH_INTERVAL_SECONDS = 60
 
@@ -1697,10 +1707,49 @@ class LoadBalancer:
                 runtime.last_error_at = None
                 runtime.version += 1
                 runtime.health_version += 1
+            # A success concurrent with an overload must not reopen the
+            # account. Expiry permits another attempt, but intermittent
+            # success must not erase recent overload escalation history.
+            if runtime and runtime.overload_cooldown_until is not None:
+                if time.time() >= runtime.overload_cooldown_until:
+                    runtime.overload_cooldown_until = None
+                    runtime.version += 1
             if runtime and runtime.health_tier == HEALTH_TIER_PROBING:
                 runtime.probe_success_streak += 1
                 runtime.version += 1
                 runtime.health_version += 1
+
+    async def record_overload(self, account: Account) -> None:
+        """Hold an account out of routing after an explicit upstream overload.
+
+        This state is intentionally runtime-only. An upstream overload does
+        not prove that the account is rate-limited or unhealthy, so it must
+        not change persisted account status or generic error backoff state.
+        """
+        lock = await self._get_account_lock(account.id)
+        async with lock:
+            runtime = self._runtime.setdefault(account.id, RuntimeState())
+            now = time.time()
+            if (
+                runtime.last_overload_at is None
+                or now - runtime.last_overload_at >= _OVERLOAD_RECURRENCE_WINDOW_SECONDS
+            ):
+                runtime.overload_count = 0
+            runtime.overload_count = min(runtime.overload_count + 1, _OVERLOAD_COOLDOWN_MAX_LEVEL + 1)
+            runtime.last_overload_at = now
+            # Five levels reach the cap: 30, 60, 120, 240, 300 seconds.
+            level = min(runtime.overload_count - 1, _OVERLOAD_COOLDOWN_MAX_LEVEL)
+            delay = min(_OVERLOAD_COOLDOWN_MAX_SECONDS, _OVERLOAD_COOLDOWN_SECONDS * (2**level))
+            runtime.overload_cooldown_until = now + delay
+            runtime.version += 1
+
+    async def overload_retry_after(self, account_id: str) -> float:
+        """Return seconds until an account's overload hold expires."""
+        async with self._runtime_lock:
+            runtime = self._runtime.get(account_id)
+            if runtime is None or runtime.overload_cooldown_until is None:
+                return 0.0
+            return max(0.0, runtime.overload_cooldown_until - time.time())
 
     async def record_probe_result(
         self,
@@ -1832,6 +1881,7 @@ class LoadBalancer:
             capacity_credits=usage_core.capacity_for_plan(account.plan_type, "secondary"),
             routing_policy=routing_policy,
             ignore_standard_quota=False,
+            overload_cooldown_until=runtime.overload_cooldown_until,
         )
 
     def _sync_runtime_state(
@@ -2465,6 +2515,7 @@ def _state_from_account(
         inflight_streams=runtime.inflight_streams,
         leased_tokens=runtime.leased_tokens,
         routing_policy=routing_policy,
+        overload_cooldown_until=runtime.overload_cooldown_until,
     )
 
 

@@ -37,6 +37,7 @@ from app.modules.proxy._service.observability import (
     _record_continuity_fail_closed,
     _record_upstream_transport_decision,
 )
+from app.modules.proxy._service.streaming.overload import OverloadRecovery
 from app.modules.proxy._service.streaming.protocol import _StreamingServiceProtocol
 from app.modules.proxy._service.support import (
     _ACCOUNT_MODEL_UNSUPPORTED_ERROR_CODE,
@@ -57,6 +58,7 @@ from app.modules.proxy._service.websocket.helpers import (
     _websocket_input_items_are_self_contained_fresh_replay,
 )
 from app.modules.proxy.affinity import (
+    _AffinityPolicy,
     _is_synthesized_turn_state,
     _owner_lookup_session_id_from_headers,
     _prompt_cache_key_from_request_model,
@@ -65,7 +67,7 @@ from app.modules.proxy.affinity import (
     _sticky_key_from_turn_state_header,
 )
 from app.modules.proxy.api_key_usage import estimate_api_key_request_usage
-from app.modules.proxy.continuity import resolve_required_account_id
+from app.modules.proxy.continuity import resolve_required_account_id, without_http_bridge_session_affinity_headers
 from app.modules.proxy.helpers import (
     _apply_error_metadata,
     _is_account_model_unsupported_error,
@@ -74,8 +76,10 @@ from app.modules.proxy.helpers import (
     _upstream_error_from_openai,
     classify_upstream_failure,
     is_upstream_model_capacity_error,
+    is_upstream_overload_error,
 )
 from app.modules.proxy.load_balancer import AccountLease, AccountSelection
+from app.modules.proxy.replay_safety import responses_payload_is_account_neutral_fresh_replay
 from app.modules.proxy.selection_errors import USAGE_LIMIT_REACHED, selection_failure_response
 
 _REQUEST_TRANSPORT_HTTP = "http"
@@ -369,10 +373,12 @@ class _StreamingRetryMixin:
         last_account_model_rejection: ProxyResponseError | None = None
         last_account_model_rejection_account_id: str | None = None
         account_model_replacement_account_id: str | None = None
-        account_model_replay_attempted = False
+        model_rejection_account_ids: set[str] = set()
+        model_rejection_retry_requested = False
         current_account_lease: AccountLease | None = None
         last_security_work_retry_error: _RetryableStreamError | None = None
         excluded_account_ids: set[str] = set()
+        overload_recovery = OverloadRecovery()
         transient_failed_account_id: str | None = None
         hard_affinity_same_owner_retry_attempted = False
         deferred_capacity_account: Account | None = None
@@ -410,11 +416,12 @@ class _StreamingRetryMixin:
         async def _release_tracked_stream_lease(lease: AccountLease | None) -> None:
             if lease is None:
                 return
+            # Retain cleanup ownership if cancellation interrupts release.
+            await proxy._load_balancer.release_account_lease(lease)
             try:
                 account_leases.remove(lease)
             except ValueError:
                 pass
-            await proxy._load_balancer.release_account_lease(lease)
 
         def _render_dispatch_transport_error(exc: ProxyResponseError) -> str:
             # Terminal render of the preserved sanitized transport failure:
@@ -569,6 +576,41 @@ class _StreamingRetryMixin:
             )
             return True
 
+        async def _recover_preaccepted_overload(account: Account, code: str | None, error: UpstreamError) -> bool:
+            nonlocal current_account_lease, affinity, preferred_account_id, require_preferred_account, headers
+            if settlement.downstream_visible or settlement.response_id is not None:
+                return False
+            if not is_upstream_overload_error(code, error.get("message")):
+                return False
+            await _release_tracked_stream_lease(current_account_lease)
+            current_account_lease = None
+            # Runtime admission suppression does not persist account-health
+            # state before the logical API-key reservation is settled.
+            await proxy._load_balancer.record_overload(account)
+            overload_recovery.retry(account.id)
+            _move_verified_fresh_replay_from_owner(account_id=account.id, outcome="owner_preaccepted_overload")
+            if (
+                not require_preferred_account
+                and file_preferred_account_id is None
+                and turn_state_owner_account_id is None
+                and responses_payload_is_account_neutral_fresh_replay(payload.to_replay_safety_payload())
+            ):
+                excluded_account_ids.add(account.id)
+                affinity = _AffinityPolicy()
+                preferred_account_id = None
+                headers = without_http_bridge_session_affinity_headers(headers)
+            else:
+                preferred_account_id = account.id
+                require_preferred_account = True
+            logger.info(
+                "Recovering pre-acceptance upstream overload request_id=%s account_id=%s code=%s owner_bound=%s",
+                request_id,
+                account.id,
+                code,
+                require_preferred_account,
+            )
+            return True
+
         async def _stream_post_refresh_with_capacity_recovery(
             account: Account,
             *,
@@ -624,7 +666,7 @@ class _StreamingRetryMixin:
                         and _facade()._should_retry_transient_stream_error(error_code, error_message)
                     )
                     retryable_capacity_rejection = bool(
-                        is_upstream_model_capacity_error(error_message)
+                        is_upstream_overload_error(error_code, error_message)
                         and _facade()._should_retry_transient_stream_error(error_code, error_message)
                     )
                     if retryable_connect_failure or retryable_capacity_rejection:
@@ -651,6 +693,16 @@ class _StreamingRetryMixin:
                     # could duplicate a request that reached the upstream.
                     return
                 except _TransientStreamError as exc:
+                    if (
+                        not settlement.downstream_visible
+                        and settlement.response_id is None
+                        and is_upstream_overload_error(exc.code, exc.error.get("message"))
+                    ):
+                        # Return this explicit rejection to the shared account
+                        # scheduler before generic transient retries consume it.
+                        raise ProxyResponseError(
+                            503, openai_error(exc.code, str(exc.error.get("message") or "Upstream overload"))
+                        ) from exc
                     recovery_decision = await _wait_for_process_network_recovery(
                         account,
                         error_code=exc.code,
@@ -827,8 +879,8 @@ class _StreamingRetryMixin:
             *,
             outcome: str,
         ) -> bool | None:
-            nonlocal affinity, current_account_lease
-            nonlocal account_model_replay_attempted
+            nonlocal affinity, current_account_lease, headers
+            nonlocal model_rejection_retry_requested, preferred_account_id, require_preferred_account
             nonlocal last_account_model_rejection, last_account_model_rejection_account_id
             error = _parse_openai_error(exc.payload)
             error_code = _normalize_error_code(
@@ -841,18 +893,22 @@ class _StreamingRetryMixin:
                 model=payload.model,
             ):
                 return None
+            # A model rejection is replayable only before the request has
+            # produced any owner-bound or downstream-visible state. Raw HTTP
+            # has no pending-response queue, but these settlement guards keep
+            # this helper safe when the same retry facade is entered from a
+            # continuation or bridge path.
+            if settlement.downstream_visible or settlement.response_id is not None:
+                return False
             can_move_verified_owner = bool(
                 require_preferred_account
                 and preferred_account_id == account.id
                 and verified_fresh_replay_payload is not None
+                and file_preferred_account_id is None
             )
             can_try_other_account = bool(
-                not account_model_replay_attempted
-                and attempt < max_attempts - 1
-                and (
-                    can_move_verified_owner
-                    or (not require_preferred_account and account.id != file_preferred_account_id)
-                )
+                account.id not in model_rejection_account_ids
+                and (can_move_verified_owner or (not require_preferred_account and file_preferred_account_id is None))
             )
             if not can_try_other_account:
                 return False
@@ -864,18 +920,46 @@ class _StreamingRetryMixin:
                 outcome,
                 _ACCOUNT_MODEL_UNSUPPORTED_ERROR_CODE,
             )
-            account_model_replay_attempted = True
+            model_rejection_account_ids.add(account.id)
+            model_rejection_retry_requested = True
             last_account_model_rejection = exc
             last_account_model_rejection_account_id = account.id
             await _release_tracked_stream_lease(current_account_lease)
             current_account_lease = None
-            if not _move_verified_fresh_replay_from_owner(
+            moved_verified_owner = _move_verified_fresh_replay_from_owner(
                 account_id=account.id,
                 outcome=outcome,
+            )
+            if (
+                not require_preferred_account
+                and preferred_account_id is None
+                and file_preferred_account_id is None
+                and turn_state_owner_account_id is None
             ):
+                # A legacy raw CODEX_SESSION row is a hard affinity mapping
+                # inside the balancer. Reallocate-sticky alone cannot bypass
+                # that row, so remove the request's session aliases when this
+                # is a fresh, ownerless request. The rejection is
+                # account-scoped and the excluded set still prevents returning
+                # to the failed account. File/continuation/turn-state owners
+                # have already set ``require_preferred_account`` or the
+                # corresponding preferred owner above and stay pinned.
+                excluded_account_ids.add(account.id)
+                affinity = _AffinityPolicy()
+                preferred_account_id = None
+                require_preferred_account = False
+                headers = without_http_bridge_session_affinity_headers(headers)
+            elif not moved_verified_owner:
                 excluded_account_ids.add(account.id)
                 affinity = replace(affinity, reallocate_sticky=True)
             return True
+
+        def _reset_model_rejection_retry() -> None:
+            nonlocal model_rejection_retry_requested
+            model_rejection_retry_requested = False
+
+        def _model_rejection_retry_requested() -> bool:
+            return model_rejection_retry_requested
 
         if api_key_reservation_settlement_started is not None:
             api_key_reservation_settlement_started.set()
@@ -946,7 +1030,11 @@ class _StreamingRetryMixin:
             )
             require_preferred_account = require_preferred_account or turn_state_owner_account_id is not None
             file_required_preferred_account = rewritten_file_account_id is not None
-            for attempt in range(max_attempts):
+            for attempt in overload_recovery.attempts(
+                max_attempts,
+                extra_retry_requested=_model_rejection_retry_requested,
+                reset_extra_retry=_reset_model_rejection_retry,
+            ):
                 remaining_budget = _facade()._remaining_budget_seconds(deadline)
                 if remaining_budget <= 0:
                     await _drain_pending_post_refresh_penalty_on_terminal(settlement)
@@ -1037,6 +1125,35 @@ class _StreamingRetryMixin:
                     current_account_lease = selection.lease
                     if selection.lease is not None:
                         account_leases.append(selection.lease)
+                    if account is not None:
+                        overload_recovery.account_ids.discard(account.id)
+                    elif overload_recovery.account_ids and selection.error_code not in {
+                        USAGE_LIMIT_REACHED,
+                        _facade()._NO_SECURITY_WORK_AUTHORIZED_ACCOUNTS_CODE,
+                    }:
+                        if _facade()._remaining_budget_seconds(deadline) <= 0:
+                            yield format_sse_event(_facade()._proxy_request_timeout_event(request_id))
+                            return
+                        async for wait_event in _iter_account_capacity_recovery_wait(
+                            request_id=request_id,
+                            model=payload.model,
+                            account_id=preferred_account_id,
+                            error_message=selection.error_message or "Waiting for upstream overload recovery",
+                            recovery_sleep_seconds=1.0,
+                            deadline=deadline,
+                            emit_keepalives=not propagate_http_errors or not enforce_openai_sdk_contract,
+                            stage="upstream_overload",
+                        ):
+                            yield wait_event
+                        # Only temporary overload exclusions are released. The
+                        # balancer's cooldown still decides whether they can run.
+                        # Overload recovery may temporarily re-admit an account,
+                        # but a model-rejected account remains excluded for the
+                        # full request-local sweep.
+                        excluded_account_ids.difference_update(
+                            overload_recovery.account_ids - model_rejection_account_ids
+                        )
+                        continue
                     if (
                         not account
                         and require_security_work_authorized
@@ -1430,12 +1547,11 @@ class _StreamingRetryMixin:
                         last_transient_exc = None
                     last_pre_dispatch_transport_error = None
                 if last_account_model_rejection is not None and account.id != last_account_model_rejection_account_id:
-                    # The original 400 is only the fallback when account
+                    # The original rejection is only the fallback when account
                     # selection cannot produce a replacement. Once this
                     # replacement attempt starts, its own failure is the one
-                    # that must reach the client. Keep the separate replay
-                    # budget so another account/model rejection cannot trigger
-                    # a second transparent replay.
+                    # that must reach the client. The request-local rejection
+                    # set separately prevents revisiting earlier accounts.
                     account_model_replacement_account_id = account.id
                     last_account_model_rejection = None
                     last_account_model_rejection_account_id = None
@@ -1793,10 +1909,7 @@ class _StreamingRetryMixin:
                                 request_id,
                                 allow_retry_flag,
                                 request_started_at=start,
-                                allow_transient_retry=(
-                                    transient_retries < _facade()._MAX_TRANSIENT_SAME_ACCOUNT_RETRIES - 1
-                                    or allow_retry_flag
-                                ),
+                                allow_transient_retry=True,
                                 api_key=api_key,
                                 api_key_reservation=api_key_reservation,
                                 settlement=settlement,
@@ -1909,6 +2022,18 @@ class _StreamingRetryMixin:
                                         settlement.error_code or "upstream_error",
                                     )
                                 return
+                            overload_error = (
+                                _upstream_error_from_openai(_parse_openai_error(tex.payload))
+                                if isinstance(tex, ProxyResponseError)
+                                else tex.error
+                            )
+                            overload_code = (
+                                _normalize_error_code(overload_error.get("code"), overload_error.get("type"))
+                                if isinstance(tex, ProxyResponseError)
+                                else tex.code
+                            )
+                            if await _recover_preaccepted_overload(account, overload_code, overload_error):
+                                break
                             if isinstance(tex, ProxyResponseError) and tex.status_code != 500:
                                 error = _parse_openai_error(tex.payload)
                                 code = _normalize_error_code(
@@ -2558,6 +2683,10 @@ class _StreamingRetryMixin:
                                 error.code if error else None,
                                 error.type if error else None,
                             )
+                            if await _recover_preaccepted_overload(
+                                account, error_code, _upstream_error_from_openai(error)
+                            ):
+                                continue
                             if getattr(retry_exc, _POST_REFRESH_TRANSIENT_EXHAUSTED_ATTR, False):
                                 transient_error_payload = _stream_settlement_error_payload(settlement)
                                 last_transient_exc = retry_exc

@@ -87,6 +87,48 @@ def _request_state(
 
 
 @pytest.mark.asyncio
+async def test_account_response_create_lease_release_defers_cancellation() -> None:
+    @asynccontextmanager
+    async def repo_factory() -> AsyncIterator[SimpleNamespace]:
+        yield SimpleNamespace(request_logs=_RequestLogsRecorder(), api_keys=object())
+
+    service = proxy_service.ProxyService(cast(proxy_service.ProxyRepoFactory, repo_factory))
+    request_state = _request_state("request_account_lease_cancel")
+    lease = object()
+    release_started = asyncio.Event()
+    release_gate = asyncio.Event()
+    released: list[object] = []
+
+    async def release_account_lease(release_lease: object | None) -> None:
+        assert release_lease is lease
+        released.append(release_lease)
+        release_started.set()
+        await release_gate.wait()
+
+    request_state.account_response_create_lease = cast(Any, lease)
+    request_state.account_response_create_release = cast(Any, release_account_lease)
+    release_task = asyncio.create_task(service._release_request_state_account_response_create_lease(request_state))
+    try:
+        await asyncio.wait_for(release_started.wait(), timeout=1)
+        release_task.cancel()
+        await asyncio.sleep(0)
+        assert request_state.account_response_create_lease is lease
+
+        release_gate.set()
+        with pytest.raises(asyncio.CancelledError):
+            await release_task
+    finally:
+        release_gate.set()
+        if not release_task.done():
+            release_task.cancel()
+        await asyncio.gather(release_task, return_exceptions=True)
+
+    assert released == [lease]
+    assert request_state.account_response_create_lease is None
+    assert request_state.account_response_create_release is None
+
+
+@pytest.mark.asyncio
 async def test_empty_transport_end_partition_leaves_late_unsent_append_sender_owned() -> None:
     pending_requests: deque[proxy_service._WebSocketRequestState] = deque()
     pending_lock = anyio.Lock()

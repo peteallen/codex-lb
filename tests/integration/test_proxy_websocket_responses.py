@@ -4914,7 +4914,7 @@ def test_backend_responses_websocket_injects_interrupted_custom_tool_output_afte
     )
 
 
-def test_backend_responses_websocket_trims_replayed_tool_call_items_with_previous_response_id(
+def test_backend_responses_websocket_preserves_unconfirmed_replayed_tool_call_items_with_previous_response_id(
     app_instance,
     monkeypatch,
 ):
@@ -5016,10 +5016,16 @@ def test_backend_responses_websocket_trims_replayed_tool_call_items_with_previou
     assert sent_payload["previous_response_id"] == "resp_prev_tool_call"
     assert sent_payload["input"] == [
         {
+            "type": "function_call",
+            "call_id": "call_repeat",
+            "name": "exec_command",
+            "arguments": '{"cmd":"date"}',
+        },
+        {
             "type": "function_call_output",
             "call_id": "call_repeat",
             "output": "Wed May 6 16:00:00 UTC 2026",
-        }
+        },
     ]
 
 
@@ -9562,9 +9568,35 @@ def test_backend_responses_websocket_transparently_retries_precreated_error_usag
     )
 
 
+@pytest.mark.parametrize("websocket_path", ["/backend-api/codex/responses", "/v1/responses"])
+@pytest.mark.parametrize(
+    ("model", "error_code", "error_message"),
+    [
+        (
+            "gpt-5.6-sol",
+            "invalid_request_error",
+            "The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account.",
+        ),
+        (
+            "gpt-6-sol",
+            "model_not_found",
+            "The model `gpt-6-sol` does not exist or you do not have access to it.",
+        ),
+        (
+            "gpt-6-luna",
+            "model_not_found",
+            "The model `gpt-6-luna` does not exist or you do not have access to it.",
+        ),
+    ],
+    ids=["legacy", "gpt-6-sol", "gpt-6-luna"],
+)
 def test_backend_responses_websocket_retries_stale_account_model_route_on_another_account(
     app_instance,
     monkeypatch,
+    websocket_path,
+    model,
+    error_code,
+    error_message,
 ):
     first_upstream = _FakeUpstreamWebSocket(
         [
@@ -9576,10 +9608,8 @@ def test_backend_responses_websocket_retries_stale_account_model_route_on_anothe
                         "status": 400,
                         "error": {
                             "type": "invalid_request_error",
-                            "code": "invalid_request_error",
-                            "message": (
-                                "The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account."
-                            ),
+                            "code": error_code,
+                            "message": error_message,
                         },
                     },
                     separators=(",", ":"),
@@ -9683,21 +9713,21 @@ def test_backend_responses_websocket_retries_stale_account_model_route_on_anothe
 
     request_payload = {
         "type": "response.create",
-        "model": "gpt-5.6-sol",
+        "model": model,
         "instructions": "",
         "input": [{"role": "user", "content": [{"type": "input_text", "text": "retry safely"}]}],
         "stream": True,
     }
 
     with TestClient(app_instance) as client:
-        with client.websocket_connect("/backend-api/codex/responses") as websocket:
+        with client.websocket_connect(websocket_path) as websocket:
             websocket.send_text(json.dumps(request_payload))
             first_event = json.loads(websocket.receive_text())
             second_event = json.loads(websocket.receive_text())
 
     assert first_event["type"] == "response.created"
     assert second_event["type"] == "response.completed"
-    assert connect_models == ["gpt-5.6-sol", "gpt-5.6-sol"]
+    assert connect_models == [model, model]
     assert excluded_snapshots == [set(), {account_ids[0]}]
     assert handled_error_codes == []
     assert first_upstream.closed is True
@@ -9706,6 +9736,198 @@ def test_backend_responses_websocket_retries_stale_account_model_route_on_anothe
     assert _without_installation_metadata(json.loads(first_upstream.sent_text[0])) == _without_installation_metadata(
         json.loads(second_upstream.sent_text[0])
     )
+
+
+@pytest.mark.parametrize("websocket_path", ["/backend-api/codex/responses", "/v1/responses"])
+@pytest.mark.parametrize(
+    "boundary",
+    ["accepted", "output", "file_pinned"],
+    ids=["accepted", "output", "file-pinned"],
+)
+def test_backend_responses_websocket_does_not_replay_model_rejection_after_acceptance_or_file_pin(
+    app_instance,
+    monkeypatch,
+    websocket_path,
+    boundary,
+):
+    model = "gpt-6-sol"
+    error_message = "The model `gpt-6-sol` does not exist or you do not have access to it."
+    response_id = "resp_ws_model_rejection_accepted"
+    if boundary == "file_pinned":
+        first_messages = [
+            _FakeUpstreamMessage(
+                "text",
+                text=json.dumps(
+                    {
+                        "type": "error",
+                        "status": 400,
+                        "error": {
+                            "type": "invalid_request_error",
+                            "code": "model_not_found",
+                            "message": error_message,
+                        },
+                    },
+                    separators=(",", ":"),
+                ),
+            )
+        ]
+    else:
+        first_messages = [
+            _FakeUpstreamMessage(
+                "text",
+                text=json.dumps(
+                    {
+                        "type": "response.created",
+                        "response": {"id": response_id, "status": "in_progress"},
+                    },
+                    separators=(",", ":"),
+                ),
+            )
+        ]
+        if boundary == "output":
+            first_messages.append(
+                _FakeUpstreamMessage(
+                    "text",
+                    text=json.dumps(
+                        {
+                            "type": "response.output_text.delta",
+                            "response_id": response_id,
+                            "output_index": 0,
+                            "delta": "partial",
+                        },
+                        separators=(",", ":"),
+                    ),
+                )
+            )
+        first_messages.append(
+            _FakeUpstreamMessage(
+                "text",
+                text=json.dumps(
+                    {
+                        "type": "response.failed",
+                        "response": {
+                            "id": response_id,
+                            "status": "failed",
+                            "error": {
+                                "type": "invalid_request_error",
+                                "code": "model_not_found",
+                                "message": error_message,
+                            },
+                        },
+                    },
+                    separators=(",", ":"),
+                ),
+            )
+        )
+    first_upstream = _FakeUpstreamWebSocket(first_messages)
+    second_upstream = _FakeUpstreamWebSocket(
+        [
+            _FakeUpstreamMessage(
+                "text",
+                text=json.dumps(
+                    {"type": "response.created", "response": {"id": "resp_ws_unexpected_retry"}},
+                    separators=(",", ":"),
+                ),
+            )
+        ]
+    )
+    upstreams = [first_upstream, second_upstream]
+    connect_models: list[str | None] = []
+
+    class _FakeSettingsCache:
+        async def get(self):
+            return _websocket_settings()
+
+    async def allow_firewall(_websocket):
+        return None
+
+    async def allow_proxy_api_key(_authorization: str | None, *, request: object | None = None):
+        return None
+
+    async def fake_resolve_file_account(self, payload, headers):
+        del self, payload, headers
+        return "acct_ws_model_rejected"
+
+    async def fake_connect_proxy_websocket(
+        self,
+        headers,
+        *,
+        sticky_key,
+        sticky_kind,
+        reallocate_sticky,
+        sticky_max_age_seconds,
+        prefer_earlier_reset,
+        prefer_earlier_reset_window,
+        routing_strategy,
+        model,
+        request_state,
+        api_key,
+        client_send_lock,
+        websocket,
+    ):
+        del (
+            self,
+            headers,
+            sticky_key,
+            sticky_kind,
+            reallocate_sticky,
+            sticky_max_age_seconds,
+            prefer_earlier_reset,
+            prefer_earlier_reset_window,
+            routing_strategy,
+            request_state,
+            api_key,
+            client_send_lock,
+            websocket,
+        )
+        index = len(connect_models)
+        connect_models.append(model)
+        return SimpleNamespace(id="acct_ws_model_rejected"), upstreams[index]
+
+    monkeypatch.setattr(proxy_api_module, "_websocket_firewall_denial_response", allow_firewall)
+    monkeypatch.setattr(proxy_api_module, "validate_proxy_api_key_authorization", allow_proxy_api_key)
+    monkeypatch.setattr(proxy_module, "get_settings_cache", lambda: _FakeSettingsCache())
+    monkeypatch.setattr(proxy_module.ProxyService, "_connect_proxy_websocket", fake_connect_proxy_websocket)
+    if boundary == "file_pinned":
+        monkeypatch.setattr(proxy_module.ProxyService, "_resolve_file_account_for_responses", fake_resolve_file_account)
+
+    request_payload = {
+        "type": "response.create",
+        "model": model,
+        "instructions": "",
+        "input": (
+            [{"role": "user", "content": [{"type": "input_text", "text": "use the uploaded file"}]}]
+            if boundary != "file_pinned"
+            else [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "use the uploaded file"},
+                        {"type": "input_file", "file_id": "file_ws_model_rejected"},
+                    ],
+                }
+            ]
+        ),
+        "stream": True,
+    }
+
+    with TestClient(app_instance) as client:
+        with client.websocket_connect(websocket_path) as websocket:
+            websocket.send_text(json.dumps(request_payload))
+            expected_event_count = {"accepted": 2, "output": 3, "file_pinned": 1}[boundary]
+            events = [json.loads(websocket.receive_text()) for _ in range(expected_event_count)]
+
+    if boundary == "file_pinned":
+        assert [event["type"] for event in events] == ["error"]
+    else:
+        expected_types = ["response.created"]
+        if boundary == "output":
+            expected_types.append("response.output_text.delta")
+        expected_types.append("response.failed")
+        assert [event["type"] for event in events] == expected_types
+    assert connect_models == [model]
+    assert len(first_upstream.sent_text) == 1
+    assert len(second_upstream.sent_text) == 0
 
 
 def test_backend_responses_websocket_previous_response_usage_limit_returns_upstream_unavailable(

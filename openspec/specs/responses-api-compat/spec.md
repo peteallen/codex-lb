@@ -3685,3 +3685,110 @@ HTTP streaming, bridged and native WebSocket completions, compact responses, and
 - **WHEN** a successful Astra response includes cache-write tokens
 - **THEN** the persisted log retains that count
 - **AND** its estimate and finalized API-key cost include the same cache-write charge
+
+### Requirement: Recoverable upstream overload waits for eligible capacity
+
+For raw HTTP, bridged HTTP, and direct WebSocket Responses traffic, an explicit upstream overload received before acceptance or downstream-visible output MUST enter recovery instead of immediately emitting a terminal error. Recovery MUST prefer another eligible account over soft session or prompt-cache affinity. If eligible capacity is temporarily unavailable, the request MUST wait with existing keepalive semantics until capacity recovers, its request deadline expires, or the client cancels. A recoverable overload MUST NOT terminate solely because a fixed account-attempt count is exhausted.
+
+Recovery MUST preserve file and upstream-state ownership unless a complete account-neutral request is available under the existing replay proof. An upstream response id, visible response progress, or delivered tool action MUST retain the existing no-replay guards. Generic failures MUST NOT acquire overload retry eligibility solely from a 5xx status.
+
+#### Scenario: Initial raw HTTP overload uses another account
+- **GIVEN** account A is preferred by soft affinity and account B is eligible
+- **WHEN** A returns a first-event `server_is_overloaded` or `overloaded_error` without an upstream response id
+- **THEN** the original request is retried safely through B without exposing A's terminal error
+- **AND** the client receives B's ordinary completion events
+
+#### Scenario: Repeated overload waits beyond the attempt-count threshold
+- **WHEN** every eligible account temporarily rejects a pre-acceptance request with overload and the request budget remains
+- **THEN** recovery releases attempt leases and waits before reconsidering capacity
+- **AND** later restored capacity completes the same downstream request
+
+#### Scenario: Accepted or visible work is not replayed
+- **WHEN** an overload arrives with an upstream response id or after visible response progress
+- **THEN** the proxy preserves the existing terminal behavior and does not repeat the request
+
+#### Scenario: Owner-bound rejection waits without crossing accounts
+- **GIVEN** a request requires an upstream owner and has no verified complete account-neutral replay
+- **WHEN** that owner temporarily rejects it before acceptance with overload
+- **THEN** the request waits for its owner within the request budget
+- **AND** it is never dispatched on another account
+
+#### Scenario: Cancelled overload waiter releases resources
+- **WHEN** the downstream cancels while overload recovery is waiting
+- **THEN** waiting stops promptly and admission, stream leases, and the logical API-key reservation are released or settled exactly once
+
+
+### Requirement: HTTP bridge isolation does not imply conversation continuity
+For an unanchored OpenAI-style HTTP Responses request, a session-header bridge isolation key alone MUST NOT cause the proxy to inject the durable last response ID when reconnecting. Durable anchor injection MUST require Codex-session continuity affinity or a verified stored input prefix, in addition to existing anchor eligibility guards. Explicit client previous-response IDs and turn-state continuity MUST retain their ownership constraints.
+
+#### Scenario: Independent request reconnects after an upstream response expires
+- **GIVEN** a plain `/v1/responses` request completed on a session-header bridge
+- **AND** the upstream connection closed and its last response ID is no longer available
+- **WHEN** another short request uses that session header without a previous-response ID, turn state, or verified stored input prefix
+- **THEN** the proxy sends the client's request without injecting a previous-response ID
+- **AND** the request can complete without stale-anchor retries
+
+#### Scenario: Explicit continuity survives reconnect
+- **WHEN** the client supplies a previous-response ID or Codex turn state on reconnect
+- **THEN** the bridge preserves the existing anchored continuity and ownership behavior
+
+#### Scenario: Verified stored-prefix reuse survives reconnect
+- **WHEN** the client's resend matches the stored input prefix
+- **THEN** existing safe anchor reuse and full-resend recovery rules remain applicable
+
+### Requirement: Anchored WebSocket trimming preserves unproven tool calls
+
+For `/backend-api/codex/responses` and `/v1/responses` WebSocket requests with `previous_response_id`, the service MUST remove a leading replayed tool call only when existing continuity state for that exact response confirms the call ID and call type were emitted upstream. This MUST apply to `function_call`, `custom_tool_call`, and `apply_patch_call`. The service MUST preserve unconfirmed calls and all tool outputs in their relative order. Missing continuity state, a different completed response ID, or a different call type MUST NOT authorize removing a call. Existing treatment of assistant/reasoning replay prefixes and non-replay prefixes MUST remain unchanged.
+
+#### Scenario: Client-created visualization call survives
+- **WHEN** an anchored request includes a visualization function call, its output, and a user message, and the referenced upstream response did not emit that call
+- **THEN** the upstream request retains all three items unchanged
+
+#### Scenario: Confirmed upstream call is deduplicated
+- **WHEN** an anchored follow-up replays a call whose ID and type match the recorded calls of that exact completed response
+- **THEN** the service removes the duplicate call and retains its output
+
+#### Scenario: Unknown or mismatched continuity preserves calls
+- **WHEN** continuity is absent or identifies another response or another call type
+- **THEN** the service preserves the supplied tool call and its output
+
+#### Scenario: Mixed prefix preserves newly introduced calls
+- **WHEN** a replay prefix contains both a confirmed upstream call and an unconfirmed client-created call
+- **THEN** the service removes only the confirmed call and retains the unconfirmed call and every output in relative order
+
+### Requirement: Canonical model-not-found rejection uses safe account recovery
+
+The Responses proxy MUST recognize upstream error code `model_not_found` with the whitespace-normalized message "The model `<model>` does not exist or you do not have access to it." for the exact requested model as an account/model rejection eligible for safe replacement-account recovery. This behavior MUST apply to native WebSocket, HTTP streaming, and HTTP bridge requests. Recovery MUST continue through remaining eligible accounts after consecutive canonical account/model rejections, within the original request deadline. Each rejecting account MUST be excluded from further attempts for that request. Account/model rejection retries MUST NOT consume the generic transient replay allowance, and MUST stop when no eligible account remains or the deadline expires. Recovery MUST preserve the requested model and API-key scope, exclude the rejecting account for that retry, and preserve existing file-ownership and continuation replay constraints. The proxy MUST NOT replay accepted work or work with upstream output. When no replacement can be selected, the original upstream rejection MUST remain the client-visible error. A rejection with a different model or unrelated message MUST NOT qualify through this classifier.
+
+#### Scenario: New model executes on an eligible replacement
+
+- **WHEN** a fresh request for `gpt-6-sol` or `gpt-6-luna` receives the canonical rejection before acceptance
+- **AND** another eligible account is available
+- **THEN** the proxy retries the same model on a different eligible account
+- **AND** a successful replacement response reaches the client without the first rejection
+
+#### Scenario: No replacement is available
+
+- **WHEN** a canonical model-not-found rejection qualifies for recovery but no replacement account can be selected
+- **THEN** the proxy returns the original model-not-found error
+
+#### Scenario: Unsafe or unrelated errors do not replay
+
+- **WHEN** a request is file-pinned, has an unverified owner-bound continuation, has already been accepted, or has produced upstream output
+- **THEN** a canonical model-not-found rejection does not trigger cross-account replay
+- **WHEN** a model-not-found error names another model or contains an unrelated message
+- **THEN** that error does not trigger account/model recovery
+
+#### Scenario: Multiple accounts reject a released model
+
+- **GIVEN** two eligible accounts reject the requested model before acceptance
+- **AND** a third account supports it
+- **WHEN** a fresh request is routed through the pool
+- **THEN** the proxy excludes both rejecting accounts and completes on the third
+- **AND** no account is tried twice for that request
+
+#### Scenario: All eligible accounts reject
+
+- **WHEN** every eligible account returns an account/model rejection
+- **THEN** the proxy stops after trying each eligible account at most once
+- **AND** returns the last upstream model rejection without repeating the pool

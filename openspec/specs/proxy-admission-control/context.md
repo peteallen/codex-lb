@@ -36,3 +36,23 @@ Session-gate waiters no longer hold account startup leases. One stalled turn and
 For example, a client resends the previous input, the assistant output, and a new question under the same session/cache key. If the warm bridge is busy, the proxy sends the complete request on an independent connection to the same account. If that account is capped, it selects another eligible account. The canonical session and sticky mapping stay in place. Explicit client anchors, opaque references, file ownership, and incomplete context disable this escape. Any upstream dispatch, including an ambiguous send failure, also disables it.
 
 Capacity retries snapshot separate startup and stream release signals before admission. Releases during an attempt remain visible to the waiter; releasing a temporary stream lease cannot repeatedly wake a startup-cap wait. When a round exhausts all candidates, temporary exclusions are cleared for the next round. Upstream quota and provider backoff keep their existing timing. No cap or timeout setting changes are needed.
+
+## Upstream overload cooldown
+
+Explicit upstream overloads suppress an account in runtime selection for a bounded cooldown, starting at 30 seconds and capped at 300 seconds when overlapping rejections escalate it. Successes from concurrent requests do not cancel an active hold. Expiry allows normal selection to probe recovery. The hold changes neither persisted account status nor generic health backoff and adds no settings or migrations.
+
+For example, alternating successes and overloads on account A no longer let each success immediately return A to routing. New eligible work can use B, and requests wait when every eligible account is cooling. Local admission errors and invalid input do not create this upstream cooldown.
+
+## Repeated overload recovery probes
+
+Cooldown expiry only permits a new attempt; it does not prove recovery. The
+runtime retains the latest overload timestamp for a fixed 15-minute recurrence
+window, allowing holds to escalate through 30, 60, 120, 240, and 300 seconds even
+when probes happen after expiry or some requests succeed. The count caps at
+five and resets lazily after a quiet window. No operator setting is needed.
+
+For example, overload at time zero holds the account for 30 seconds. Another
+overload at second 31 holds it for 60 more seconds, so an independent request
+at second 62 selects a healthy alternative. Explicit owner-bound requests still
+follow their existing ownership and deadline rules. Accepted work remains
+ineligible for automatic replay solely because the terminal error is overload.

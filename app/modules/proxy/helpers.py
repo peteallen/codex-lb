@@ -48,12 +48,17 @@ def _is_account_model_unsupported_error(
     message: str | None,
     model: str | None,
 ) -> bool:
-    """Match only the account-entitlement rejection for the requested model."""
-    if code != "invalid_request_error" or message is None or model is None:
+    """Match canonical account/model rejections for the exact requested model."""
+    if message is None or model is None:
         return False
     normalized_message = " ".join(message.split())
-    expected_message = f"The '{model}' model is not supported when using Codex with a ChatGPT account."
-    return normalized_message == expected_message
+    if code == "invalid_request_error":
+        return normalized_message == f"The '{model}' model is not supported when using Codex with a ChatGPT account."
+    if code == "model_not_found":
+        # Catalog publication can precede execution access on individual
+        # accounts. Callers retain their bounded, pre-acceptance replay checks.
+        return normalized_message == f"The model `{model}` does not exist or you do not have access to it."
+    return False
 
 
 def is_upstream_model_capacity_error(message: str | None) -> bool:
@@ -61,6 +66,13 @@ def is_upstream_model_capacity_error(message: str | None) -> bool:
         return False
     normalized_message = " ".join(message.lower().split())
     return any(marker in normalized_message for marker in _MODEL_CAPACITY_MESSAGE_MARKERS)
+
+
+def is_upstream_overload_error(code: str | None, message: str | None) -> bool:
+    """Recognize explicit capacity rejection without treating quota as overload."""
+    if code in _RATE_LIMIT_CODES or code in _QUOTA_CODES:
+        return False
+    return code in {"overloaded_error", "server_is_overloaded"} or is_upstream_model_capacity_error(message)
 
 
 def classify_upstream_failure(

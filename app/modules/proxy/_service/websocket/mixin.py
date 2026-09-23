@@ -336,6 +336,7 @@ from app.modules.proxy._service.support import (
     _WebSocketRequestState,
     _WebSocketTransientRefreshFailover,
     _WebSocketUpstreamControl,
+    overload_replay_is_account_neutral,
 )
 from app.modules.proxy._service.support import (
     _HTTPBridgeOwnerForward as _HTTPBridgeOwnerForward,
@@ -391,6 +392,7 @@ from app.modules.proxy._service.websocket.helpers import (
     _record_websocket_continuity_completion,
     _record_websocket_responses_lite_acceptance,
     _record_websocket_stale_anchor_failure,
+    _release_websocket_account_response_create_lease,
     _release_websocket_response_create_gate,
     _rewrite_websocket_continuity_corruption_event,
     _rewrite_websocket_downstream_response_id,
@@ -425,6 +427,7 @@ from app.modules.proxy._service.websocket.helpers import (
     _websocket_response_id,
     _wrapped_websocket_error_event,
 )
+from app.modules.proxy._service.websocket.overload import prepare_overload_recovery
 from app.modules.proxy._service.websocket.protocol import _WebSocketServiceProtocol
 from app.modules.proxy.affinity import (
     _AffinityPolicy,
@@ -447,7 +450,7 @@ from app.modules.proxy.capability_routing import (
     reject_capability_signal_outside_response_create,
     strip_capability_metadata,
 )
-from app.modules.proxy.continuity import resolve_required_account_id
+from app.modules.proxy.continuity import resolve_required_account_id, without_http_bridge_session_affinity_headers
 from app.modules.proxy.durable_bridge_coordinator import (
     DurableBridgeLookup as DurableBridgeLookup,
 )
@@ -456,6 +459,7 @@ from app.modules.proxy.helpers import (
     _normalize_error_code,
     _parse_openai_error,
     _upstream_error_from_openai,
+    is_upstream_overload_error,
 )
 from app.modules.proxy.http_bridge_forwarding import (
     HTTPBridgeForwardContext as HTTPBridgeForwardContext,
@@ -1225,6 +1229,18 @@ async def _process_upstream_websocket_transport_end(
 
 
 class _WebSocketMixin:
+    async def _release_request_state_account_response_create_lease(
+        self,
+        request_state: "_WebSocketRequestState",
+    ) -> None:
+        if request_state.account_response_create_release is None:
+            request_state.account_response_create_release = cast(
+                _WebSocketServiceProtocol, self
+            )._load_balancer.release_account_lease
+        cancellation = await _release_websocket_account_response_create_lease(request_state)
+        if cancellation is not None:
+            raise cancellation
+
     def _websocket_continuity_state_for_request(
         self,
         headers: Mapping[str, str],
@@ -2363,6 +2379,11 @@ class _WebSocketMixin:
                             key: value for key, value in filtered_headers.items() if key.lower() != "x-codex-turn-state"
                         }
                     connect_headers = _facade()._headers_with_turn_state(filtered_headers, upstream_turn_state)
+                    if (
+                        request_state.overload_recovery_pending
+                        or request_state.precreated_replay_reason == _ACCOUNT_MODEL_UNSUPPORTED_ERROR_CODE
+                    ) and request_state.preferred_account_id is None:
+                        connect_headers = without_http_bridge_session_affinity_headers(connect_headers)
                     account, upstream = await proxy._connect_proxy_websocket(
                         connect_headers,
                         sticky_key=request_affinity.selection_key,
@@ -3193,7 +3214,16 @@ class _WebSocketMixin:
                 input_value=responses_payload.input,
                 continuity_state=continuity_state,
             )
-            trimmed_input_items = _trim_websocket_previous_response_input_items(previous_response_input_items)
+            confirmed_tool_call_types = (
+                continuity_state.last_pending_tool_call_types
+                if continuity_state is not None
+                and responses_payload.previous_response_id == continuity_state.last_completed_response_id
+                else None
+            )
+            trimmed_input_items = _trim_websocket_previous_response_input_items(
+                previous_response_input_items,
+                confirmed_tool_call_types=confirmed_tool_call_types,
+            )
             if len(trimmed_input_items) != len(previous_response_input_items):
                 previous_response_trimmed_input_count = len(previous_response_input_items)
                 previous_response_trimmed_input_fingerprint = _facade()._fingerprint_input_items(
@@ -3581,6 +3611,7 @@ class _WebSocketMixin:
                 (request_state.previous_response_id is not None and request_state.preferred_account_id is not None)
                 or request_state.file_required_preferred_account
                 or turn_state_owner_required
+                or (request_state.overload_recovery_pending and request_state.preferred_account_id is not None)
             )
             try:
                 account = await proxy._select_websocket_connect_account(
@@ -5527,6 +5558,24 @@ class _WebSocketMixin:
             payload=payload,
             has_other_pending_requests=has_other_pending_requests,
         )
+        if retry_error_code is not None and is_upstream_overload_error(
+            retry_error_code, _websocket_event_error_message(event_type, payload)
+        ):
+            # Transfer ownership before awaiting cleanup: this terminal state
+            # has already left pending_requests, so scope cancellation must
+            # still be able to find and settle it.
+            upstream_control.replay_request_state = request_state
+            await prepare_overload_recovery(
+                proxy,
+                account,
+                request_state,
+                response_create_gate,
+                error={"message": _websocket_event_error_message(event_type, payload) or "Upstream overload"},
+                error_code=retry_error_code,
+            )
+            upstream_control.reconnect_requested = True
+            upstream_control.suppress_downstream_event = True
+            return text
         auth_error_code = _websocket_precreated_auth_error_code(
             request_state,
             event_type=event_type,
@@ -5622,6 +5671,9 @@ class _WebSocketMixin:
             if not request_state.file_required_preferred_account:
                 retry_text = _prepare_websocket_request_state_for_account_switch(request_state)
             if retry_text is not None:
+                account_neutral_replay = (
+                    request_state.preferred_account_id is None and overload_replay_is_account_neutral(request_state)
+                )
                 request_state.precreated_replay_reason = _ACCOUNT_MODEL_UNSUPPORTED_ERROR_CODE
                 request_state.precreated_replay_account_id = account.id
                 request_state.error_code_override = (
@@ -5641,12 +5693,18 @@ class _WebSocketMixin:
                 request_state.error_http_status_override = _facade()._http_error_status_from_payload(payload) or 400
                 await proxy._release_request_state_account_response_create_lease(request_state)
                 request_state.excluded_account_ids.add(account.id)
-                request_state.affinity_policy = replace(
-                    request_state.affinity_policy,
-                    reallocate_sticky=True,
-                )
+                if account_neutral_replay:
+                    # A raw CODEX_SESSION row is a hard balancer mapping.
+                    # Once this request is proven to be a fresh, account-neutral
+                    # replay, retain the request-local exclusion but drop that
+                    # owner anchor so the replacement selection can proceed.
+                    request_state.affinity_policy = _AffinityPolicy()
+                else:
+                    request_state.affinity_policy = replace(
+                        request_state.affinity_policy,
+                        reallocate_sticky=True,
+                    )
                 request_state.request_text = retry_text
-                request_state.replay_count += 1
                 request_state.awaiting_response_created = True
                 request_state.response_id = None
                 request_state.response_event_count = 0

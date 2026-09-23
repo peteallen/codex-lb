@@ -92,6 +92,9 @@ DRAIN_SECONDARY_THRESHOLD_PCT = 90.0
 DRAIN_ERROR_WINDOW_SECONDS = 60.0
 DRAIN_ERROR_COUNT_THRESHOLD = 2
 ERROR_BACKOFF_THRESHOLD = 3
+UPSTREAM_OVERLOAD_COOLDOWN_MIN_SECONDS = 30.0
+UPSTREAM_OVERLOAD_COOLDOWN_MAX_SECONDS = 300.0
+UPSTREAM_OVERLOAD_COOLDOWN_ERROR_CODE = "upstream_overload_cooldown"
 PROBE_QUIET_SECONDS = 60.0
 PROBE_SUCCESS_STREAK_REQUIRED = 3
 ROUTING_POLICY_NORMAL = "normal"
@@ -140,6 +143,7 @@ class AccountState:
     leased_tokens: float = 0.0
     routing_policy: str = ROUTING_POLICY_NORMAL
     ignore_standard_quota: bool = False
+    overload_cooldown_until: float | None = None
 
 
 @dataclass
@@ -532,6 +536,12 @@ def select_account(
     current = now or time.time()
     available: list[AccountState] = []
     in_error_backoff: list[AccountState] = []
+    overload_cooldown_deadlines: list[float] = []
+    # Count accounts after static status/cooldown filtering, before generic
+    # transient backoff. A backoff account remains the ordinary fallback
+    # candidate when the selector is configured to use that path, so it must
+    # prevent an overload-only result from masking the existing fallback.
+    otherwise_eligible_count = 0
     all_states = list(states)
     usage_exhaustion_state_list = list(usage_exhaustion_states) if usage_exhaustion_states is not None else all_states
     bypass_account_ids = None if bypass_quota_exceeded_account_ids is None else set(bypass_quota_exceeded_account_ids)
@@ -569,6 +579,17 @@ def select_account(
             state.error_count = 0
         if state.cooldown_until and current < state.cooldown_until:
             continue
+        # Upstream overload has an independent runtime-only cooldown. Check
+        # it before generic error backoff so neither a success-cleared error
+        # count nor the fallback account path can bypass the hold.
+        if state.overload_cooldown_until is not None:
+            if current >= state.overload_cooldown_until:
+                state.overload_cooldown_until = None
+            else:
+                otherwise_eligible_count += 1
+                overload_cooldown_deadlines.append(state.overload_cooldown_until)
+                continue
+        otherwise_eligible_count += 1
         if state.error_count >= ERROR_BACKOFF_THRESHOLD:
             backoff = min(300, 30 * (2 ** (state.error_count - ERROR_BACKOFF_THRESHOLD)))
             if state.last_error_at and current - state.last_error_at < backoff:
@@ -591,6 +612,13 @@ def select_account(
         available = opportunistic_available
 
     if not available:
+        if overload_cooldown_deadlines and len(overload_cooldown_deadlines) == otherwise_eligible_count:
+            wait_seconds = max(0.0, min(overload_cooldown_deadlines) - current)
+            return SelectionResult(
+                None,
+                _format_overload_retry_hint(wait_seconds),
+                error_code=UPSTREAM_OVERLOAD_COOLDOWN_ERROR_CODE,
+            )
         in_error_backoff_ids = {state.account_id for state in in_error_backoff}
         hard_blocked_exists = any(
             state.status
@@ -1250,6 +1278,11 @@ SELECTOR_RETRY_HINT_MAX_SECONDS = 300
 def _format_retry_hint(wait_seconds: float) -> str:
     capped = min(max(0.0, wait_seconds), float(SELECTOR_RETRY_HINT_MAX_SECONDS))
     return f"Rate limit exceeded. Try again in {capped:.0f}s"
+
+
+def _format_overload_retry_hint(wait_seconds: float) -> str:
+    capped = min(max(0.0, wait_seconds), float(SELECTOR_RETRY_HINT_MAX_SECONDS))
+    return f"Upstream accounts are overloaded. Try again in {capped:.0f}s"
 
 
 def handle_quota_exceeded(state: AccountState, error: UpstreamError) -> None:

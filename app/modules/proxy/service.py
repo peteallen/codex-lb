@@ -1410,15 +1410,6 @@ class ProxyService(
             await _release_websocket_response_create_gate(request_state, response_create_gate)
             raise
 
-    async def _release_request_state_account_response_create_lease(
-        self,
-        request_state: "_WebSocketRequestState",
-    ) -> None:
-        lease = request_state.account_response_create_lease
-        request_state.account_response_create_lease = None
-        request_state.account_response_create_release = None
-        await self._load_balancer.release_account_lease(lease)
-
     async def _select_account_with_budget_compatible(
         self,
         deadline: float,

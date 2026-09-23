@@ -3423,16 +3423,19 @@ async def test_http_bridge_model_capacity_waits_before_precreated_retry(
     )
 
     assert request_state.event_queue is not None
-    keepalive_block = await asyncio.wait_for(request_state.event_queue.get(), timeout=1.0)
-    assert keepalive_block is not None
-    keepalive = proxy_service.parse_sse_data_json(keepalive_block)
-    assert isinstance(keepalive, dict)
-    assert keepalive["status"] == "waiting_for_account_capacity"
-    assert keepalive["request_id"] == "req-model-capacity-wait"
-    assert keepalive["retry_after_seconds"] == 0
-    reason = keepalive["reason"]
-    assert isinstance(reason, str)
-    assert "Selected model is at capacity" in reason
+    if upstream_code == "rate_limit_exceeded":
+        keepalive_block = await asyncio.wait_for(request_state.event_queue.get(), timeout=1.0)
+        assert keepalive_block is not None
+        keepalive = proxy_service.parse_sse_data_json(keepalive_block)
+        assert isinstance(keepalive, dict)
+        assert keepalive["status"] == "waiting_for_account_capacity"
+        assert keepalive["request_id"] == "req-model-capacity-wait"
+        assert keepalive["retry_after_seconds"] == 0
+        reason = keepalive["reason"]
+        assert isinstance(reason, str)
+        assert "Selected model is at capacity" in reason
+    else:
+        assert request_state.event_queue.empty()
     handle_stream_error.assert_awaited_once()
     handle_call = handle_stream_error.await_args
     assert handle_call is not None
@@ -3847,7 +3850,7 @@ async def test_http_bridge_model_capacity_wait_does_not_retry_after_deadline(
 
 
 @pytest.mark.asyncio
-async def test_http_bridge_model_capacity_wait_skips_sleep_for_non_replayable_request(
+async def test_http_bridge_model_capacity_wait_skips_sleep_for_visible_request(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     service = proxy_service.ProxyService(cast(Any, nullcontext()))
@@ -3874,6 +3877,7 @@ async def test_http_bridge_model_capacity_wait_skips_sleep_for_non_replayable_re
         transport="http",
         request_text='{"type":"response.create","model":"gpt-5.6-sol","input":"hello"}',
         replay_count=1,
+        downstream_visible=True,
     )
     session = _make_bridge_session(
         key_value="bridge-model-capacity-not-replayable",
