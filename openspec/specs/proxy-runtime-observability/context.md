@@ -42,3 +42,17 @@ timing as approximate first output.
 ## Missing response-created acknowledgment
 
 `missing_created_progress` accompanies reader failures that have response activity without an assigned acknowledgment. It records event count, a bounded last-event category, dispatch, assigned-ID, acknowledgment, and downstream-visibility flags. At most 16 pending requests are summarized per failure; unknown event names become `response.other`. It does not contain prompt text or tool arguments. These diagnostics distinguish protocol activity from safe-to-retry unsent work; they do not prove whether the provider omitted an event or the bridge failed to match it.
+
+## Request-history row identity
+
+Request IDs correlate a logical request across attempts; they do not identify a
+single request-log row. The listing exposes the existing database primary key as
+string `logId`, which the dashboard uses for row identity. This also distinguishes
+entries with the same account and timestamp, without a database migration.
+
+For example, one request retried through two accounts appears as two entries
+sharing `requestId` but with different `logId` values. Using the request ID as a
+React key previously retained extra rows during polling and could place an older
+9:37 entry above a newer 9:38 entry. Those extra rendered rows are a display bug;
+the underlying retry attempts remain real. Deploy the additive backend field
+before the consuming frontend and reload existing dashboard tabs to load it.

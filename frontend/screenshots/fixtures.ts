@@ -123,6 +123,7 @@ export const accounts: AccountSummary[] = [
 
 export const requestLogs: RequestLogEntry[] = [
   createRequestLogEntry({
+    logId: "log_01",
     requestId: "req_01",
     accountId: "acc_01",
     model: "gpt-5.2-codex",
@@ -137,6 +138,7 @@ export const requestLogs: RequestLogEntry[] = [
     requestedAt: offsetIso(-2),
   }),
   createRequestLogEntry({
+    logId: "log_02",
     requestId: "req_02",
     accountId: "acc_01",
     model: "gpt-5.2-codex",
@@ -151,6 +153,7 @@ export const requestLogs: RequestLogEntry[] = [
     requestedAt: offsetIso(-5),
   }),
   createRequestLogEntry({
+    logId: "log_03",
     requestId: "req_03",
     accountId: "acc_02",
     model: "gpt-5.2-codex",
@@ -165,6 +168,7 @@ export const requestLogs: RequestLogEntry[] = [
     requestedAt: offsetIso(-8),
   }),
   createRequestLogEntry({
+    logId: "log_04",
     requestId: "req_04",
     accountId: "acc_01",
     model: "gpt-5.2",
@@ -179,6 +183,7 @@ export const requestLogs: RequestLogEntry[] = [
     requestedAt: offsetIso(-12),
   }),
   createRequestLogEntry({
+    logId: "log_05",
     requestId: "req_05",
     accountId: "acc_03",
     model: "gpt-5.2-codex",
@@ -193,6 +198,7 @@ export const requestLogs: RequestLogEntry[] = [
     requestedAt: offsetIso(-18),
   }),
   createRequestLogEntry({
+    logId: "log_06",
     requestId: "req_06",
     accountId: "acc_04",
     model: "gpt-5.2-codex",
@@ -207,6 +213,7 @@ export const requestLogs: RequestLogEntry[] = [
     requestedAt: offsetIso(-25),
   }),
   createRequestLogEntry({
+    logId: "log_07",
     requestId: "req_07",
     accountId: "acc_05",
     model: "gpt-5.1-codex-mini",
@@ -221,6 +228,7 @@ export const requestLogs: RequestLogEntry[] = [
     requestedAt: offsetIso(-32),
   }),
   createRequestLogEntry({
+    logId: "log_08",
     requestId: "req_08",
     accountId: "acc_01",
     model: "gpt-5.2-codex",
@@ -237,6 +245,7 @@ export const requestLogs: RequestLogEntry[] = [
     requestedAt: offsetIso(-40),
   }),
   createRequestLogEntry({
+    logId: "log_09",
     requestId: "req_09",
     accountId: "acc_02",
     model: "gpt-5.2-codex",
@@ -253,6 +262,7 @@ export const requestLogs: RequestLogEntry[] = [
     requestedAt: offsetIso(-48),
   }),
   createRequestLogEntry({
+    logId: "log_10",
     requestId: "req_10",
     accountId: "acc_01",
     model: "gpt-5.2-codex",
