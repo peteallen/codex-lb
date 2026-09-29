@@ -6,7 +6,7 @@ from app.core import usage as usage_core
 from app.core.auth import DEFAULT_EMAIL, DEFAULT_PLAN, extract_id_token_claims, token_expiry_epoch_ms
 from app.core.config import settings as config_settings
 from app.core.crypto import TokenEncryptor
-from app.core.plan_types import coerce_account_plan_type
+from app.core.plan_types import coerce_account_plan_type, is_pro_family_plan
 from app.core.usage.quota import apply_usage_quota
 from app.core.usage.types import UsageTrendBucket, UsageWindowRow
 from app.core.utils.time import from_epoch_seconds
@@ -114,12 +114,22 @@ def _account_to_summary(
 ) -> AccountSummary:
     plan_type = coerce_account_plan_type(account.plan_type, DEFAULT_PLAN)
     auth_status = _build_auth_status(account, encryptor) if include_auth else None
+    # A complete refresh may persist a synthetic primary row to prove that
+    # upstream omitted the short window. It is an absence marker, not a 0%
+    # usage sample, and must not surface as 100% remaining in the dashboard.
+    primary_usage = _usable_usage_entry(primary_usage)
+    secondary_usage = _usable_usage_entry(secondary_usage)
+    monthly_usage = _usable_usage_entry(monthly_usage)
     effective_primary_usage, effective_secondary_usage = _effective_usage_windows(
         primary_usage,
         secondary_usage,
     )
 
-    if monthly_usage is not None and usage_core.capacity_for_plan(plan_type, "monthly") is None:
+    if (
+        monthly_usage is not None
+        and usage_core.capacity_for_plan(plan_type, "monthly") is None
+        and not is_pro_family_plan(plan_type)
+    ):
         monthly_usage = None
     usage_refreshed_at = _latest_usage_recorded_at(primary_usage, secondary_usage, monthly_usage)
     monthly_used_percent = _normalize_used_percent(monthly_usage)
@@ -489,6 +499,18 @@ def _normalize_used_percent(entry: UsageHistory | None) -> float | None:
     return entry.used_percent
 
 
+def _usable_usage_entry(entry: UsageHistory | None) -> UsageHistory | None:
+    if entry is None:
+        return None
+    if usage_core.is_no_data_window(
+        used_percent=entry.used_percent,
+        reset_at=entry.reset_at,
+        window_minutes=entry.window_minutes,
+    ):
+        return None
+    return entry
+
+
 def _extract_credit_status(
     *entries: UsageHistory | None,
 ) -> tuple[bool | None, bool | None, float | None]:
@@ -575,6 +597,17 @@ def _effective_usage_trend_buckets(buckets: list[UsageTrendBucket]) -> list[Usag
     }
     result: list[UsageTrendBucket] = []
     for bucket in buckets:
+        # The updater's authoritative omission marker is deliberately exact:
+        # older trend rows may legitimately lack reset/window metadata, so
+        # treating every metadata-less trend point as absent would erase
+        # otherwise valid historical usage.
+        if (
+            bucket.window == "primary"
+            and bucket.avg_used_percent == 0.0
+            and bucket.reset_at is None
+            and bucket.window_minutes == 0
+        ):
+            continue
         key = (bucket.account_id, bucket.bucket_epoch)
         weekly_primary = weekly_primary_by_key.get(key)
         if bucket.window == "secondary" and weekly_primary is not None:

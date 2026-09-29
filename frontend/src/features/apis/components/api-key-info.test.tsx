@@ -14,6 +14,7 @@ describe("ApiKeyInfo", () => {
 					allowedModels: ["gpt-5.1", "gpt-4o-mini"],
 					enforcedModel: "gpt-5.1",
 					enforcedReasoningEffort: "high",
+					enforcedServiceTier: "ultrafast",
 				})}
 			/>,
 		);
@@ -24,6 +25,8 @@ describe("ApiKeyInfo", () => {
     expect(screen.getByText("Foreground")).toBeInTheDocument();
     expect(screen.getByText("Enforced Model")).toBeInTheDocument();
     expect(screen.getByText("Enforced Effort")).toBeInTheDocument();
+    expect(screen.getByText("Enforced service tier")).toBeInTheDocument();
+    expect(screen.getByText("Ultrafast")).toBeInTheDocument();
   });
 
   it("renders opportunistic traffic class when set", () => {

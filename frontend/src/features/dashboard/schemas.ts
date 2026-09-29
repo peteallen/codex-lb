@@ -33,8 +33,8 @@ export function parseConversationTimeframe(value: string | null | undefined): Co
 const UsageHistoryItemSchema = z.object({
   accountId: z.string(),
   remainingPercentAvg: z.number().nullable(),
-  capacityCredits: z.number(),
-  remainingCredits: z.number(),
+  capacityCredits: z.number().nullable(),
+  remainingCredits: z.number().nullable(),
 });
 
 export const UsageWindowSchema = z.object({
@@ -44,9 +44,9 @@ export const UsageWindowSchema = z.object({
 });
 
 const UsageSummaryWindowSchema = z.object({
-  remainingPercent: z.number(),
-  capacityCredits: z.number(),
-  remainingCredits: z.number(),
+  remainingPercent: z.number().nullable(),
+  capacityCredits: z.number().nullable(),
+  remainingCredits: z.number().nullable(),
   resetAt: z.iso.datetime({ offset: true }).nullable(),
   windowMinutes: z.number().nullable(),
 });

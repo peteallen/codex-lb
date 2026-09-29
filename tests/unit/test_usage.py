@@ -37,7 +37,7 @@ def test_normalize_usage_window_defaults():
         window_minutes=None,
     )
     window = normalize_usage_window(summary)
-    assert window.used_percent == 0.0
+    assert window.used_percent is None
     assert window.capacity_credits == 0.0
     assert window.used_credits == 0.0
 
@@ -45,12 +45,13 @@ def test_normalize_usage_window_defaults():
 def test_capacity_for_plan():
     assert capacity_for_plan("plus", "5h") is not None
     assert capacity_for_plan("plus", "7d") is not None
-    assert capacity_for_plan("prolite", "5h") == pytest.approx(1125.0)
-    assert capacity_for_plan("prolite", "7d") == pytest.approx(37800.0)
+    assert capacity_for_plan("pro", "5h") is None
+    assert capacity_for_plan("prolite", "5h") is None
+    assert capacity_for_plan("promax", "7d") is None
     assert capacity_for_plan("unknown", "5h") is None
 
 
-def test_summarize_usage_window_includes_prolite_capacity():
+def test_summarize_usage_window_preserves_prolite_percentage_without_capacity():
     account = Account(
         id="acc_prolite",
         email="prolite@example.com",
@@ -71,9 +72,51 @@ def test_summarize_usage_window_includes_prolite_capacity():
 
     summary = summarize_usage_window([row], {account.id: account}, "primary")
 
-    assert summary.capacity_credits == pytest.approx(1125.0)
-    assert summary.used_credits == pytest.approx(281.25)
+    assert summary.capacity_credits is None
+    assert summary.used_credits is None
     assert summary.used_percent == pytest.approx(25.0)
+
+
+def test_summarize_usage_window_omits_no_data_marker():
+    row = UsageWindowRow(
+        account_id="acc",
+        used_percent=0.0,
+        reset_at=None,
+        window_minutes=0,
+        recorded_at=utcnow(),
+    )
+
+    summary = summarize_usage_window([row], {}, "primary")
+
+    assert summary.used_percent is None
+    assert summary.capacity_credits is None
+    assert summary.used_credits is None
+
+
+def test_summarize_usage_window_preserves_incomplete_measured_usage():
+    account = Account(
+        id="acc_plus",
+        email="plus@example.com",
+        plan_type="plus",
+        access_token_encrypted=b"access",
+        refresh_token_encrypted=b"refresh",
+        id_token_encrypted=b"id",
+        last_refresh=utcnow(),
+        status=AccountStatus.ACTIVE,
+    )
+    row = UsageWindowRow(
+        account_id=account.id,
+        used_percent=100.0,
+        reset_at=None,
+        window_minutes=None,
+        recorded_at=utcnow(),
+    )
+
+    summary = summarize_usage_window([row], {account.id: account}, "primary")
+
+    assert summary.used_percent == pytest.approx(100.0)
+    assert summary.capacity_credits == pytest.approx(225.0)
+    assert summary.used_credits == pytest.approx(225.0)
 
 
 def test_normalize_weekly_only_rows_prefers_newer_primary_over_stale_secondary():

@@ -111,7 +111,7 @@ function remainingItem(overrides: Partial<RemainingItem> & Pick<RemainingItem, "
     label: overrides.label ?? overrides.accountId,
     labelSuffix: overrides.labelSuffix ?? "",
     isEmail: overrides.isEmail ?? false,
-    value: overrides.value ?? 100,
+    value: overrides.value === undefined ? 100 : overrides.value,
     remainingPercent: overrides.remainingPercent === undefined ? 80 : overrides.remainingPercent,
     color: overrides.color ?? "#aaa",
   };
@@ -295,6 +295,30 @@ describe("buildRemainingItems", () => {
     expect(buildRemainingItems([monthly], null, "primary")).toEqual([]);
     expect(buildRemainingItems([monthly], null, "secondary")).toEqual([]);
   });
+
+  it("retains unknown absolute remaining credits instead of treating them as zero", () => {
+    const promax = account({
+      accountId: "acc-promax",
+      email: "promax@example.com",
+      planType: "promax",
+      usage: { primaryRemainingPercent: 75, secondaryRemainingPercent: 25 },
+      windowMinutesPrimary: 300,
+      windowMinutesSecondary: 10080,
+    });
+    const items = buildRemainingItems(
+      [promax],
+      {
+        windowKey: "secondary",
+        windowMinutes: 10080,
+        accounts: [{ accountId: "acc-promax", remainingPercentAvg: 25, capacityCredits: null, remainingCredits: null }],
+      },
+      "secondary",
+    );
+
+    expect(items[0]?.remainingPercent).toBe(25);
+    expect(items[0]?.value).toBeNull();
+    expect(sumRemaining(items)).toBeNull();
+  });
 });
 
 describe("sumRemaining", () => {
@@ -324,6 +348,14 @@ describe("sumRemaining", () => {
       remainingItem({ accountId: "b", value: -20 }),
     ];
     expect(sumRemaining(items)).toBe(0);
+  });
+
+  it("returns null when any remaining credit quantity is unknown", () => {
+    const items = [
+      remainingItem({ accountId: "known", value: 120 }),
+      remainingItem({ accountId: "unknown", value: null }),
+    ];
+    expect(sumRemaining(items)).toBeNull();
   });
 });
 
@@ -480,8 +512,8 @@ describe("buildWeeklyCreditPace", () => {
     expect(pace?.paceMultiplier).toBeCloseTo(4.95);
     expect(pace?.throttleToPercent).toBeCloseTo(0.25);
     expect(pace?.reduceByPercent).toBeCloseTo(99.75);
-    expect(pace?.proAccountEquivalentToCoverOverPlan).toBeCloseTo(78.37);
-    expect(pace?.proAccountsToCoverOverPlan).toBe(79);
+    expect(pace?.proAccountEquivalentToCoverOverPlan).toBeNull();
+    expect(pace?.proAccountsToCoverOverPlan).toBeNull();
     expect(pace?.projectedDepletionHours).toBeCloseTo(0.34);
     expect(pace?.status).toBe("danger");
   });
@@ -503,8 +535,8 @@ describe("buildWeeklyCreditPace", () => {
     expect(pace?.projectedShortfallCredits).toBeGreaterThan(0);
     expect(pace?.pauseForBreakEvenHours).toBeCloseTo(90.72);
     expect(pace?.paceMultiplier).toBeCloseTo(2.78);
-    expect(pace?.proAccountEquivalentToCoverOverPlan).toBeGreaterThan(0);
-    expect(pace?.proAccountsToCoverOverPlan).toBe(6);
+    expect(pace?.proAccountEquivalentToCoverOverPlan).toBeNull();
+    expect(pace?.proAccountsToCoverOverPlan).toBeNull();
     expect(pace?.status).toBe("danger");
   });
 
@@ -550,8 +582,8 @@ describe("buildWeeklyCreditPace", () => {
     expect(pace?.scheduleGapCredits).toBeCloseTo(30_000.02);
     expect(pace?.projectedShortfallCredits).toBeCloseTo(59_999.01);
     expect(pace?.projectedDepletionHours).toBeLessThan(40);
-    expect(pace?.proAccountEquivalentToCoverOverPlan).toBeGreaterThan(1);
-    expect(pace?.proAccountsToCoverOverPlan).toBe(2);
+    expect(pace?.proAccountEquivalentToCoverOverPlan).toBeNull();
+    expect(pace?.proAccountsToCoverOverPlan).toBeNull();
     expect(pace?.status).toBe("danger");
   });
 
@@ -572,8 +604,8 @@ describe("buildWeeklyCreditPace", () => {
     expect(pace?.paceMultiplier).toBeCloseTo(5.56);
     expect(pace?.throttleToPercent).toBeCloseTo(10);
     expect(pace?.reduceByPercent).toBeCloseTo(90);
-    expect(pace?.proAccountEquivalentToCoverOverPlan).toBeCloseTo(17.86);
-    expect(pace?.proAccountsToCoverOverPlan).toBe(18);
+    expect(pace?.proAccountEquivalentToCoverOverPlan).toBeNull();
+    expect(pace?.proAccountsToCoverOverPlan).toBeNull();
     expect(pace?.projectedDepletionHours).toBeCloseTo(0);
     expect(pace?.status).toBe("danger");
   });
@@ -658,8 +690,8 @@ describe("buildWeeklyCreditPace", () => {
     expect(pace?.paceMultiplier).toBeGreaterThan(1);
     expect(pace?.throttleToPercent).toBeGreaterThanOrEqual(0);
     expect(pace?.reduceByPercent).toBeGreaterThan(0);
-    expect(pace?.proAccountEquivalentToCoverOverPlan).toBeGreaterThan(0);
-    expect(pace?.proAccountsToCoverOverPlan).toBe(1);
+    expect(pace?.proAccountEquivalentToCoverOverPlan).toBeNull();
+    expect(pace?.proAccountsToCoverOverPlan).toBeNull();
     expect(pace?.projectedMinimumRemainingCredits).toBeCloseTo(0);
     expect(pace?.status).toBe("danger");
   });
@@ -670,6 +702,24 @@ describe("buildWeeklyCreditPace", () => {
         weeklyAccount({ accountId: "missing-full", fullCredits: null, remainingCredits: 1_000, timeLeftPercent: 50 }),
         weeklyAccount({ accountId: "missing-reset", fullCredits: 100_000, remainingCredits: 50_000, resetAtSecondary: null }),
         weeklyAccount({ accountId: "missing-window", fullCredits: 100_000, remainingCredits: 50_000, windowMinutesSecondary: null }),
+      ],
+      now,
+    );
+
+    expect(pace).toBeNull();
+  });
+
+  it("does not build a partial weekly pace when reported capacity is unknown", () => {
+    const pace = buildWeeklyCreditPace(
+      [
+        weeklyAccount({ accountId: "known", fullCredits: 100_000, remainingCredits: 50_000, timeLeftPercent: 50 }),
+        weeklyAccount({
+          accountId: "promax",
+          fullCredits: null,
+          remainingCredits: null,
+          timeLeftPercent: 25,
+          planType: "promax",
+        }),
       ],
       now,
     );
@@ -768,6 +818,10 @@ describe("buildDashboardView", () => {
           resetAtSecondary: null,
           windowMinutesPrimary: 300,
           windowMinutesSecondary: 10080,
+          capacityCreditsPrimary: 225,
+          remainingCreditsPrimary: 202.5,
+          capacityCreditsSecondary: 7560,
+          remainingCreditsSecondary: 75.6,
         }),
         account({
           accountId: "acc-2",
@@ -780,6 +834,10 @@ describe("buildDashboardView", () => {
           resetAtSecondary: null,
           windowMinutesPrimary: 300,
           windowMinutesSecondary: 10080,
+          capacityCreditsPrimary: 225,
+          remainingCreditsPrimary: 135,
+          capacityCreditsSecondary: 7560,
+          remainingCreditsSecondary: 5292,
         }),
       ],
       summary: {
@@ -821,7 +879,7 @@ describe("buildDashboardView", () => {
     expect(view.primaryUsageItems[1]?.value).toBeCloseTo(135);
     expect(overview.summary.primaryWindow.capacityCredits).toBe(450);
     expect(overview.summary.secondaryWindow?.capacityCredits).toBe(15120);
-    expect(view.primaryUsageItems.reduce((total, item) => total + item.value, 0)).toBeCloseTo(210.6);
+    expect(view.primaryUsageItems.reduce((total, item) => total + (item.value ?? 0), 0)).toBeCloseTo(210.6);
   });
 
   it("keeps primary totals intact for accounts without secondary usage data", () => {

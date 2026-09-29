@@ -20,7 +20,6 @@ from app.core.usage.pricing import (
     calculate_cost_from_usage,
     get_pricing_for_model,
 )
-from app.core.usage.types import UsageWindowRow
 from app.core.utils.time import to_utc_naive, utcnow
 from app.db.models import Account, AccountStatus, ApiKey, ApiKeyLimit, LimitType, LimitWindow, ModelSource, UsageHistory
 from app.db.session import sqlite_writer_section
@@ -358,7 +357,8 @@ class ApiKeyUsageSummaryData:
 class PooledCreditData:
     remaining_percent_primary: float | None = None
     remaining_percent_secondary: float | None = None
-    capacity_credits_primary: float = 0.0
+    remaining_percent_monthly: float | None = None
+    capacity_credits_primary: float | None = 0.0
 
 
 def _compute_pooled_credits(
@@ -367,6 +367,7 @@ def _compute_pooled_credits(
     all_accounts: list[Account],
     primary_usage: dict[str, UsageHistory],
     secondary_usage: dict[str, UsageHistory],
+    monthly_usage: dict[str, UsageHistory] | None = None,
     account_assignment_scope_enabled: bool = False,
 ) -> PooledCreditData:
     import app.core.usage as usage_core
@@ -387,6 +388,8 @@ def _compute_pooled_credits(
         and a.status not in (AccountStatus.REAUTH_REQUIRED, AccountStatus.DEACTIVATED, AccountStatus.PAUSED)
     }
     account_ids = set(account_map)
+    if not account_ids:
+        return PooledCreditData()
 
     primary_rows_raw = [
         usage_history_to_window_row(entry) for entry in primary_usage.values() if entry.account_id in account_ids
@@ -408,36 +411,31 @@ def _compute_pooled_credits(
     # Secondary (weekly) rows pool raw: upstream still reports long windows,
     # so an elapsed sample is transient staleness the next refresh rewrites —
     # zeroing it would briefly report an exhausted weekly pool as 100% free.
-    primary_rows = _seed_missing_usage_rows(primary_rows, account_ids)
-    secondary_rows = _seed_missing_usage_rows(secondary_rows, account_ids)
+    monthly_rows = [
+        usage_history_to_window_row(entry)
+        for entry in (monthly_usage or {}).values()
+        if entry.account_id in account_ids
+    ]
 
     primary_summary = usage_core.summarize_usage_window(primary_rows, account_map, "primary")
     secondary_summary = usage_core.summarize_usage_window(secondary_rows, account_map, "secondary")
+    monthly_summary = usage_core.summarize_usage_window(monthly_rows, account_map, "monthly")
 
     primary_remaining = usage_core.remaining_percent_from_used(primary_summary.used_percent)
     secondary_remaining = usage_core.remaining_percent_from_used(secondary_summary.used_percent)
+    primary_capacity = primary_summary.capacity_credits
+    if all(usage_core.capacity_for_plan(account.plan_type, "primary") == 0.0 for account in account_map.values()):
+        primary_capacity = 0.0
 
-    if primary_summary.capacity_credits == 0.0 or not has_live_primary:
+    if primary_capacity == 0.0 or not has_live_primary:
         primary_remaining = None
 
     return PooledCreditData(
         remaining_percent_primary=primary_remaining,
         remaining_percent_secondary=secondary_remaining,
-        capacity_credits_primary=primary_summary.capacity_credits,
+        remaining_percent_monthly=usage_core.remaining_percent_from_used(monthly_summary.used_percent),
+        capacity_credits_primary=primary_capacity,
     )
-
-
-def _seed_missing_usage_rows(
-    rows: list[UsageWindowRow],
-    account_ids: set[str],
-) -> list[UsageWindowRow]:
-    present_account_ids = {row.account_id for row in rows}
-    missing_account_ids = account_ids - present_account_ids
-    if not missing_account_ids:
-        return rows
-    return rows + [
-        UsageWindowRow(account_id=account_id, used_percent=0.0) for account_id in sorted(missing_account_ids)
-    ]
 
 
 @dataclass(frozen=True, slots=True)
@@ -534,6 +532,7 @@ class ApiKeysService:
                 all_accounts = await self._repository.list_all_accounts()
                 primary_usage = await self._usage_repository.latest_by_account("primary")
                 secondary_usage = await self._usage_repository.latest_by_account("secondary")
+                monthly_usage = await self._usage_repository.latest_by_account("monthly")
             else:
                 all_account_ids = sorted({account_id for ids in assigned_ids_by_key.values() for account_id in ids})
                 if all_account_ids:
@@ -545,16 +544,21 @@ class ApiKeysService:
                         "secondary",
                         account_ids=all_account_ids,
                     )
+                    monthly_usage = await self._usage_repository.latest_by_account(
+                        "monthly", account_ids=all_account_ids
+                    )
                 else:
                     all_accounts = []
                     primary_usage = {}
                     secondary_usage = {}
+                    monthly_usage = {}
             for row in rows:
                 pooled_by_key[row.id] = _compute_pooled_credits(
                     assigned_account_ids=assigned_ids_by_key[row.id],
                     all_accounts=all_accounts,
                     primary_usage=primary_usage,
                     secondary_usage=secondary_usage,
+                    monthly_usage=monthly_usage,
                     account_assignment_scope_enabled=row.account_assignment_scope_enabled,
                 )
 
@@ -1360,7 +1364,7 @@ def _normalize_model_slug(value: str | None) -> str | None:
 
 
 _SUPPORTED_REASONING_EFFORTS = frozenset({"none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"})
-_SUPPORTED_SERVICE_TIERS = frozenset({"auto", "default", "priority", "flex"})
+_SUPPORTED_SERVICE_TIERS = frozenset({"auto", "default", "priority", "flex", "ultrafast"})
 
 
 def _normalize_expires_at(value: datetime | None) -> datetime | None:

@@ -290,10 +290,14 @@ export function createDashboardOverview(
 				windowMinutes: 300,
 				accounts: accounts.map((account) => ({
 					accountId: account.accountId,
-					remainingPercentAvg: account.usage?.primaryRemainingPercent ?? 0,
-					capacityCredits: 225,
+					remainingPercentAvg: account.usage?.primaryRemainingPercent ?? null,
+					capacityCredits: account.capacityCreditsPrimary === undefined ? 225 : account.capacityCreditsPrimary,
 					remainingCredits:
-						((account.usage?.primaryRemainingPercent ?? 0) / 100) * 225,
+						account.remainingCreditsPrimary !== undefined
+							? account.remainingCreditsPrimary
+							: account.capacityCreditsPrimary != null && account.usage?.primaryRemainingPercent != null
+								? (account.usage.primaryRemainingPercent / 100) * account.capacityCreditsPrimary
+								: null,
 				})),
 			},
 			secondary: {
@@ -301,12 +305,14 @@ export function createDashboardOverview(
 				windowMinutes: 10_080,
 				accounts: accounts.map((account) => ({
 					accountId: account.accountId,
-					remainingPercentAvg: account.usage?.secondaryRemainingPercent ?? 0,
-					capacityCredits: account.capacityCreditsSecondary ?? 7560,
+					remainingPercentAvg: account.usage?.secondaryRemainingPercent ?? null,
+					capacityCredits: account.capacityCreditsSecondary === undefined ? 7560 : account.capacityCreditsSecondary,
 					remainingCredits:
-						account.remainingCreditsSecondary ??
-						((account.usage?.secondaryRemainingPercent ?? 0) / 100) *
-							(account.capacityCreditsSecondary ?? 7560),
+						account.remainingCreditsSecondary !== undefined
+							? account.remainingCreditsSecondary
+							: account.capacityCreditsSecondary != null && account.usage?.secondaryRemainingPercent != null
+								? (account.usage.secondaryRemainingPercent / 100) * account.capacityCreditsSecondary
+								: null,
 				})),
 			},
 		},

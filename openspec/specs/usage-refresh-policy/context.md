@@ -11,6 +11,27 @@ OpenAI account surfaces can display reset state earlier than `/wham/usage`,
 especially during team reset windows, so the dashboard can temporarily show an
 account as `rate_limited` even when Codex Desktop says the quota has reset.
 
+## September 2026 Pro entitlements
+
+The September 29 Pro tiers and grandfathered Pro allowances cannot be converted
+to absolute credits from plan labels or subscription prices. The observed
+`pro`, `prolite` and `promax` identifiers retain their identities and upstream
+window percentages; their estimated capacity and remaining credit quantities
+are null until an authoritative source provides an allowance. See the
+[requirements](spec.md) and [official Pro tier guidance](https://help.openai.com/en/articles/9793128-about-chatgpt-pro-tiers).
+
+For example, a Pro Max account with 25% monthly usage still displays 75%
+remaining and its upstream reset, without claiming a numeric credit balance.
+Mixed pools use a common remaining-percentage basis for capacity-dependent
+selection. A genuine known zero allowance remains distinct from an unknown
+allowance. Whole-pool credit forecasts and legacy Pro-account purchase
+equivalents are unavailable when the required capacities are unknown.
+
+Successful complete usage responses can explicitly supersede an omitted short
+window. Missing rate-limit objects, incomplete windows and failed refreshes do
+not erase earlier quota evidence; independent cooldowns remain enforced. No
+schema migration or subscription-price setting is required.
+
 ## Upstream Usage Source
 
 codex-lb refreshes account usage by calling:

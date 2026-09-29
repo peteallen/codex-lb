@@ -56,7 +56,7 @@ from app.core.metrics.prometheus import (
     stream_pool_inflight,
 )
 from app.core.openai.model_registry import canonical_service_tier_value, get_model_registry
-from app.core.plan_types import account_plan_matches_allowed, normalize_account_plan_type
+from app.core.plan_types import account_plan_matches_allowed, is_pro_family_plan, normalize_account_plan_type
 from app.core.resilience.circuit_breaker import are_all_account_circuit_breakers_open
 from app.core.resilience.degradation import get_status as get_degradation_status
 from app.core.resilience.degradation import set_degraded, set_normal
@@ -149,6 +149,20 @@ _SIBLING_FETCH_MARGIN_SECONDS = 5.0
 _UsageWindowEntry = UsageHistory | AdditionalUsageHistory
 
 _ACCOUNT_STREAM_LEASE_STALE_GRACE_SECONDS = 60.0
+
+
+def _usable_usage_entry(entry: _UsageWindowEntry | None) -> _UsageWindowEntry | None:
+    """Return a measured usage row, omitting an authoritative no-data marker."""
+    if entry is None:
+        return None
+    if usage_core.is_no_data_window(
+        used_percent=entry.used_percent,
+        reset_at=entry.reset_at,
+        window_minutes=entry.window_minutes,
+    ):
+        return None
+    return entry
+
 
 # Explicit upstream overloads use a separate runtime-only cooldown. Keep the
 # aliases local to this module so tests and operational probes can use a short
@@ -2188,6 +2202,11 @@ def _state_from_account(
     secondary_entry: UsageHistory | AdditionalUsageHistory | None,
     runtime: RuntimeState,
 ) -> AccountState:
+    # A successful refresh may persist a primary no-data marker to prove that
+    # upstream omitted the short window. Treat it as absent before deriving
+    # status, health, quota and routing state.
+    primary_entry = _usable_usage_entry(primary_entry)
+    secondary_entry = _usable_usage_entry(secondary_entry)
     routing_policy = _normalize_account_routing_policy(getattr(account, "routing_policy", None))
     normalized_usage = _normalize_usage_inputs(
         account=account,
@@ -2482,8 +2501,8 @@ def _state_from_account(
     long_window_key = "secondary"
     if effective_secondary_entry is not None and effective_secondary_entry.window == "monthly":
         long_window_key = "monthly"
-    capacity_credits = usage_core.capacity_for_plan(account.plan_type, long_window_key) or 0.0
-    if capacity_credits > 0.0 and runtime.leased_tokens > 0:
+    capacity_credits = usage_core.capacity_for_plan(account.plan_type, long_window_key)
+    if capacity_credits is not None and capacity_credits > 0.0 and runtime.leased_tokens > 0:
         lease_token_weight = getattr(settings, "proxy_account_lease_token_weight", 1.0)
         leased_token_pressure_pct = runtime.leased_tokens * lease_token_weight / capacity_credits * 100.0
     pressure_pct = inflight_pressure_pct + leased_token_pressure_pct
@@ -2527,6 +2546,8 @@ def _normalize_usage_inputs(
     now_epoch: int,
 ) -> _NormalizedUsageInputs:
     """Normalize persisted usage for routing and explicit probe settlement."""
+    primary_entry = _usable_usage_entry(primary_entry)
+    secondary_entry = _usable_usage_entry(secondary_entry)
     primary_used = primary_entry.used_percent if primary_entry else None
     primary_reset = primary_entry.reset_at if primary_entry else None
     primary_window_minutes = primary_entry.window_minutes if primary_entry else None
@@ -2535,6 +2556,7 @@ def _normalize_usage_inputs(
         effective_secondary_entry is not None
         and effective_secondary_entry.window == "monthly"
         and usage_core.capacity_for_plan(account.plan_type, "monthly") is None
+        and not is_pro_family_plan(account.plan_type)
     ):
         effective_secondary_entry = None
     primary_row = usage_history_to_window_row(primary_entry) if primary_entry is not None else None
@@ -2727,7 +2749,15 @@ def _select_long_window_entry(
     monthly_entry: UsageHistory | None,
     secondary_entry: UsageHistory | AdditionalUsageHistory | None,
 ) -> UsageHistory | AdditionalUsageHistory | None:
-    if monthly_entry is not None and usage_core.capacity_for_plan(account.plan_type, "monthly") is not None:
+    if monthly_entry is not None and usage_core.is_no_data_window(
+        used_percent=monthly_entry.used_percent,
+        reset_at=monthly_entry.reset_at,
+        window_minutes=monthly_entry.window_minutes,
+    ):
+        monthly_entry = None
+    secondary_entry = _usable_usage_entry(secondary_entry)
+    monthly_capacity_known = usage_core.capacity_for_plan(account.plan_type, "monthly") is not None
+    if monthly_entry is not None and (monthly_capacity_known or is_pro_family_plan(account.plan_type)):
         return monthly_entry
     return secondary_entry
 
@@ -2738,10 +2768,15 @@ def _rate_limited_freshness_entry(
     primary_entry: _UsageWindowEntry | None,
     long_window_entry: _UsageWindowEntry | None,
 ) -> _UsageWindowEntry | None:
+    primary_entry = _usable_usage_entry(primary_entry)
+    long_window_entry = _usable_usage_entry(long_window_entry)
     if (
         long_window_entry is not None
         and long_window_entry.window == "monthly"
-        and usage_core.capacity_for_plan(account.plan_type, "monthly") is not None
+        and (
+            usage_core.capacity_for_plan(account.plan_type, "monthly") is not None
+            or is_pro_family_plan(account.plan_type)
+        )
     ):
         return long_window_entry
     if primary_entry is None:
@@ -2764,6 +2799,7 @@ def _rate_limited_freshness_entry(
 
 
 def _usage_entry_is_recent_available(entry: _UsageWindowEntry | None) -> bool:
+    entry = _usable_usage_entry(entry)
     return (
         entry is not None
         and _usage_entry_is_recent_enough(entry.recorded_at)
@@ -2773,6 +2809,7 @@ def _usage_entry_is_recent_available(entry: _UsageWindowEntry | None) -> bool:
 
 
 def _usage_entry_recorded_after_block(entry: _UsageWindowEntry | None, blocked_at: float) -> bool:
+    entry = _usable_usage_entry(entry)
     if entry is None or entry.recorded_at is None:
         return False
     recorded_at = entry.recorded_at
@@ -2844,13 +2881,20 @@ def _filter_accounts_for_model_with_catalog_evidence(
     normalized_service_tier = service_tier.strip().lower() if service_tier is not None else None
     effective_service_tier = None if normalized_service_tier in {"auto", "default"} else service_tier
     if effective_service_tier is not None:
+        requires_account_tier_evidence = canonical_service_tier_value(effective_service_tier) == "ultrafast"
         allowed_account_ids = (
             registry.account_ids_for_model_service_tier(model, effective_service_tier)
-            if account_indexes_cover_selection
+            if account_indexes_cover_selection or requires_account_tier_evidence
             else None
         )
+        if requires_account_tier_evidence and allowed_account_ids is None:
+            allowed_account_ids = frozenset()
         if allowed_account_ids is not None:
-            if additional_quota_can_override_account_catalog and general_model_account_ids is not None:
+            if (
+                additional_quota_can_override_account_catalog
+                and general_model_account_ids is not None
+                and not requires_account_tier_evidence
+            ):
                 allowed_plans = registry.plan_types_for_model_service_tier(model, effective_service_tier)
                 tier_filtered_accounts: list[Account] = []
                 for account in accounts:

@@ -14,6 +14,7 @@ from app.core.clients.proxy import stream_responses
 from app.core.crypto import TokenEncryptor
 from app.core.openai.parsing import parse_sse_event
 from app.core.openai.requests import ResponsesRequest
+from app.core.plan_types import is_pro_family_plan
 from app.core.utils.time import utcnow
 from app.db.models import Account, AccountStatus, QuotaPlannerDecision
 from app.modules.accounts.repository import AccountsRepository
@@ -443,8 +444,9 @@ class QuotaWarmupService:
         # reported the short window: the stale short primary sample is not
         # evidence of a current short window, so warm-up traffic would open
         # nothing. Same-fetch rows land within milliseconds and stay inside
-        # the margin. Monthly rows only count for plans with monthly
-        # capacity — lingering rows from a former plan are not applicable.
+        # the margin. Monthly rows also count for Pro-family plans, whose
+        # absolute capacity is intentionally unknown. Lingering rows from a
+        # former non-Pro plan are not applicable.
         if latest is None:
             return False
         latest_window_minutes = getattr(latest, "window_minutes", None)
@@ -457,7 +459,11 @@ class QuotaWarmupService:
         if latest_recorded_at is None:
             return False
         for window in ("secondary", "monthly"):
-            if window == "monthly" and usage_core.capacity_for_plan(account.plan_type, "monthly") is None:
+            if (
+                window == "monthly"
+                and usage_core.capacity_for_plan(account.plan_type, "monthly") is None
+                and not is_pro_family_plan(account.plan_type)
+            ):
                 continue
             sibling = (await self._usage.latest_by_account(window=window)).get(account.id)
             if sibling is None:

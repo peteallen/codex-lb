@@ -5,8 +5,6 @@ import type { WeeklyCreditPace } from "@/features/dashboard/utils";
 import { cn } from "@/lib/utils";
 import { formatCompactNumber } from "@/utils/formatters";
 
-const PRO_WEEKLY_CAPACITY_CREDITS = 50_400;
-
 export type WeeklyCreditsPaceCardProps = {
   pace: WeeklyCreditPace | null;
 };
@@ -104,12 +102,8 @@ function breakEvenLine(pace: WeeklyCreditPace, t: ReturnType<typeof useTranslati
 }
 
 function proAccountsLine(pace: WeeklyCreditPace, t: ReturnType<typeof useTranslation>["t"]): string | null {
-  const scheduleGapCredits = pace.smoothedScheduleGapCredits ?? pace.scheduleGapCredits;
-  const gapCredits =
-    pace.projectedShortfallCredits > 0 ? pace.projectedShortfallCredits : Math.max(0, scheduleGapCredits);
-  const equivalent =
-    pace.proAccountEquivalentToCoverOverPlan ?? (gapCredits > 0 ? gapCredits / PRO_WEEKLY_CAPACITY_CREDITS : null);
-  const accounts = pace.proAccountsToCoverOverPlan ?? (gapCredits > 0 ? Math.ceil(gapCredits / PRO_WEEKLY_CAPACITY_CREDITS) : null);
+  const equivalent = pace.proAccountEquivalentToCoverOverPlan;
+  const accounts = pace.proAccountsToCoverOverPlan;
 
   if (!accounts || equivalent == null) {
     return null;

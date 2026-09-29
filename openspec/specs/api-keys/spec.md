@@ -600,8 +600,7 @@ Fast-tier input, cached-input, and output rates for `gpt-5.4-mini`.
 
 ### Requirement: Represented OpenAI model pricing matches the current published rates
 
-For the additional GPT-5 models represented by the canonical pricing registry,
-the system MUST use the USD-per-1M-token rates published on the official
+The system MUST use the USD-per-1M-token rates for additional GPT-5 models represented by the canonical pricing registry as published on the official
 OpenAI API pricing page on September 4, 2026. Each triplet is uncached input /
 cached input / output; a dash means the published table has no rate for that
 dimension or context tier.
@@ -645,8 +644,7 @@ registry entry.
 
 ### Requirement: Supported GPT Image models use model-specific current pricing
 
-For the supported public image models `gpt-image-2`, `gpt-image-1.5`,
-`gpt-image-1`, and `gpt-image-1-mini`, the registry MUST use each model's
+The registry MUST use each supported public image model's (`gpt-image-2`, `gpt-image-1.5`, `gpt-image-1`, and `gpt-image-1-mini`)
 current published image-generation rates through the documented single-input
 rate approximation. The approximation uses text input for `input_per_1m`,
 image cached input for `cached_input_per_1m`, and image output for
@@ -722,57 +720,54 @@ API key cost accounting MUST continue to use the effective billable `service_tie
 
 ### Requirement: API keys can enforce a service tier
 
-The dashboard API key CRUD surface MUST allow callers to persist an optional enforced service tier. The service MUST normalize `fast` to the canonical upstream value `priority` before persistence and before returning the API key payload.
+The dashboard API key CRUD surface MUST allow callers to persist an optional enforced service tier including ultrafast. The service MUST normalize fast to the canonical upstream value priority before persistence and before returning the API key payload. Enforced ultrafast MUST be forwarded unchanged and MUST remain subject to model/account service-tier eligibility without silent downgrade.
 
 #### Scenario: Create API key with fast service tier alias
-
-- **WHEN** a dashboard client creates an API key with `enforcedServiceTier: "fast"`
+- **WHEN** a dashboard client creates an API key with enforcedServiceTier fast
 - **THEN** the request is accepted
-- **AND** the persisted API key stores the canonical value `priority`
-- **AND** the response returns `enforcedServiceTier: "priority"`
+- **AND** persistence and response use priority
 
 #### Scenario: Update API key with canonical service tier
+- **WHEN** a dashboard client updates an API key with enforcedServiceTier flex
+- **THEN** persistence and subsequent reads return flex
 
-- **WHEN** a dashboard client updates an API key with `enforcedServiceTier: "flex"`
-- **THEN** the persisted API key stores `flex`
-- **AND** subsequent reads return `flex`
+#### Scenario: Ultrafast survives dashboard round trips
+- **WHEN** a client creates or updates a key with enforcedServiceTier ultrafast
+- **THEN** create, list and update responses preserve ultrafast
+- **AND** the dashboard can select and display Ultrafast
 
 ### Requirement: API key list includes pooled credit data
 
-The `GET /api/api-keys/` list endpoint SHALL include per-key pooled credit data computed by aggregating upstream usage across the selectable accounts assigned to each key. When a key has no assigned accounts, the system SHALL pool across all selectable accounts.
+The `GET /api/api-keys/` list endpoint SHALL include pooled usage across the selectable accounts assigned to each key. Unscoped keys SHALL pool all selectable accounts; an enabled assignment scope with no remaining accounts SHALL remain empty. Paused, deactivated and reauthentication-required accounts SHALL be excluded.
 
-Selectable accounts exclude accounts whose status is `paused` or `deactivated`, matching load-balancer routing eligibility.
+The response SHALL include nullable `pooled_remaining_percent_primary`, `pooled_remaining_percent_secondary`, `pooled_remaining_percent_monthly`, and `pooled_capacity_credits_primary`. A reported window whose absolute capacity is unknown SHALL retain its percentage without inventing credit quantities. Missing usage SHALL NOT be seeded as zero percent used. Incomplete-capacity pools SHALL use a consistent percentage basis for reported samples instead of a partial absolute credit sum.
 
-The response SHALL include `pooled_remaining_percent_primary` (float or null), `pooled_remaining_percent_secondary` (float or null), and `pooled_capacity_credits_primary` (float, default 0.0) on each key object.
-
-When `pooled_capacity_credits_primary` is 0.0 (e.g., all assigned accounts are free-tier), `pooled_remaining_percent_primary` SHALL be null. Primary samples whose `reset_at` has elapsed SHALL be pooled as reset windows rather than frozen values, and when no live (unexpired) primary sample exists across the pooled accounts, `pooled_remaining_percent_primary` SHALL be null instead of an optimistic value.
+When primary capacity is known zero, or no live primary sample exists, primary remaining percentage SHALL be null. Expired primary samples SHALL continue to use reset-window semantics; weekly and monthly samples SHALL retain their reported usage until refreshed.
 
 #### Scenario: Scoped key pools assigned accounts only
-
-- **WHEN** an API key has `assignedAccountIds` containing two accounts
-- **AND** those accounts have usage data
-- **THEN** `pooled_remaining_percent_primary` and `pooled_remaining_percent_secondary` reflect only those two accounts
+- **WHEN** an API key is scoped to two selectable accounts
+- **THEN** pooled usage reflects only those two accounts
 
 #### Scenario: Unscoped key pools all accounts
-
-- **WHEN** an API key has `assignedAccountIds` = []
-- **THEN** pooled credit fields reflect all accounts in the system
+- **WHEN** a key has no assignment scope
+- **THEN** pooled usage reflects all selectable accounts
 
 #### Scenario: Free-tier accounts hide primary bar
-
-- **WHEN** all assigned accounts have plan_type "free" (primary capacity = 0)
-- **THEN** `pooled_capacity_credits_primary` = 0.0
-- **AND** `pooled_remaining_percent_primary` = null
+- **WHEN** assigned accounts all have known zero primary capacity
+- **THEN** primary capacity is zero and primary remaining percentage is null
 
 #### Scenario: Absent primary windows hide the pooled primary bar
-
-- **WHEN** upstream stopped reporting the primary window and every pooled account's primary sample has an elapsed `reset_at` or no primary sample at all
-- **THEN** `pooled_remaining_percent_primary` = null
+- **WHEN** every primary sample is absent or expired
+- **THEN** primary remaining percentage is null
 
 #### Scenario: Paused and deactivated accounts are excluded
+- **WHEN** a key includes active, paused and deactivated accounts
+- **THEN** only active selectable accounts contribute to pooled usage
 
-- **WHEN** an API key has assigned accounts with active and paused statuses
-- **THEN** pooled credit fields reflect only the active selectable accounts
+#### Scenario: Monthly Pro usage survives the API-key list contract
+- **WHEN** a Pro-family account reports monthly usage at 65 percent
+- **THEN** the key list exposes monthly remaining percentage as 35
+- **AND** unknown Pro capacity does not hide that percentage
 
 ### Requirement: API key 7-day usage includes account cost breakdown
 
@@ -1325,3 +1320,29 @@ A repair command MUST default to dry-run, require an explicit model scope, and p
 #### Scenario: Preview is read only
 - **WHEN** the repair command runs without its apply option
 - **THEN** it reports proposed changes without persisting row or aggregate changes
+
+### Requirement: September GPT-6 models have complete API cost estimates
+
+The pricing registry MUST recognize gpt-6.1-sol, gpt-6-sol, and gpt-6-luna and dated snapshots of those exact model families. Standard short-context input/cached-input/output USD rates per million tokens MUST be 2/0.10/10, 2/0.20/10, and 0.10/0.01/0.50 respectively. Cache writes MUST cost 1.25 times ordinary input. Above 272000 input tokens, input/cache rates MUST double and output rates MUST multiply by 1.5 for the full request. Fast/priority MUST cost twice Standard; Flex MUST cost half Standard. Reservation, settlement and request-log estimates MUST use the same rates.
+
+#### Scenario: New Sol model settles a real cost
+- **WHEN** an API-key request for gpt-6.1-sol completes with 100000 uncached input and 10000 output tokens at Standard
+- **THEN** its cost usage and request estimate are 0.30 USD
+- **AND** its final quota usage is not zero or the temporary reservation amount
+
+#### Scenario: Cache discount belongs to the exact model
+- **WHEN** 100000 cached input tokens are priced for gpt-6.1-sol and gpt-6-sol at Standard short context
+- **THEN** the cached costs are 0.01 USD and 0.02 USD respectively
+
+### Requirement: Astra Ultrafast has explicit API rates
+
+The calculator MUST price gpt-6-astra Ultrafast at 60/6/300 USD per million short-context input/cached-input/output tokens and 120/12/450 for long context above 272000 input tokens. Cache writes MUST cost 1.25 times the applicable input rate. Upstream-reported billable tiers MUST take precedence over requested tiers. These API rates MUST NOT use the subscription usage multiplier.
+
+#### Scenario: Ultrafast output does not use Standard price
+- **WHEN** Astra returns one million output tokens with actual service tier ultrafast and short input
+- **THEN** output cost is 300 USD
+- **AND** request-log and API-key settlement use the same cost
+
+#### Scenario: Actual Standard response overrides requested Ultrafast
+- **WHEN** a request asks for ultrafast but the response reports default
+- **THEN** the calculator uses Standard rates

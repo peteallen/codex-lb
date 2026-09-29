@@ -5,7 +5,7 @@ TBD - created by archiving change add-relative-availability-routing. Update Purp
 ## Requirements
 ### Requirement: Relative availability routing
 
-The proxy account selector SHALL support a `relative_availability` routing strategy. The strategy SHALL evaluate only accounts that have passed the existing eligibility, health-tier, model-plan, quota, cooldown, circuit-breaker, and budget-safety gates. Re-authentication-required accounts SHALL be treated as hard-blocked routing candidates, the same as paused and deactivated accounts. For each candidate, it SHALL compute a raw score from remaining secondary-window credits divided by seconds until the secondary-window reset, using bounded fallbacks for unknown or near-immediate reset times, and SHALL select from the highest weighted candidates according to the configured power and top-K cutoff.
+The proxy account selector SHALL support a `relative_availability` routing strategy. The strategy SHALL evaluate only accounts that have passed the existing eligibility, health-tier, model-plan, quota, cooldown, circuit-breaker, and budget-safety gates. Re-authentication-required accounts SHALL be treated as hard-blocked routing candidates, the same as paused and deactivated accounts. For each candidate in a pool with fully known capacities, it SHALL compute a raw score from remaining secondary-window credits divided by seconds until the secondary-window reset, using bounded fallbacks for unknown or near-immediate reset times, and SHALL select from the highest weighted candidates according to the configured power and top-K cutoff. Pools containing unknown capacities SHALL substitute remaining percentage for credits consistently across the candidate pool.
 
 #### Scenario: Soon-resetting usable credits are preferred
 - **GIVEN** two healthy eligible accounts with equal remaining secondary credits
@@ -40,7 +40,7 @@ Relative-availability selection diagnostics SHALL identify accounts using stable
 - **AND** the log message does not include the account email address
 
 ### Requirement: Sequential drain routing
-The proxy account selector SHALL support a `sequential_drain` routing strategy. The strategy SHALL evaluate only accounts that pass the existing eligibility, model-plan, quota, cooldown, circuit-breaker, and budget-safety gates, then select the usable account with the lowest effective secondary capacity before moving to higher-capacity accounts.
+The proxy account selector SHALL support a `sequential_drain` routing strategy. The strategy SHALL evaluate only accounts that pass the existing eligibility, model-plan, quota, cooldown, circuit-breaker, and budget-safety gates, then select the usable account with the lowest effective secondary capacity before moving to higher-capacity accounts when all capacities are known. Pools containing unknown capacities SHALL instead drain the most-used account by the common percentage basis.
 
 #### Scenario: Lowest-capacity usable account is drained first
 - **GIVEN** multiple healthy eligible accounts with different effective secondary capacities
@@ -641,3 +641,24 @@ Recovery admission MUST occur only after all ordinary account eligibility, coold
 - **WHEN** selection finalizes the stable local account-cap error
 - **THEN** any provisional delete or rebind decision is discarded
 - **AND** the existing hard-sticky owner mapping remains unchanged
+
+### Requirement: Unknown absolute capacity does not exclude eligible accounts
+
+Capacity-dependent routing MUST preserve known zero capacity as distinct from unknown capacity. When any eligible candidate's long-window capacity is unknown, capacity weighting and relative-availability selection MUST use remaining percentage on a consistent basis for the complete candidate pool. Sequential-drain ordering MUST likewise avoid comparing unknown capacity with invented free or legacy Pro allowances. Fully known candidate pools MUST retain existing absolute-capacity behavior. Model/tier eligibility, quota exhaustion, health cooldowns and ownership constraints MUST remain enforced.
+
+#### Scenario: Pro Max competes in a mixed pool
+- **GIVEN** an eligible promax account with unknown absolute capacity and remaining weekly quota
+- **AND** another eligible account with known capacity
+- **WHEN** capacity-weighted or relative-availability selection runs
+- **THEN** the promax account has nonzero eligibility weight based on remaining percentage
+- **AND** both accounts use the same percentage weighting basis
+
+#### Scenario: Exhausted account is not rescued by unknown capacity
+- **GIVEN** an account with unknown absolute capacity and a current upstream exhausted window
+- **WHEN** an account is selected
+- **THEN** the account remains unavailable until quota recovery is established
+
+#### Scenario: Fully known pool retains absolute weighting
+- **GIVEN** every eligible account has known capacity
+- **WHEN** capacity-weighted selection runs
+- **THEN** selection uses remaining absolute capacity as before

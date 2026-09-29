@@ -32,7 +32,7 @@ const ApiKeyUsageSummarySchema = z.object({
   outputTokens: z.number().int().nonnegative().optional(),
 });
 
-const SERVICE_TIERS = ["auto", "default", "priority", "flex"] as const;
+const SERVICE_TIERS = ["auto", "default", "priority", "flex", "ultrafast"] as const;
 export type ServiceTierType = (typeof SERVICE_TIERS)[number];
 
 export const TRAFFIC_CLASSES = ["foreground", "opportunistic"] as const;
@@ -72,7 +72,8 @@ export const ApiKeySchema = z.object({
   usageSummary: ApiKeyUsageSummarySchema.nullable().default(null),
   pooledRemainingPercentPrimary: z.number().nullable().default(null),
   pooledRemainingPercentSecondary: z.number().nullable().default(null),
-  pooledCapacityCreditsPrimary: z.number().default(0),
+  pooledRemainingPercentMonthly: z.number().nullable().default(null),
+  pooledCapacityCreditsPrimary: z.number().nullable().default(null),
 });
 
 export const USAGE_SECTIONS = ["upstream_limits", "account_pool_usage"] as const;

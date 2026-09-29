@@ -60,7 +60,8 @@ describe("ApiKeySchema", () => {
     expect(parsed.applyToCodexModel).toBe(false);
     expect(parsed.pooledRemainingPercentPrimary).toBeNull();
     expect(parsed.pooledRemainingPercentSecondary).toBeNull();
-    expect(parsed.pooledCapacityCreditsPrimary).toBe(0);
+    expect(parsed.pooledRemainingPercentMonthly).toBeNull();
+    expect(parsed.pooledCapacityCreditsPrimary).toBeNull();
   });
 
   it("parses pooled credit fields", () => {
@@ -75,12 +76,32 @@ describe("ApiKeySchema", () => {
       lastUsedAt: null,
       pooledRemainingPercentPrimary: 67.5,
       pooledRemainingPercentSecondary: 85.0,
+      pooledRemainingPercentMonthly: 42.5,
       pooledCapacityCreditsPrimary: 225.0,
     });
 
     expect(parsed.pooledRemainingPercentPrimary).toBe(67.5);
     expect(parsed.pooledRemainingPercentSecondary).toBe(85.0);
+    expect(parsed.pooledRemainingPercentMonthly).toBe(42.5);
     expect(parsed.pooledCapacityCreditsPrimary).toBe(225.0);
+  });
+
+  it("preserves an Ultrafast enforced service tier", () => {
+    const parsed = ApiKeySchema.parse({
+      id: "key-1",
+      name: "Ultrafast key",
+      keyPrefix: "sk-live",
+      allowedModels: null,
+      enforcedServiceTier: "ultrafast",
+      expiresAt: null,
+      isActive: true,
+      createdAt: ISO,
+      lastUsedAt: null,
+    });
+
+    expect(parsed.enforcedServiceTier).toBe("ultrafast");
+    expect(ApiKeyCreateRequestSchema.parse({ name: "new", enforcedServiceTier: "ultrafast" }).enforcedServiceTier).toBe("ultrafast");
+    expect(ApiKeyUpdateRequestSchema.parse({ enforcedServiceTier: "ultrafast" }).enforcedServiceTier).toBe("ultrafast");
   });
 
   it("parses assigned model source ids", () => {

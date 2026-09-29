@@ -32,7 +32,9 @@ class ApiKeyCreateRequest(DashboardModel):
     enforced_reasoning_effort: str | None = Field(
         default=None, pattern=r"(?i)^(none|minimal|low|medium|high|xhigh|max|ultra)$"
     )
-    enforced_service_tier: str | None = Field(default=None, pattern=r"(?i)^(auto|default|priority|flex|fast)$")
+    enforced_service_tier: str | None = Field(
+        default=None, pattern=r"(?i)^(auto|default|priority|flex|fast|ultrafast)$"
+    )
     traffic_class: str | None = Field(default=None, pattern=r"(?i)^(foreground|opportunistic)$")
     transport_policy_override: str | None = None
     usage_sections: str | None = None
@@ -51,7 +53,9 @@ class ApiKeyUpdateRequest(DashboardModel):
     enforced_reasoning_effort: str | None = Field(
         default=None, pattern=r"(?i)^(none|minimal|low|medium|high|xhigh|max|ultra)$"
     )
-    enforced_service_tier: str | None = Field(default=None, pattern=r"(?i)^(auto|default|priority|flex|fast)$")
+    enforced_service_tier: str | None = Field(
+        default=None, pattern=r"(?i)^(auto|default|priority|flex|fast|ultrafast)$"
+    )
     traffic_class: str | None = Field(default=None, pattern=r"(?i)^(foreground|opportunistic)$")
     transport_policy_override: str | None = None
     usage_sections: str | None = None
@@ -97,7 +101,8 @@ class ApiKeyResponse(DashboardModel):
     usage_summary: ApiKeyUsageSummaryResponse | None = None
     pooled_remaining_percent_primary: float | None = None
     pooled_remaining_percent_secondary: float | None = None
-    pooled_capacity_credits_primary: float = 0.0
+    pooled_remaining_percent_monthly: float | None = None
+    pooled_capacity_credits_primary: float | None = 0.0
 
 
 class ApiKeyCreateResponse(ApiKeyResponse):

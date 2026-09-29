@@ -3,7 +3,7 @@ import { useTranslation } from "react-i18next";
 import { Cell, Pie, PieChart, Sector, type PieSectorShapeProps } from "@/components/lazy-recharts";
 
 import { buildDonutPalette } from "@/utils/colors";
-import { formatCompactNumber, formatNumber } from "@/utils/formatters";
+import { formatCompactNumber, formatNumber, formatPercentNullable } from "@/utils/formatters";
 import { useReducedMotion } from "@/hooks/use-reduced-motion";
 import { usePrivacyStore } from "@/hooks/use-privacy";
 import { useThemeStore } from "@/hooks/use-theme";
@@ -16,14 +16,16 @@ export type DonutChartItem = {
   labelSuffix?: string;
   /** When true the label text gets CSS-blurred in privacy mode. */
   isEmail?: boolean;
-  value: number;
+  value: number | null;
+  /** Reported remaining percentage used when absolute credits are unknown. */
+  remainingPercent?: number | null;
   color?: string;
 };
 
 export type DonutChartProps = {
   items: DonutChartItem[];
-  total: number;
-  centerValue?: number;
+  total: number | null;
+  centerValue?: number | null;
   title: string;
   subtitle?: string;
   safeLine?: { safePercent: number; riskLevel: "safe" | "warning" | "danger" | "critical" } | null;
@@ -99,7 +101,10 @@ type DonutDatum = {
   fill: string;
 };
 
-function formatUsedPercent(percent: number): string {
+function formatUsedPercent(percent: number | null): string {
+  if (percent === null) {
+    return "--";
+  }
   if (!Number.isFinite(percent) || percent <= 0) {
     return "0%";
   }
@@ -122,22 +127,32 @@ export function DonutChart({ items, total, centerValue, title, subtitle, safeLin
       ...item,
       color: item.color ?? palette[index % palette.length],
     }))
-    .sort((a, b) => b.value - a.value);
+    .sort((a, b) => {
+      if (a.value === null) return 1;
+      if (b.value === null) return -1;
+      return b.value - a.value;
+    });
 
-  const usedSum = normalizedItems.reduce((acc, item) => acc + Math.max(0, item.value), 0);
-  const safeCapacity = Math.max(0, total);
-  const consumed = Math.max(0, total - usedSum);
-  const displayTotal = Math.max(0, centerValue ?? total);
-  const usedPercent = safeCapacity > 0 ? (consumed / safeCapacity) * 100 : 0;
+  const knownItems = normalizedItems.filter(
+    (item): item is typeof item & { value: number } => item.value !== null,
+  );
+  const usedSum = knownItems.reduce((acc, item) => acc + Math.max(0, item.value), 0);
+  const safeCapacity = total === null ? null : Math.max(0, total);
+  const hasUnknownRemaining = centerValue === null || normalizedItems.some((item) => item.value === null);
+  const consumed = safeCapacity === null || hasUnknownRemaining ? null : Math.max(0, safeCapacity - usedSum);
+  const displayTotal = centerValue === undefined ? safeCapacity : centerValue;
+  const usedPercent = safeCapacity !== null && safeCapacity > 0 && consumed !== null
+    ? (consumed / safeCapacity) * 100
+    : null;
 
   const chartData: DonutDatum[] = [
-    ...normalizedItems.map((item) => ({
+    ...knownItems.map((item) => ({
       id: item.id ?? item.label,
       name: item.label,
       value: Math.max(0, item.value),
       fill: item.color,
     })),
-    ...(consumed > 0
+    ...(consumed !== null && consumed > 0
       ? [{ id: "__consumed__", name: "__consumed__", value: consumed, fill: consumedColor }]
       : []),
   ];
@@ -298,7 +313,9 @@ export function DonutChart({ items, total, centerValue, title, subtitle, safeLin
                 </span>
               </div>
               <span className="tabular-nums text-muted-foreground">
-                {formatCompactNumber(item.value)}
+                {item.value === null
+                  ? formatPercentNullable(item.remainingPercent)
+                  : formatCompactNumber(item.value)}
               </span>
             </button>
             );

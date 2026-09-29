@@ -464,6 +464,27 @@ async def test_account_ids_for_model_service_tier_tracks_account_catalogs():
 
 
 @pytest.mark.asyncio
+async def test_ultrafast_requires_account_catalog_evidence():
+    registry = ModelRegistry(ttl_seconds=60.0)
+    model = replace(_model("gpt-6-astra"), raw={"service_tiers": [{"id": "ultrafast"}]})
+    standard = replace(model, raw={})
+
+    assert registry.account_ids_for_model_service_tier(model.slug, "ultrafast") == frozenset()
+    await registry.update({"pro": [model]})
+    assert registry.account_ids_for_model_service_tier(model.slug, "ultrafast") == frozenset()
+
+    await registry.update(
+        {"pro": [model]},
+        per_account_results={
+            "eligible": ("promax", [model]),
+            "standard": ("pro", [standard]),
+        },
+        active_account_plans={"eligible": "promax", "standard": "pro"},
+    )
+    assert registry.account_ids_for_model_service_tier(model.slug, "ultrafast") == frozenset({"eligible"})
+
+
+@pytest.mark.asyncio
 async def test_plan_types_for_model_service_tier_rejects_missing_authoritative_tier_map():
     model = replace(_model("gpt-5.5"), raw={})
     registry = ModelRegistry(ttl_seconds=60.0)

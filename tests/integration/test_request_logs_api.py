@@ -573,3 +573,46 @@ async def test_astra_cache_write_estimate_reaches_request_log_api(async_client, 
         "outputUsd": pytest.approx(5),
         "totalUsd": pytest.approx(6.2),
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("model", "service_tier", "expected"),
+    [
+        ("gpt-6.1-sol", None, 1.11),
+        ("gpt-6-sol", None, 1.115),
+        ("gpt-6-luna", None, 0.05575),
+        ("gpt-6-astra", "ultrafast", 33.45),
+    ],
+)
+async def test_new_gpt6_prices_reach_request_log_api(
+    async_client,
+    db_setup,
+    model,
+    service_tier,
+    expected,
+):
+    async with SessionLocal() as session:
+        log = await RequestLogsRepository(session).add_log(
+            account_id=None,
+            request_id=f"{model}-cost",
+            model=model,
+            input_tokens=100_000,
+            output_tokens=100_000,
+            cached_input_tokens=50_000,
+            cache_write_tokens=10_000,
+            service_tier=service_tier,
+            latency_ms=10,
+            status="success",
+            error_code=None,
+        )
+        assert log.cost_usd == pytest.approx(expected)
+
+    response = await async_client.get(f"/api/request-logs?model={model}")
+    assert response.status_code == 200
+    rows = response.json()["requests"]
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["model"] == model
+    assert row["serviceTier"] == service_tier
+    assert row["costBreakdown"]["totalUsd"] == pytest.approx(expected)

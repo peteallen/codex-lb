@@ -11,6 +11,7 @@ from datetime import datetime
 from typing import Any, AsyncIterator, Protocol, TypeVar, cast
 
 from app.core.config.settings import get_settings
+from app.core.plan_types import is_pro_family_plan
 from app.core.usage import capacity_for_plan
 from app.db.models import Account, AccountLimitWarmup, AccountStatus, UsageHistory
 from app.db.session import detach_session_objects, get_background_session
@@ -379,7 +380,9 @@ def _select_long_window_entry(
     monthly_entry: UsageHistory | None,
     secondary_entry: UsageHistory | None,
 ) -> UsageHistory | None:
-    if monthly_entry is not None and capacity_for_plan(account.plan_type, "monthly") is not None:
+    if monthly_entry is not None and (
+        capacity_for_plan(account.plan_type, "monthly") is not None or is_pro_family_plan(account.plan_type)
+    ):
         return monthly_entry
     return secondary_entry
 

@@ -13,10 +13,10 @@ const DonutChart = lazy(() =>
 export type UsageDonutsProps = {
 	primaryItems: RemainingItem[];
 	secondaryItems: RemainingItem[];
-	primaryTotal: number;
-	secondaryTotal: number;
-	primaryCenterValue?: number;
-	secondaryCenterValue?: number;
+	primaryTotal: number | null;
+	secondaryTotal: number | null;
+	primaryCenterValue?: number | null;
+	secondaryCenterValue?: number | null;
 	safeLinePrimary?: SafeLineView | null;
 	safeLineSecondary?: SafeLineView | null;
 };
@@ -40,6 +40,7 @@ export function UsageDonuts({
 				labelSuffix: item.labelSuffix,
 				isEmail: item.isEmail,
 				value: item.value,
+				remainingPercent: item.remainingPercent,
 				color: item.color,
 			})),
 		[primaryItems],
@@ -52,6 +53,7 @@ export function UsageDonuts({
 				labelSuffix: item.labelSuffix,
 				isEmail: item.isEmail,
 				value: item.value,
+				remainingPercent: item.remainingPercent,
 				color: item.color,
 			})),
 		[secondaryItems],

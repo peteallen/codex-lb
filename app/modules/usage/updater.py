@@ -22,7 +22,12 @@ from app.core.balancer import (
 from app.core.clients.usage import UsageFetchError, fetch_usage
 from app.core.config.settings import get_settings
 from app.core.crypto import TokenEncryptor
-from app.core.plan_types import ACCOUNT_PLAN_TYPES, coerce_account_plan_type, normalize_account_plan_type
+from app.core.plan_types import (
+    ACCOUNT_PLAN_TYPES,
+    coerce_account_plan_type,
+    is_pro_family_plan,
+    normalize_account_plan_type,
+)
 from app.core.upstream_proxy import ResolvedUpstreamRoute, UpstreamProxyRouteError, resolve_upstream_route
 from app.core.usage.models import AdditionalRateLimitPayload, UsagePayload, UsageWindow
 from app.core.utils.request_id import get_request_id
@@ -464,11 +469,14 @@ class UsageUpdater:
         return (now - latest_at).total_seconds() >= interval_seconds
 
     async def _freshness_usage_entry(self, account: Account, latest: UsageHistory | None) -> UsageHistory | None:
+        latest = _usable_usage_entry(latest)
         if latest is not None:
             return latest
-        if usage_core.capacity_for_plan(account.plan_type, "monthly") is None:
+        if usage_core.capacity_for_plan(account.plan_type, "monthly") is None and not is_pro_family_plan(
+            account.plan_type
+        ):
             return None
-        return await self._usage_repo.latest_entry_for_account(account.id, window="monthly")
+        return _usable_usage_entry(await self._usage_repo.latest_entry_for_account(account.id, window="monthly"))
 
     async def _usage_is_fresh_with_siblings(
         self,
@@ -478,6 +486,7 @@ class UsageUpdater:
         now: datetime,
         interval_seconds: int,
     ) -> bool:
+        latest = _usable_usage_entry(latest)
         if _latest_usage_is_fresh(latest, now=now, interval_seconds=interval_seconds):
             return not await self._additional_usage_is_stale(account.id, now=now, interval_seconds=interval_seconds)
         # A stale (or elapsed-reset) newest row of one window must not
@@ -491,12 +500,16 @@ class UsageUpdater:
         for window in _MAIN_USAGE_WINDOWS:
             if latest is not None and window == latest.window:
                 continue
-            if window == "monthly" and usage_core.capacity_for_plan(account.plan_type, "monthly") is None:
+            if (
+                window == "monthly"
+                and usage_core.capacity_for_plan(account.plan_type, "monthly") is None
+                and not is_pro_family_plan(account.plan_type)
+            ):
                 # A lingering monthly row from a former plan (e.g. after a
                 # free-to-paid upgrade) is not applicable usage and must not
                 # suppress refreshes.
                 continue
-            sibling = await self._usage_repo.latest_entry_for_account(account.id, window=window)
+            sibling = _usable_usage_entry(await self._usage_repo.latest_entry_for_account(account.id, window=window))
             if sibling is not None and (newest is None or sibling.recorded_at > newest.recorded_at):
                 newest = sibling
         if newest is None or newest is latest:
@@ -706,37 +719,69 @@ class UsageUpdater:
             return AccountRefreshResult(usage_written=additional_synced)
         credits_has, credits_unlimited, credits_balance = _credits_snapshot(payload)
         snapshot_windows: list[UsageWindowWrite] = []
+        complete_primary = primary if _is_complete_usage_window(primary) else None
+        complete_secondary = secondary if _is_complete_usage_window(secondary) else None
+        complete_monthly = monthly if _is_complete_usage_window(monthly) else None
 
-        if primary and primary.used_percent is not None:
+        # A complete response that still contains a usable long window but no
+        # primary window is authoritative evidence that the prior short
+        # window was omitted. Persist that fact in the same snapshot so
+        # readers can supersede stale primary exhaustion without deleting
+        # history. An absent rate_limit object, an incomplete window, or a
+        # fetch error never writes this marker.
+        has_usable_long_window = complete_secondary is not None or complete_monthly is not None
+        if primary is None and has_usable_long_window:
             snapshot_windows.append(
                 UsageWindowWrite(
                     window="primary",
-                    used_percent=float(primary.used_percent),
-                    reset_at=_reset_at(primary.reset_at, primary.reset_after_seconds, now_epoch),
-                    window_minutes=_window_minutes(primary.limit_window_seconds),
+                    used_percent=0.0,
+                    reset_at=None,
+                    window_minutes=0,
+                )
+            )
+
+        if complete_primary is not None and complete_primary.used_percent is not None:
+            snapshot_windows.append(
+                UsageWindowWrite(
+                    window="primary",
+                    used_percent=float(complete_primary.used_percent),
+                    reset_at=_reset_at(
+                        complete_primary.reset_at,
+                        complete_primary.reset_after_seconds,
+                        now_epoch,
+                    ),
+                    window_minutes=_window_minutes(complete_primary.limit_window_seconds),
                     credits_has=credits_has,
                     credits_unlimited=credits_unlimited,
                     credits_balance=credits_balance,
                 )
             )
 
-        if secondary and secondary.used_percent is not None:
+        if complete_secondary is not None and complete_secondary.used_percent is not None:
             snapshot_windows.append(
                 UsageWindowWrite(
                     window="secondary",
-                    used_percent=float(secondary.used_percent),
-                    reset_at=_reset_at(secondary.reset_at, secondary.reset_after_seconds, now_epoch),
-                    window_minutes=_window_minutes(secondary.limit_window_seconds),
+                    used_percent=float(complete_secondary.used_percent),
+                    reset_at=_reset_at(
+                        complete_secondary.reset_at,
+                        complete_secondary.reset_after_seconds,
+                        now_epoch,
+                    ),
+                    window_minutes=_window_minutes(complete_secondary.limit_window_seconds),
                 )
             )
 
-        if monthly and monthly.used_percent is not None:
+        if complete_monthly is not None and complete_monthly.used_percent is not None:
             snapshot_windows.append(
                 UsageWindowWrite(
                     window="monthly",
-                    used_percent=float(monthly.used_percent),
-                    reset_at=_reset_at(monthly.reset_at, monthly.reset_after_seconds, now_epoch),
-                    window_minutes=_window_minutes(monthly.limit_window_seconds),
+                    used_percent=float(complete_monthly.used_percent),
+                    reset_at=_reset_at(
+                        complete_monthly.reset_at,
+                        complete_monthly.reset_after_seconds,
+                        now_epoch,
+                    ),
+                    window_minutes=_window_minutes(complete_monthly.limit_window_seconds),
                     credits_has=credits_has,
                     credits_unlimited=credits_unlimited,
                     credits_balance=credits_balance,
@@ -748,7 +793,12 @@ class UsageUpdater:
             snapshot_windows,
         )
         usage_written = any(_usage_entry_written(entry) for entry in entries)
-        await self._recover_quota_status_from_usage(account, primary=primary, secondary=secondary, monthly=monthly)
+        await self._recover_quota_status_from_usage(
+            account,
+            primary=complete_primary,
+            secondary=complete_secondary,
+            monthly=complete_monthly,
+        )
         return AccountRefreshResult(usage_written=usage_written)
 
     async def _deactivate_for_client_error(self, account: Account, exc: UsageFetchError) -> None:
@@ -1261,6 +1311,7 @@ def _latest_usage_is_fresh(
     now: datetime,
     interval_seconds: int,
 ) -> bool:
+    latest = _usable_usage_entry(latest)
     if latest is None:
         return False
     if (now - latest.recorded_at).total_seconds() >= interval_seconds:
@@ -1273,6 +1324,19 @@ def _latest_usage_is_fresh(
 
 
 _MAIN_USAGE_WINDOWS = ("primary", "secondary", "monthly")
+
+
+def _usable_usage_entry(entry: UsageHistory | None) -> UsageHistory | None:
+    """Return a measured row, omitting a persisted no-data marker."""
+    if entry is None:
+        return None
+    if usage_core.is_no_data_window(
+        used_percent=entry.used_percent,
+        reset_at=entry.reset_at,
+        window_minutes=entry.window_minutes,
+    ):
+        return None
+    return entry
 
 
 def _quota_recovery_should_bypass_freshness(account: Account, *, latest: UsageHistory | None) -> bool:
@@ -1325,6 +1389,15 @@ def _window_minutes(limit_seconds: int | None) -> int | None:
     if not limit_seconds or limit_seconds <= 0:
         return None
     return max(1, math.ceil(limit_seconds / 60))
+
+
+def _is_complete_usage_window(window: UsageWindow | None) -> bool:
+    """Return whether a long-window sample can prove a primary omission."""
+    if window is None or window.used_percent is None:
+        return False
+    if _window_minutes(window.limit_window_seconds) is None:
+        return False
+    return window.reset_at is not None or window.reset_after_seconds is not None
 
 
 def _now_epoch() -> int:

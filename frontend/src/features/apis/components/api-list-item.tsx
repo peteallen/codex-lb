@@ -56,9 +56,11 @@ export function ApiListItem({ apiKey, selected, onSelect }: ApiListItemProps) {
   const expired = isExpired(apiKey);
   const primary = apiKey.pooledRemainingPercentPrimary ?? null;
   const secondary = apiKey.pooledRemainingPercentSecondary ?? null;
-  const hasPrimary = apiKey.pooledCapacityCreditsPrimary > 0 && primary !== null;
+  const monthly = apiKey.pooledRemainingPercentMonthly ?? null;
+  const hasPrimary = primary !== null;
   const hasSecondary = secondary !== null;
-  const visibleRows = Number(hasPrimary) + Number(hasSecondary);
+  const hasMonthly = monthly !== null;
+  const visibleRows = Number(hasPrimary) + Number(hasSecondary) + Number(hasMonthly);
   const limitPct = formatLimitPercent(apiKey);
 
   return (
@@ -111,6 +113,19 @@ export function ApiListItem({ apiKey, selected, onSelect }: ApiListItemProps) {
                 aria-label={t("apis.listItem.pooledWeeklyAria")}
                 percent={secondary}
                 testId="pooled-quota-track-weekly"
+              />
+            </div>
+          ) : null}
+          {hasMonthly ? (
+            <div className="space-y-1">
+              <div className="flex items-center justify-between text-[11px]">
+                <span className="text-muted-foreground">{t("apis.listItem.pooledMonthly")}</span>
+                <span className="tabular-nums font-medium">{formatPercentNullable(monthly)}</span>
+              </div>
+              <MiniQuotaBar
+                aria-label={t("apis.listItem.pooledMonthlyAria")}
+                percent={monthly}
+                testId="pooled-quota-track-monthly"
               />
             </div>
           ) : null}

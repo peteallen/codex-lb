@@ -668,6 +668,52 @@ async def test_reconcile_recoverable_account_statuses_restores_quota_exceeded_fr
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("plan_type", ["pro", "prolite", "promax"])
+async def test_reconcile_recoverable_account_statuses_uses_monthly_usage_for_pro_family(
+    monkeypatch: pytest.MonkeyPatch,
+    plan_type: str,
+) -> None:
+    now = 1_700_000_000.0
+    future_reset = int(now + 30 * 24 * 3600)
+    blocked_at = int(now - 130)
+    monkeypatch.setattr("app.modules.proxy.load_balancer.time.time", lambda: now)
+    monkeypatch.setattr("app.core.usage.quota.time.time", lambda: now)
+    monkeypatch.setattr("app.modules.proxy.load_balancer.utcnow", lambda: _epoch_to_naive_utc(now))
+
+    account = _make_account(
+        f"acc_quota_exceeded_{plan_type}_monthly",
+        status=AccountStatus.QUOTA_EXCEEDED,
+        plan_type=plan_type,
+        reset_at=future_reset,
+        blocked_at=blocked_at,
+    )
+    accounts_repo = StubAccountsRepository([account])
+    usage_repo = StubUsageRepository(
+        monthly={
+            account.id: _make_usage(
+                account.id,
+                window="monthly",
+                used_percent=10.0,
+                reset_at=future_reset,
+                recorded_at=_epoch_to_naive_utc(now - 10),
+                window_minutes=43200,
+            )
+        }
+    )
+
+    recovered = await refresh_scheduler_module.reconcile_recoverable_account_statuses(
+        accounts_repo=accounts_repo,
+        usage_repo=usage_repo,
+        accounts=[account],
+    )
+
+    assert recovered == 1
+    assert account.status == AccountStatus.ACTIVE
+    assert account.reset_at is None
+    assert account.blocked_at is None
+
+
+@pytest.mark.asyncio
 async def test_reconcile_recoverable_account_statuses_recovers_quota_exceeded_and_clears_advisory_primary_reset(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

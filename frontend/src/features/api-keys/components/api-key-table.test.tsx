@@ -72,6 +72,21 @@ describe("ApiKeyTable", () => {
     expect(screen.getByText("Opportunistic")).toBeInTheDocument();
   });
 
+  it("renders the Ultrafast enforced service tier", () => {
+    renderWithProviders(
+      <ApiKeyTable
+        keys={[createApiKey({ enforcedServiceTier: "ultrafast" })]}
+        busy={false}
+        onEdit={vi.fn()}
+        onDelete={vi.fn()}
+        onRegenerate={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText("Service tier")).toBeInTheDocument();
+    expect(screen.getByText("Ultrafast")).toBeInTheDocument();
+  });
+
   it("renders 'All' when allowedModels is missing and the configured list otherwise", () => {
     const restricted = createApiKey({
       id: "key_restricted",

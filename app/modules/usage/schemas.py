@@ -8,9 +8,9 @@ from app.modules.shared.schemas import DashboardModel
 
 
 class UsageWindow(DashboardModel):
-    remaining_percent: float
-    capacity_credits: float
-    remaining_credits: float
+    remaining_percent: float | None = None
+    capacity_credits: float | None = None
+    remaining_credits: float | None = None
     reset_at: datetime | None = None
     window_minutes: int | None = None
 
@@ -39,8 +39,8 @@ class UsageSummaryResponse(DashboardModel):
 class UsageHistoryItem(DashboardModel):
     account_id: str
     remaining_percent_avg: float | None = None
-    capacity_credits: float
-    remaining_credits: float
+    capacity_credits: float | None = None
+    remaining_credits: float | None = None
 
 
 class UsageHistoryResponse(DashboardModel):

@@ -89,6 +89,26 @@ def test_get_pricing_for_model_gpt_5_6_aliases(requested_model: str, canonical_m
     assert result == (canonical_model, DEFAULT_PRICING_MODELS[canonical_model])
 
 
+@pytest.mark.parametrize(
+    ("requested_model", "canonical_model"),
+    [
+        ("gpt-6.1-sol", "gpt-6.1-sol"),
+        ("gpt-6.1-sol-2026-09-29", "gpt-6.1-sol"),
+        ("gpt-6.1-sol-snapshot", "gpt-6.1-sol"),
+        ("gpt-6-sol", "gpt-6-sol"),
+        ("gpt-6-sol-2026-09-29", "gpt-6-sol"),
+        ("gpt-6-sol-snapshot", "gpt-6-sol"),
+        ("gpt-6-luna", "gpt-6-luna"),
+        ("gpt-6-luna-2026-09-29", "gpt-6-luna"),
+        ("gpt-6-luna-snapshot", "gpt-6-luna"),
+    ],
+)
+def test_get_pricing_for_model_gpt_6_aliases(requested_model: str, canonical_model: str) -> None:
+    result = get_pricing_for_model(requested_model, DEFAULT_PRICING_MODELS, DEFAULT_MODEL_ALIASES)
+
+    assert result == (canonical_model, DEFAULT_PRICING_MODELS[canonical_model])
+
+
 def test_get_pricing_for_model_gpt_5_4_mini_alias():
     result = get_pricing_for_model("gpt-5.4-mini-2026-03-17", DEFAULT_PRICING_MODELS, DEFAULT_MODEL_ALIASES)
     assert result is not None
@@ -600,6 +620,51 @@ def test_astra_long_context_boundary_includes_cache_reads_and_writes(tier, multi
     above = UsageTokens(272_001, 100_000, 100_000, 40_000)
     assert calculate_cost_from_usage(at, price, service_tier=tier) == pytest.approx(6.92 * multiplier)
     assert calculate_cost_from_usage(above, price, service_tier=tier) == pytest.approx(11.34002 * multiplier)
+
+
+@pytest.mark.parametrize(
+    ("model", "short_cost", "long_cost"),
+    [
+        ("gpt-6.1-sol", 1.23, 2.55),
+        ("gpt-6-sol", 1.24, 2.56),
+        ("gpt-6-luna", 0.062, 0.128),
+    ],
+)
+def test_gpt_6_prices_include_cache_writes_and_long_context(model: str, short_cost: float, long_cost: float) -> None:
+    price = DEFAULT_PRICING_MODELS[model]
+    short = UsageTokens(200_000, 100_000, 100_000, 40_000)
+    long = UsageTokens(300_000, 100_000, 50_000, 40_000)
+
+    assert calculate_cost_from_usage(short, price) == pytest.approx(short_cost)
+    assert calculate_cost_from_usage(long, price) == pytest.approx(long_cost)
+
+
+@pytest.mark.parametrize(
+    ("model", "standard_cost"),
+    [
+        ("gpt-6.1-sol", 1.23),
+        ("gpt-6-sol", 1.24),
+        ("gpt-6-luna", 0.062),
+    ],
+)
+def test_gpt_6_fast_and_flex_prices_scale_standard(model: str, standard_cost: float) -> None:
+    usage = UsageTokens(200_000, 100_000, 100_000, 40_000)
+    price = DEFAULT_PRICING_MODELS[model]
+
+    assert calculate_cost_from_usage(usage, price, service_tier="fast") == pytest.approx(standard_cost * 2)
+    assert calculate_cost_from_usage(usage, price, service_tier="priority") == pytest.approx(standard_cost * 2)
+    assert calculate_cost_from_usage(usage, price, service_tier="flex") == pytest.approx(standard_cost * 0.5)
+
+
+def test_astra_ultrafast_prices_include_long_context_cache_writes() -> None:
+    price = DEFAULT_PRICING_MODELS["gpt-6-astra"]
+
+    short = UsageTokens(200_000, 100_000, 100_000, 40_000)
+    long = UsageTokens(300_000, 100_000, 50_000, 40_000)
+
+    assert calculate_cost_from_usage(short, price, service_tier="ultrafast") == pytest.approx(37.2)
+    assert calculate_cost_from_usage(long, price, service_tier="ultrafast") == pytest.approx(76.8)
+    assert calculate_cost_from_usage(UsageTokens(0, 1_000_000), price, service_tier="ultrafast") == pytest.approx(300)
 
 
 @pytest.mark.parametrize(

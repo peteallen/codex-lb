@@ -371,6 +371,31 @@ async def test_api_key_list_includes_pooled_credit_fields_for_selectable_assigne
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("plan_type", ["pro", "prolite", "promax"])
+async def test_api_key_pool_preserves_pro_percentages_and_monthly_usage(async_client, plan_type):
+    account_id = await _import_account(async_client, "acc-new-pro", "new-pro@example.com")
+    async with SessionLocal() as session:
+        await session.execute(update(Account).where(Account.id == account_id).values(plan_type=plan_type))
+        session.add_all(
+            [
+                UsageHistory(account_id=account_id, window="primary", used_percent=25.0, window_minutes=300),
+                UsageHistory(account_id=account_id, window="secondary", used_percent=40.0, window_minutes=10080),
+                UsageHistory(account_id=account_id, window="monthly", used_percent=65.0, window_minutes=43200),
+            ]
+        )
+        await session.commit()
+    created = await async_client.post("/api/api-keys/", json={"name": "pro-pool", "assignedAccountIds": [account_id]})
+    assert created.status_code == 200
+    response = await async_client.get("/api/api-keys/")
+    assert response.status_code == 200
+    [row] = response.json()
+    assert row["pooledCapacityCreditsPrimary"] is None
+    assert row["pooledRemainingPercentPrimary"] == 75.0
+    assert row["pooledRemainingPercentSecondary"] == 60.0
+    assert row["pooledRemainingPercentMonthly"] == 35.0
+
+
+@pytest.mark.asyncio
 async def test_deleted_assigned_accounts_do_not_fall_back_to_other_accounts(async_client, monkeypatch):
     await _populate_test_registry()
     monkeypatch.setattr(
@@ -668,21 +693,27 @@ async def test_api_key_rejects_enforced_model_outside_allowed_models(async_clien
 
 
 @pytest.mark.asyncio
-async def test_api_key_create_accepts_fast_service_tier_alias(async_client):
+@pytest.mark.parametrize("tier, canonical", [("fast", "priority"), ("ultrafast", "ultrafast")])
+async def test_api_key_create_accepts_service_tier(async_client, tier, canonical):
     created = await async_client.post(
         "/api/api-keys/",
         json={
             "name": "fast-tier-key",
-            "enforcedServiceTier": "fast",
+            "enforcedServiceTier": tier,
         },
     )
 
     assert created.status_code == 200
-    assert created.json()["enforcedServiceTier"] == "priority"
+    assert created.json()["enforcedServiceTier"] == canonical
+    listed = await async_client.get("/api/api-keys/")
+    assert listed.status_code == 200
+    row = next(key for key in listed.json() if key["id"] == created.json()["id"])
+    assert row["enforcedServiceTier"] == canonical
 
 
 @pytest.mark.asyncio
-async def test_api_key_update_accepts_fast_service_tier_alias(async_client):
+@pytest.mark.parametrize("tier, canonical", [("fast", "priority"), ("ULTRAFAST", "ultrafast")])
+async def test_api_key_update_accepts_service_tier(async_client, tier, canonical):
     created = await async_client.post(
         "/api/api-keys/",
         json={
@@ -695,12 +726,12 @@ async def test_api_key_update_accepts_fast_service_tier_alias(async_client):
     updated = await async_client.patch(
         f"/api/api-keys/{key_id}",
         json={
-            "enforcedServiceTier": "fast",
+            "enforcedServiceTier": tier,
         },
     )
 
     assert updated.status_code == 200
-    assert updated.json()["enforcedServiceTier"] == "priority"
+    assert updated.json()["enforcedServiceTier"] == canonical
 
 
 @pytest.mark.asyncio
@@ -777,7 +808,19 @@ async def test_api_key_enforces_model_and_reasoning_for_responses(async_client, 
 
 
 @pytest.mark.asyncio
-async def test_api_key_enforces_service_tier_for_responses(async_client, monkeypatch):
+@pytest.mark.parametrize(
+    "tier, canonical, advertised, account_catalog",
+    [
+        ("fast", "priority", True, "complete"),
+        ("ultrafast", "ultrafast", True, "complete"),
+        ("ultrafast", "ultrafast", False, "complete"),
+        ("ultrafast", "ultrafast", True, "plan_only"),
+        ("ultrafast", "ultrafast", True, "missing_account"),
+    ],
+)
+async def test_api_key_enforces_service_tier_for_responses(
+    async_client, monkeypatch, tier, canonical, advertised, account_catalog
+):
     await _populate_test_registry()
     model_ids = sorted(_TEST_MODELS)
     forced_model = model_ids[0]
@@ -799,14 +842,27 @@ async def test_api_key_enforces_service_tier_for_responses(async_client, monkeyp
             "name": "enforced-service-tier",
             "allowedModels": [forced_model],
             "enforcedModel": forced_model,
-            "enforcedServiceTier": "fast",
+            "enforcedServiceTier": tier,
         },
     )
     assert created.status_code == 200
     key = created.json()["key"]
-    assert created.json()["enforcedServiceTier"] == "priority"
+    assert created.json()["enforcedServiceTier"] == canonical
 
-    await _import_account(async_client, "acc_enforced_service_tier", "enforced-service-tier@example.com")
+    account_id = await _import_account(async_client, "acc_enforced_service_tier", "enforced-service-tier@example.com")
+    if canonical == "ultrafast":
+        model = _make_upstream_model(forced_model)
+        if advertised:
+            model.raw["service_tiers"] = [{"id": "ultrafast", "name": "Ultrafast"}]
+        if account_catalog == "plan_only":
+            await get_model_registry().update({"plus": [model]})
+        else:
+            catalog_account_id = "catalog-peer" if account_catalog == "missing_account" else account_id
+            await get_model_registry().update(
+                {"plus": [model]},
+                per_account_results={catalog_account_id: ("plus", [model])},
+                active_account_plans={catalog_account_id: "plus"},
+            )
 
     seen: dict[str, str | None] = {}
 
@@ -830,10 +886,15 @@ async def test_api_key_enforces_service_tier_for_responses(async_client, monkeyp
             "stream": True,
         },
     ) as response:
+        if not advertised or account_catalog != "complete":
+            body = (await response.aread()).decode()
+            assert "no_plan_support_for_model" in body
+            assert not seen
+            return
         assert response.status_code == 200
         _ = [line async for line in response.aiter_lines() if line]
 
-    assert seen["service_tier"] == "priority"
+    assert seen["service_tier"] == canonical
 
 
 @pytest.mark.asyncio
@@ -4101,4 +4162,67 @@ async def test_astra_cache_writes_charge_same_cost_in_proxy_logs_and_key_limit(
         logs = list((await session.scalars(select(RequestLog).where(RequestLog.model == "gpt-6-astra"))).all())
         assert len(logs) == 1
         assert logs[0].cache_write_tokens == 40_000
+        assert logs[0].cost_usd == pytest.approx(expected)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("model", "service_tier", "expected"),
+    [
+        ("gpt-6.1-sol", "default", 1.11),
+        ("gpt-6-sol", "default", 1.115),
+        ("gpt-6-luna", "default", 0.05575),
+        ("gpt-6-astra", "ultrafast", 33.45),
+    ],
+)
+async def test_new_gpt6_prices_settle_api_key_and_request_log_cost(
+    async_client,
+    monkeypatch,
+    model,
+    service_tier,
+    expected,
+):
+    await async_client.put("/api/settings", json={"apiKeyAuthEnabled": True, "stickyThreadsEnabled": False})
+    created = await async_client.post(
+        "/api/api-keys/",
+        json={
+            "name": f"{model}-settlement",
+            "limits": [{"limitType": "cost_usd", "limitWindow": "weekly", "maxValue": 100_000_000}],
+        },
+    )
+    assert created.status_code == 200
+    key = created.json()
+    await _import_account(async_client, f"{model}-settlement-account", f"{model}-settlement@example.com")
+    response_payload = {
+        "id": f"resp_{model.replace('.', '_')}_settlement",
+        "model": model,
+        "status": "completed",
+        "service_tier": service_tier,
+        "output": [],
+        "usage": {
+            "input_tokens": 100_000,
+            "output_tokens": 100_000,
+            "total_tokens": 200_000,
+            "input_tokens_details": {"cached_tokens": 50_000, "cache_write_tokens": 10_000},
+        },
+    }
+
+    async def fake_compact(*args, **kwargs):
+        return OpenAIResponsePayload.model_validate(response_payload)
+
+    monkeypatch.setattr(proxy_module, "core_compact_responses", fake_compact)
+    response = await async_client.post(
+        "/v1/responses/compact",
+        headers={"Authorization": f"Bearer {key['key']}"},
+        json={"model": model, "input": [], "instructions": "hi", "service_tier": service_tier},
+    )
+    assert response.status_code == 200
+
+    async with SessionLocal() as session:
+        limits = await ApiKeysRepository(session).get_limits_by_key(key["id"])
+        assert limits[0].current_value == int(expected * 1_000_000)
+        logs = list((await session.scalars(select(RequestLog).where(RequestLog.model == model))).all())
+        assert len(logs) == 1
+        assert logs[0].service_tier == service_tier
+        assert logs[0].cache_write_tokens == 10_000
         assert logs[0].cost_usd == pytest.approx(expected)

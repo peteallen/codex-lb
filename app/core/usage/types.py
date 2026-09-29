@@ -37,17 +37,17 @@ class UsageAggregateRow:
 @dataclass(frozen=True)
 class UsageWindowSummary:
     used_percent: float | None
-    capacity_credits: float
-    used_credits: float
+    capacity_credits: float | None
+    used_credits: float | None
     reset_at: int | None
     window_minutes: int | None
 
 
 @dataclass(frozen=True)
 class UsageWindowSnapshot:
-    used_percent: float
-    capacity_credits: float
-    used_credits: float
+    used_percent: float | None
+    capacity_credits: float | None
+    used_credits: float | None
     reset_at: int | None
     window_minutes: int | None
 
