@@ -395,7 +395,7 @@ data is available.
 
 - **GIVEN** an authenticated operator opens the dashboard
 - **WHEN** `GET /api/dashboard/overview` and request-log calls complete before `GET /api/dashboard/projections`
-- **THEN** the dashboard renders the primary cards, usage donuts, account list, and request-log surface
+- **THEN** the dashboard renders the primary cards, account list, and request-log surface
 - **AND** projection-only safe-line and weekly-credit fields may populate later when the projections response arrives
 
 #### Scenario: Projection endpoint exposes heavy dashboard calculations
@@ -404,18 +404,26 @@ data is available.
 - **THEN** the response includes depletion safe-line data and weekly-credit pace data when those calculations are available
 - **AND** the overview endpoint does not need to compute those fields for initial page render
 
-### Requirement: Dashboard usage donuts present credits as stacked remaining and capacity
+### Requirement: Dashboard omits pooled quota charts
 
-The dashboard's primary and secondary usage donuts MUST present remaining credits and capacity as two stacked values separated by a horizontal divider: the remaining count above (bold, `data-testid="donut-center-remaining"`) and the capacity count below (muted, `data-testid="donut-center-capacity"`). Both values MUST use locale-aware thousands separators (e.g. `7,331` and `7,560`). Compact-format abbreviation (e.g. `7.33k`) MUST NOT be used in the donut center for these panels.
+The dashboard MUST NOT render the pooled 5-hour or weekly credit charts, their credit fractions, legends or safe-line ticks, regardless of whether absolute account capacities are known. It MUST NOT replace these panels with pooled or per-account percentage charts. Account cards, account list rows and account details MUST retain their existing quota information. The separate weekly credit pace card MAY remain when its existing eligibility rules permit it.
 
-The primary donut title MUST read `5-Hour Credits`. The secondary donut title MUST read `Weekly Credits`.
+#### Scenario: Mixed-capacity accounts do not render quota charts
 
-#### Scenario: Dashboard donut shows stacked remaining and capacity
+- **WHEN** the dashboard receives accounts with a mixture of known and unknown absolute credit capacities
+- **THEN** neither the 5-hour nor weekly pooled chart appears
+- **AND** account quota information remains available in the accounts section
 
-- **WHEN** the dashboard renders a usage donut with `remaining=7331` and `total=7560`
-- **THEN** the donut title reads `5-Hour Credits` or `Weekly Credits`
-- **AND** the center renders `7,331` in the remaining element and `7,560` in the capacity element
-- **AND** a divider separates the two values
+#### Scenario: Known capacities do not restore the removed panels
+
+- **WHEN** every account has complete absolute credit data
+- **THEN** neither `5-Hour Credits` nor `Weekly Credits` pooled chart is rendered
+
+#### Scenario: Other dashboard content is preserved
+
+- **WHEN** the dashboard overview loads
+- **THEN** summary cards, the accounts section and recent request logs remain available
+- **AND** an eligible weekly credit pace card remains available without an empty quota-chart column
 
 ### Requirement: API sidebar shows pooled credit bars
 

@@ -121,10 +121,6 @@ vi.mock("@/features/dashboard/components/stats-grid", () => ({
   StatsGrid: () => <div data-testid="stats-grid" />,
 }));
 
-vi.mock("@/features/dashboard/components/usage-donuts", () => ({
-  UsageDonuts: () => <div data-testid="usage-donuts" />,
-}));
-
 vi.mock("@/features/dashboard/components/weekly-credits-pace-card", () => ({
   WeeklyCreditsPaceCard: () => <div data-testid="weekly-credits-pace-card" />,
 }));
@@ -266,6 +262,47 @@ describe("DashboardPage", () => {
 
     return overview;
   }
+
+  it.each([225, null])("omits pooled quota charts with capacity %s while preserving dashboard content", async (capacity) => {
+    const overview = mockReadyDashboard();
+    overview.summary.primaryWindow.capacityCredits = capacity;
+    if (overview.summary.secondaryWindow) {
+      overview.summary.secondaryWindow.capacityCredits = capacity;
+    }
+    const actual = await vi.importActual<typeof import("@/features/dashboard/utils")>("@/features/dashboard/utils");
+    buildDashboardViewMock.mockReturnValue(actual.buildDashboardView(overview, []));
+
+    renderWithProviders(<DashboardPage />);
+
+    expect(screen.queryByRole("heading", { name: "5-Hour Credits" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Weekly Credits" })).not.toBeInTheDocument();
+    expect(screen.queryByTestId("donut-center-remaining")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("safe-line-tick")).not.toBeInTheDocument();
+    expect(screen.getByTestId("stats-grid")).toBeInTheDocument();
+    expect(screen.getByTestId("account-cards")).toBeInTheDocument();
+    expect(screen.getByTestId("recent-requests-table")).toBeInTheDocument();
+  });
+
+  it("retains an eligible weekly pace card without restoring the quota charts", async () => {
+    const overview = mockReadyDashboard();
+    const actual = await vi.importActual<typeof import("@/features/dashboard/utils")>("@/features/dashboard/utils");
+    const pace = actual.buildWeeklyCreditPace([{
+      ...overview.accounts[0],
+      capacityCreditsSecondary: 100,
+      remainingCreditsSecondary: 80,
+      resetAtSecondary: "2026-10-01T00:00:00Z",
+      windowMinutesSecondary: 10080,
+    }], new Date("2026-09-29T00:00:00Z"));
+    expect(pace).not.toBeNull();
+    buildDashboardViewMock.mockReturnValue({ ...actual.buildDashboardView(overview, []), weeklyCreditPace: pace });
+
+    renderWithProviders(<DashboardPage />);
+
+    expect(screen.getByTestId("weekly-credits-pace-card")).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "5-Hour Credits" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Weekly Credits" })).not.toBeInTheDocument();
+    expect(screen.getByTestId("account-cards")).toBeInTheDocument();
+  });
 
   it("keeps the page-wide skeleton while overview data is unavailable", () => {
     mockReadyDashboard();
