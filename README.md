@@ -60,13 +60,17 @@ see [Getting started](https://soju06.github.io/codex-lb/getting-started/).
 Point any OpenAI-compatible client at codex-lb. For Codex CLI, `~/.codex/config.toml`:
 
 ```toml
-model = "gpt-5.6-sol"
+model = "gpt-6.1-sol"
 model_reasoning_effort = "xhigh"
 model_provider = "codex-lb"
+
+[features]
+api_key_model_discovery = true
 
 [model_providers.codex-lb]
 name = "openai"  # required — enables remote /responses/compact. Lowercase since Codex 2026-05-23; older "OpenAI" stops resolving gpt-5.5
 base_url = "http://127.0.0.1:2455/backend-api/codex"
+model_catalog_url = "http://127.0.0.1:2455/backend-api/codex/models"
 wire_api = "responses"
 supports_websockets = true
 requires_openai_auth = true # required for codex app

@@ -109,13 +109,17 @@ docker run -d --name codex-lb \
 `~/.codex/config.toml`：
 
 ```toml
-model = "gpt-5.3-codex"
+model = "gpt-6.1-sol"
 model_reasoning_effort = "xhigh"
 model_provider = "codex-lb"
 
+[features]
+api_key_model_discovery = true
+
 [model_providers.codex-lb]
-name = "OpenAI"  # 必填 —— 启用远程 /responses/compact
+name = "openai"  # 必填 —— 启用远程 /responses/compact
 base_url = "http://127.0.0.1:2455/backend-api/codex"
+model_catalog_url = "http://127.0.0.1:2455/backend-api/codex/models"
 wire_api = "responses"
 supports_websockets = true
 requires_openai_auth = true # codex 应用需要
@@ -155,8 +159,9 @@ responses_websockets_v2 = true
 
 ```toml
 [model_providers.codex-lb]
-name = "OpenAI"
+name = "openai"
 base_url = "http://127.0.0.1:2455/backend-api/codex"
+model_catalog_url = "http://127.0.0.1:2455/backend-api/codex/models"
 wire_api = "responses"
 env_key = "CODEX_LB_API_KEY"
 supports_websockets = true
