@@ -133,6 +133,8 @@
   "accounts.toasts.paused": "账户已暂停",
   "accounts.toasts.pauseFailed": "暂停失败",
   "accounts.toasts.probed": "账户 probe 已执行",
+  "accounts.toasts.probeRejected": "上游探测失败（HTTP {{status}}）。",
+  "accounts.toasts.probeConnectionFailed": "探测无法连接到上游服务。",
   "accounts.toasts.probeFailed": "Probe 失败",
   "accounts.toasts.rateLimitWindowsReset": "已 reset {{count}} 个 rate-limit window",
   "accounts.toasts.rateLimitWindowsReset_one": "已 reset {{count}} 个 rate-limit window",

@@ -252,7 +252,15 @@ def build_usage_summary_response(
     account_map = {account.id: account for account in accounts}
     primary_rows = _without_no_data_rows(primary_rows)
     secondary_rows = _without_no_data_rows(secondary_rows)
-    monthly_rows = _without_no_data_rows(monthly_rows)
+    primary_by_account = {row.account_id: row for row in primary_rows}
+    secondary_by_account = {row.account_id: row for row in secondary_rows}
+    monthly_rows = [
+        row
+        for row in monthly_rows
+        if usage_core.is_current_monthly_window(
+            row, primary_by_account.get(row.account_id), secondary_by_account.get(row.account_id)
+        )
+    ]
     primary_window = usage_core.summarize_usage_window(primary_rows, account_map, "primary")
     secondary_window = usage_core.summarize_usage_window(secondary_rows, account_map, "secondary")
     monthly_window = usage_core.summarize_usage_window(monthly_rows, account_map, "monthly") if monthly_rows else None

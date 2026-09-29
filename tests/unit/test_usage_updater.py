@@ -404,6 +404,7 @@ def test_usage_refresh_scheduler_selects_monthly_long_window_for_free_accounts()
     selected = _select_long_window_entries(
         accounts=[free_account, plus_account],
         monthly_entries={free_account.id: monthly},
+        primary_entries={},
         secondary_entries={free_account.id: free_secondary, plus_account.id: plus_secondary},
     )
 

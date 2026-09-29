@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import timedelta
 
 import pytest
@@ -8,6 +9,7 @@ from app.core.usage import (
     SIBLING_FETCH_MARGIN_SECONDS,
     _should_prefer_primary_row,
     capacity_for_plan,
+    is_current_monthly_window,
     normalize_rate_limit_windows,
     normalize_usage_window,
     normalize_weekly_only_rows,
@@ -565,3 +567,27 @@ def test_same_fetch_real_rows_secondary_with_later_reset_at_wins():
     )
 
     assert _should_prefer_primary_row(primary_earlier_reset, secondary_later_reset) is False
+
+
+@pytest.mark.parametrize("delta, expected", [(-60, True), (0, True), (5, True), (6, False)])
+def test_current_monthly_window_requires_a_later_complete_observation(delta, expected):
+    now = utcnow()
+    monthly = UsageWindowRow("a", 0.0, reset_at=2000, window_minutes=43200, recorded_at=now)
+    weekly = UsageWindowRow("a", 100.0, reset_at=1500, window_minutes=10080, recorded_at=now + timedelta(seconds=delta))
+    assert is_current_monthly_window(monthly, weekly) is expected
+
+
+@pytest.mark.parametrize("missing", ["used_percent", "reset_at", "window_minutes", "recorded_at"])
+def test_incomplete_sibling_does_not_supersede_monthly_quota(missing):
+    now = utcnow()
+    monthly = UsageWindowRow("a", 100.0, reset_at=2000, window_minutes=43200, recorded_at=now)
+    sibling = UsageWindowRow("a", 0.0, reset_at=1500, window_minutes=10080, recorded_at=now + timedelta(days=1))
+    assert is_current_monthly_window(monthly, replace(sibling, **{missing: None}))
+
+
+def test_no_data_sibling_does_not_supersede_monthly_quota():
+    now = utcnow()
+    monthly = UsageWindowRow("a", 100.0, reset_at=2000, window_minutes=43200, recorded_at=now)
+    absent = UsageWindowRow("a", 0.0, window_minutes=0, recorded_at=now + timedelta(days=1))
+    assert is_current_monthly_window(monthly, absent)
+    assert not is_current_monthly_window(absent, monthly)

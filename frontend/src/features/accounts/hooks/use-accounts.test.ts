@@ -3,6 +3,7 @@ import { renderHook, waitFor } from "@testing-library/react";
 import { HttpResponse, http } from "msw";
 import { createElement, type PropsWithChildren } from "react";
 import { describe, expect, it, vi } from "vitest";
+import { toast } from "sonner";
 
 import {
   useAccounts,
@@ -224,5 +225,43 @@ describe("useAccounts", () => {
     const refetchInterval = (query?.options as { refetchInterval?: unknown } | undefined)
       ?.refetchInterval;
     expect(refetchInterval).toBeUndefined();
+  });
+});
+
+
+describe("Force Probe outcomes", () => {
+  it.each([200, 204, 400, 429, 0, null])("reports upstream status %s and refreshes quota", async (status) => {
+    const success = vi.spyOn(toast, "success").mockImplementation(() => "");
+    const failure = vi.spyOn(toast, "error").mockImplementation(() => "");
+    const queryClient = createTestQueryClient();
+    const invalidate = vi.spyOn(queryClient, "invalidateQueries");
+    server.use(http.post("/api/accounts/:accountId/probe", ({ params }) => HttpResponse.json({
+      status: "probed",
+      accountId: String(params.accountId),
+      probeStatusCode: status,
+      primaryUsedPercentBefore: 100,
+      primaryUsedPercentAfter: 100,
+      secondaryUsedPercentBefore: null,
+      secondaryUsedPercentAfter: null,
+      accountStatusBefore: "rate_limited",
+      accountStatusAfter: "rate_limited",
+    })));
+    const { result } = renderHook(() => useAccounts(), { wrapper: createWrapper(queryClient) });
+    await result.current.probeMutation.mutateAsync({ accountId: "probe-account" });
+    if (status !== null && status >= 200 && status < 300) {
+      expect(success).toHaveBeenCalledWith("Account probed");
+      expect(failure).not.toHaveBeenCalled();
+    } else {
+      expect(success).not.toHaveBeenCalled();
+      expect(failure).toHaveBeenCalledWith(status === null
+        ? "Probe failed"
+        : status === 0
+        ? "Could not connect to the upstream service for the probe."
+        : `Upstream probe failed (HTTP ${status}).`);
+    }
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: ["accounts", "list"] });
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: ["dashboard", "overview"] });
+    success.mockRestore();
+    failure.mockRestore();
   });
 });

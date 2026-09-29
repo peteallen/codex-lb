@@ -813,7 +813,6 @@ class AccountsService:
                     "content": [{"type": "input_text", "text": "."}],
                 }
             ],
-            "max_output_tokens": 1,
             "stream": True,
             "store": False,
         }

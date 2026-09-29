@@ -116,6 +116,35 @@ def is_no_data_window(
     return used_percent == 0.0 and reset_at is None and window_minutes == 0
 
 
+def is_current_monthly_window(
+    monthly: UsageWindowRow | None,
+    *siblings: UsageWindowRow | None,
+) -> bool:
+    """Keep monthly quota unless a later complete window superseded it."""
+    if monthly is None or is_no_data_window(
+        used_percent=monthly.used_percent,
+        reset_at=monthly.reset_at,
+        window_minutes=monthly.window_minutes,
+    ):
+        return False
+    monthly_recorded_at = _normalize_recorded_at(monthly.recorded_at)
+    if monthly_recorded_at is None:
+        return True
+    for sibling in siblings:
+        sibling_recorded_at = _normalize_recorded_at(sibling.recorded_at) if sibling is not None else None
+        if (
+            sibling is not None
+            and sibling.account_id == monthly.account_id
+            and sibling.used_percent is not None
+            and _has_real_quota_metadata(sibling)
+            and not is_monthly_window_minutes(sibling.window_minutes)
+            and sibling_recorded_at is not None
+            and (sibling_recorded_at - monthly_recorded_at).total_seconds() > SIBLING_FETCH_MARGIN_SECONDS
+        ):
+            return False
+    return True
+
+
 def used_credits_from_percent(used_percent: float | None, capacity_credits: float | None) -> float | None:
     if used_percent is None or capacity_credits is None:
         return None

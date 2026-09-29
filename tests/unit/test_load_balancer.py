@@ -6096,3 +6096,34 @@ def test_select_account_fill_first_primary_dominates_over_secondary():
     assert result.account is not None
     # Primary still wins -- only ties break on secondary.
     assert result.account.account_id == "high-secondary"
+
+
+@pytest.mark.parametrize("slot", ["primary", "secondary"])
+def test_build_states_uses_current_weekly_quota_over_historical_monthly(monkeypatch, slot):
+    now = 1_700_000_000.0
+    monkeypatch.setattr("app.modules.proxy.load_balancer.time.time", lambda: now)
+    account = _make_test_account(plan_type="pro", status=AccountStatus.RATE_LIMITED, blocked_at=int(now - 86400))
+    monthly = _make_test_usage(
+        window="monthly",
+        used_percent=0.0,
+        window_minutes=43200,
+        reset_at=int(now + 432000),
+        recorded_at=_epoch_to_naive_utc(now - 86400 * 20),
+    )
+    weekly = _make_test_usage(
+        window=slot,
+        used_percent=100.0,
+        window_minutes=10080,
+        reset_at=int(now + 345600),
+        recorded_at=_epoch_to_naive_utc(now - 10),
+    )
+    states, _ = _build_states(
+        accounts=[account],
+        latest_primary={account.id: weekly} if slot == "primary" else {},
+        latest_secondary={account.id: weekly} if slot == "secondary" else {},
+        latest_monthly={account.id: monthly},
+        runtime={},
+    )
+    assert states[0].secondary_used_percent == 100.0
+    assert states[0].secondary_reset_at == weekly.reset_at
+    assert states[0].status == AccountStatus.RATE_LIMITED

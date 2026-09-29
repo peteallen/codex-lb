@@ -139,8 +139,16 @@ export function useAccountMutations() {
   const probeMutation = useMutation({
     mutationFn: ({ accountId, model }: { accountId: string; model?: string }) =>
       probeAccount(accountId, model ? { model } : undefined),
-    onSuccess: (_data, variables) => {
-      toast.success(t("accounts.toasts.probed"));
+    onSuccess: (data, variables) => {
+      if (data.probeStatusCode === null) {
+        toast.error(t("accounts.toasts.probeFailed"));
+      } else if (data.probeStatusCode >= 200 && data.probeStatusCode < 300) {
+        toast.success(t("accounts.toasts.probed"));
+      } else if (data.probeStatusCode === 0) {
+        toast.error(t("accounts.toasts.probeConnectionFailed"));
+      } else {
+        toast.error(t("accounts.toasts.probeRejected", { status: data.probeStatusCode }));
+      }
       void invalidateAccountRelatedQueries(queryClient, variables.accountId);
     },
     onError: (error: Error) => {

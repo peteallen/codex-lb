@@ -133,6 +133,8 @@
   "accounts.toasts.paused": "Account paused",
   "accounts.toasts.pauseFailed": "Pause failed",
   "accounts.toasts.probed": "Account probed",
+  "accounts.toasts.probeRejected": "Upstream probe failed (HTTP {{status}}).",
+  "accounts.toasts.probeConnectionFailed": "Could not connect to the upstream service for the probe.",
   "accounts.toasts.probeFailed": "Probe failed",
   "accounts.toasts.rateLimitWindowsReset": "Rate-limit window reset ({{count}})",
   "accounts.toasts.rateLimitWindowsReset_one": "Rate-limit window reset ({{count}})",

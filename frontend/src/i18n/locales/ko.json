@@ -133,6 +133,8 @@
   "accounts.toasts.paused": "Account 일시 정지됨",
   "accounts.toasts.pauseFailed": "일시 정지 실패",
   "accounts.toasts.probed": "Account probe 완료",
+  "accounts.toasts.probeRejected": "업스트림 프로브 실패(HTTP {{status}}).",
+  "accounts.toasts.probeConnectionFailed": "프로브를 위해 업스트림 서비스에 연결할 수 없습니다.",
   "accounts.toasts.probeFailed": "Probe 실패",
   "accounts.toasts.rateLimitWindowsReset": "rate-limit window {{count}}개 reset",
   "accounts.toasts.rateLimitWindowsReset_one": "rate-limit window {{count}}개 reset",

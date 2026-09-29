@@ -1801,6 +1801,7 @@ class LoadBalancer:
             effective_secondary_entry = _select_long_window_entry(
                 account=account,
                 monthly_entry=monthly_entry,
+                primary_entry=primary_entry,
                 secondary_entry=secondary_entry,
             )
             normalized_usage = _normalize_usage_inputs(
@@ -2051,6 +2052,7 @@ def _build_states(
             secondary_entry = _select_long_window_entry(
                 account=account,
                 monthly_entry=latest_monthly.get(account.id),
+                primary_entry=latest_primary.get(account.id),
                 secondary_entry=secondary_entry,
             )
         state = _state_from_account(
@@ -2748,11 +2750,12 @@ def _select_long_window_entry(
     account: Account,
     monthly_entry: UsageHistory | None,
     secondary_entry: UsageHistory | AdditionalUsageHistory | None,
+    primary_entry: UsageHistory | AdditionalUsageHistory | None = None,
 ) -> UsageHistory | AdditionalUsageHistory | None:
-    if monthly_entry is not None and usage_core.is_no_data_window(
-        used_percent=monthly_entry.used_percent,
-        reset_at=monthly_entry.reset_at,
-        window_minutes=monthly_entry.window_minutes,
+    if not usage_core.is_current_monthly_window(
+        usage_history_to_window_row(monthly_entry) if monthly_entry is not None else None,
+        usage_history_to_window_row(primary_entry) if primary_entry is not None else None,
+        usage_history_to_window_row(secondary_entry) if secondary_entry is not None else None,
     ):
         monthly_entry = None
     secondary_entry = _usable_usage_entry(secondary_entry)
