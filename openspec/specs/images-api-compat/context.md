@@ -11,6 +11,22 @@ Codex client setup is part of this compatibility boundary. A working server
 route is insufficient when a custom-provider gateway hides the image tool
 before it makes an HTTP request.
 
+## Internal host model selection
+
+The Images adapter keeps the public `gpt-image-*` model in the image-generation
+tool while selecting the outer Responses host from the model registry. It
+checks non-empty plan visibility and suppression state in the ordered candidate
+list `gpt-5.6-luna`, `gpt-6-astra`, `gpt-5.5`. This lets current catalogs avoid
+withdrawn hosts while preserving older deployments. If no candidate qualifies,
+the adapter returns the first candidate and leaves normal account-selection
+errors in control.
+
+On 2026-10-30, the live catalog had withdrawn `gpt-5.5` but still supported
+`gpt-5.6-luna`. A real Responses image-tool diagnostic using that host returned
+a valid PNG over HTTP 200. The diagnostic did not exercise the public Images
+route or prove browser/PSTN behavior; route-level coverage is provided by the
+integration tests.
+
 ## Codex provider eligibility
 
 Codex has two distinct provider-authentication paths that can make built-in
