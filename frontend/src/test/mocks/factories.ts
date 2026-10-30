@@ -365,6 +365,7 @@ export function createDashboardProjections(
 			secondsUntilExhaustion: null,
 		},
 		weeklyCreditPace: null,
+		weeklyCoverage: null,
 		...overrides,
 	});
 }

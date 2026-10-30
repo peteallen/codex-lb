@@ -63,6 +63,7 @@ nav:
   - Authentication: authentication.md
   - API Keys: api-keys.md
   - Routing: routing.md
+  - Weekly Coverage: weekly-coverage.md
   - Database: database.md
   - Deployment:
       - Docker: deployment/docker.md

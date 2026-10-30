@@ -16,6 +16,10 @@ import {
   settings,
   upstreamProxyAdmin,
   unauthenticatedSession,
+  weeklyCoverageLearningProjections,
+  weeklyCoverageLegacyProjections,
+  weeklyCoverageLimitedProjections,
+  weeklyCoverageReadyProjections,
 } from "./fixtures";
 import {
   createAccountSummary,
@@ -57,6 +61,7 @@ async function interceptApi(
   page: Page,
   session: SessionOverride = authSession,
   accountList = accounts,
+  projections = weeklyCoverageReadyProjections,
 ) {
   await page.route("**/api/**", (route) => {
     const url = new URL(route.request().url());
@@ -64,6 +69,7 @@ async function interceptApi(
 
     if (p === "/api/dashboard-auth/session") return fulfill(route, session);
     if (p === "/api/dashboard/overview") return fulfill(route, overview);
+    if (p === "/api/dashboard/projections") return fulfill(route, projections);
     if (p === "/api/request-logs/options") return fulfill(route, filterOptions);
     if (p === "/api/request-logs") {
       const limit = Math.max(1, Number(url.searchParams.get("limit") ?? 50));
@@ -132,12 +138,14 @@ async function capture(
     route: string;
     fullPage?: boolean;
     session?: SessionOverride;
+    projections?: typeof weeklyCoverageReadyProjections;
     waitFor?: string;
+    element?: string;
     beforeScreenshot?: (page: Page) => Promise<void>;
   },
 ) {
   await applyTheme(page, opts.theme);
-  await interceptApi(page, opts.session);
+  await interceptApi(page, opts.session, accounts, opts.projections);
 
   // Trigger prefers-reduced-motion so the existing CSS media query kicks in.
   await page.emulateMedia({ reducedMotion: "reduce" });
@@ -174,12 +182,15 @@ async function capture(
     });
   }
 
-  await page.screenshot({
+  const screenshotOptions = {
     path: path.join(SCREENSHOT_DIR, opts.file),
-    type: "jpeg",
-    quality: 90,
-    fullPage: opts.fullPage ?? false,
-  });
+    ...(opts.file.endsWith(".png") ? { type: "png" as const } : { type: "jpeg" as const, quality: 90 }),
+  };
+  if (opts.element) {
+    await page.locator(opts.element).screenshot(screenshotOptions);
+  } else {
+    await page.screenshot({ ...screenshotOptions, fullPage: opts.fullPage ?? false });
+  }
 }
 
 // ── Scenes ──
@@ -190,6 +201,122 @@ test("dashboard — light", async ({ page }) => {
 
 test("dashboard — dark", async ({ page }) => {
   await capture(page, { file: "dashboard-dark.jpg", theme: "dark", route: "/dashboard" });
+});
+
+async function assertNoHorizontalOverflow(page: Page) {
+  const dimensions = await page.evaluate(() => ({
+    clientWidth: document.documentElement.clientWidth,
+    scrollWidth: document.documentElement.scrollWidth,
+  }));
+  expect(dimensions.scrollWidth).toBeLessThanOrEqual(dimensions.clientWidth + 1);
+}
+
+test("dashboard weekly coverage — ready desktop", async ({ page }) => {
+  await capture(page, {
+    file: "dashboard-weekly-coverage-ready.jpg",
+    theme: "light",
+    route: "/dashboard",
+    fullPage: true,
+    waitFor: '[data-testid="weekly-coverage-card"]',
+    beforeScreenshot: async (currentPage) => {
+      const card = currentPage.getByTestId("weekly-coverage-card");
+      await expect(card.getByRole("button", { name: "Details" })).toHaveAttribute("aria-expanded", "false");
+      await expect(card).toBeVisible();
+    },
+  });
+});
+
+test("dashboard weekly coverage — ready narrow", async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await capture(page, {
+    file: "dashboard-weekly-coverage-ready-narrow.jpg",
+    theme: "light",
+    route: "/dashboard",
+    waitFor: '[data-testid="weekly-coverage-card"]',
+    beforeScreenshot: async (currentPage) => {
+      await expect(currentPage.getByTestId("weekly-coverage-card").getByRole("button", { name: "Details" })).toHaveAttribute("aria-expanded", "false");
+      await assertNoHorizontalOverflow(currentPage);
+      await currentPage.evaluate(() => {
+        const card = document.querySelector<HTMLElement>('[data-testid="weekly-coverage-card"]');
+        if (card) {
+          window.scrollTo(0, Math.max(0, window.scrollY + card.getBoundingClientRect().top - 220));
+        }
+      });
+    },
+  });
+});
+
+test("dashboard weekly coverage — learning", async ({ page }) => {
+  await capture(page, {
+    file: "dashboard-weekly-coverage-learning.jpg",
+    theme: "light",
+    route: "/dashboard",
+    fullPage: true,
+    projections: weeklyCoverageLearningProjections,
+    waitFor: '[data-testid="weekly-coverage-card"]',
+  });
+});
+
+test("dashboard weekly coverage — limited account projections", async ({ page }) => {
+  await capture(page, {
+    file: "dashboard-weekly-coverage-limited.jpg",
+    theme: "light",
+    route: "/dashboard",
+    fullPage: true,
+    projections: weeklyCoverageLimitedProjections,
+    waitFor: '[data-testid="weekly-coverage-card"]',
+    beforeScreenshot: async (currentPage) => {
+      const card = currentPage.getByTestId("weekly-coverage-card");
+      await expect(currentPage.getByTestId("weekly-coverage-card").getByRole("button", { name: "Details" })).toHaveAttribute("aria-expanded", "false");
+      await expect(currentPage.getByTestId("weekly-coverage-account-timeline-coverage_pro_one")).toBeVisible();
+      await expect(currentPage.getByTestId("weekly-coverage-account-timeline-coverage_pro_two")).toBeVisible();
+      await expect(currentPage.getByTestId("weekly-coverage-account-timeline-coverage_pro_three")).toBeVisible();
+      await expect(currentPage.getByTestId("weekly-coverage-account-timeline-coverage_pro_four")).toBeVisible();
+      await expect(currentPage.getByTestId("weekly-coverage-account-timeline-coverage_pro_max_live")).toBeVisible();
+      const cardBox = await card.boundingBox();
+      expect(cardBox, "weekly coverage card should be measurable").not.toBeNull();
+      expect(cardBox?.height).toBeLessThanOrEqual(400);
+    },
+  });
+});
+
+test("dashboard weekly coverage — compact limited card", async ({ page }) => {
+  await capture(page, {
+    file: "dashboard-weekly-coverage-compact-card.png",
+    theme: "light",
+    route: "/dashboard",
+    projections: weeklyCoverageLimitedProjections,
+    element: '[data-testid="weekly-coverage-card"]',
+    waitFor: '[data-testid="weekly-coverage-card"]',
+    beforeScreenshot: async (currentPage) => {
+      await expect(currentPage.getByTestId("weekly-coverage-card").getByRole("button", { name: "Details" })).toHaveAttribute("aria-expanded", "false");
+    },
+  });
+});
+
+test("dashboard weekly coverage — compact limited card dark", async ({ page }) => {
+  await capture(page, {
+    file: "dashboard-weekly-coverage-compact-card-dark.png",
+    theme: "dark",
+    route: "/dashboard",
+    projections: weeklyCoverageLimitedProjections,
+    element: '[data-testid="weekly-coverage-card"]',
+    waitFor: '[data-testid="weekly-coverage-card"]',
+    beforeScreenshot: async (currentPage) => {
+      await expect(currentPage.getByTestId("weekly-coverage-card").getByRole("button", { name: "Details" })).toHaveAttribute("aria-expanded", "false");
+    },
+  });
+});
+
+test("dashboard weekly coverage — legacy before state", async ({ page }) => {
+  await capture(page, {
+    file: "dashboard-weekly-coverage-legacy.jpg",
+    theme: "light",
+    route: "/dashboard",
+    fullPage: true,
+    projections: weeklyCoverageLegacyProjections,
+    waitFor: "text=Weekly credits pace",
+  });
 });
 
 test("dashboard conversations — desktop", async ({ page }) => {

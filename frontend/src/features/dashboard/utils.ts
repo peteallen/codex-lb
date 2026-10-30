@@ -9,6 +9,7 @@ import type {
   RequestLog,
   TrendPoint,
   UsageWindow,
+  WeeklyCoverage,
 } from "@/features/dashboard/schemas";
 import { formatCompactAccountId } from "@/utils/account-identifiers";
 import { buildDonutPalette } from "@/utils/colors";
@@ -102,6 +103,7 @@ export type DashboardView = {
   safeLinePrimary: SafeLineView | null;
   safeLineSecondary: SafeLineView | null;
   weeklyCreditPace: WeeklyCreditPace | null;
+  weeklyCoverage?: WeeklyCoverage | null;
 };
 
 type DashboardViewOptions = {
@@ -735,6 +737,7 @@ export function buildDashboardView(
     requestLogs,
     safeLinePrimary: buildDepletionView(projections?.depletionPrimary ?? overview.depletionPrimary),
     safeLineSecondary: buildDepletionView(projections?.depletionSecondary ?? overview.depletionSecondary),
+    weeklyCoverage: projections?.weeklyCoverage ?? null,
     weeklyCreditPace:
       projections?.weeklyCreditPace !== undefined
         ? projections.weeklyCreditPace

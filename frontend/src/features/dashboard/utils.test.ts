@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import type { AccountSummary, Depletion } from "@/features/dashboard/schemas";
+import type { AccountSummary, Depletion, WeeklyCoverage } from "@/features/dashboard/schemas";
 import {
   applySecondaryConstraint,
   buildDashboardView,
@@ -729,6 +729,30 @@ describe("buildWeeklyCreditPace", () => {
 });
 
 describe("buildDashboardView", () => {
+  it("passes additive weekly coverage projections through to the dashboard view", () => {
+    const weeklyCoverage: WeeklyCoverage = {
+      status: "learning",
+      generatedAt: "2026-01-01T00:00:00Z",
+      horizonAt: "2026-01-15T00:00:00Z",
+      paceBasis: "current_window_average",
+      routingStrategy: "reset_drain",
+      warnings: ["insufficient_calibration"],
+      accounts: [],
+      intervals: [],
+      minimumReserveHours: null,
+      minimumReserveAt: null,
+    };
+    const overview = createDashboardOverview();
+    const view = buildDashboardView(
+      overview,
+      createDefaultRequestLogs(),
+      false,
+      { weeklyCoverage },
+    );
+
+    expect(view.weeklyCoverage).toBe(weeklyCoverage);
+  });
+
   it("prefers backend weekly credit pace when the overview provides it", () => {
     const serverPace: WeeklyCreditPace = {
       totalFullCredits: 50_400,

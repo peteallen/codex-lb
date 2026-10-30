@@ -1,0 +1,54 @@
+{
+  "config": {
+    "freshnessHours": 0.08333333333333333,
+    "holdoutDays": 7.0,
+    "lookbackDays": 7.0
+  },
+  "cutoffs": {
+    "calibratedAccountCutoffs": 101,
+    "eligibleAccountCutoffs": 1020,
+    "evaluated": 204,
+    "first": "2026-06-15T23:00:00",
+    "insufficientEvidenceCutoffs": 204,
+    "last": "2026-09-25T22:00:00",
+    "learningAccountCutoffs": 451,
+    "limitedAccountCutoffs": 568,
+    "readyAccountCutoffs": 1,
+    "readyPoolCutoffs": 0,
+    "simulatedPoolCutoffs": 0,
+    "stepHours": 12.0,
+    "zeroReadyPoolCutoffs": 203
+  },
+  "limitations": [
+    "Historical account status and plan changes are not retained; current eligible accounts are used as the validation cohort.",
+    "Account attribution is required for work scoring; unmatched or incomplete work is reported as unavailable evidence.",
+    "The metric scores account capacity drawdown, not a guarantee of future routing or provider behavior.",
+    "Only ready estimates are scored; saturation does not measure uncensored drawdown.",
+    "Held-out capacity error is evaluated separately from full-pool interruption timing; the historical request log cannot reproduce sticky-session allocation exactly.",
+    "Only seven-day quota observations are included; five-hour limits and purchased credits are excluded."
+  ],
+  "mode": "read_only_sqlite_transaction",
+  "schemaVersion": 1,
+  "scope": {
+    "eligibleAccountCount": 5,
+    "historyEnd": "2026-10-02T22:57:03.198658",
+    "historyStart": "2026-06-08T22:48:40.278243",
+    "planCounts": {
+      "pro": 4,
+      "promax": 1
+    },
+    "statusCounts": {
+      "active": 5
+    },
+    "weeklySampleCount": 422746,
+    "workBucketCount": 16946
+  },
+  "validation": {
+    "candidateIntervals": 1,
+    "incompleteIntervals": 0,
+    "reason": "no_complete_held_out_drawdown_intervals",
+    "scoredIntervals": 0,
+    "status": "validation_unavailable",
+    "unexplainedIntervals": 1
+  }
+}

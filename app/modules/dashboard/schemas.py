@@ -6,6 +6,7 @@ from typing import List, Literal
 from pydantic import Field
 
 from app.modules.accounts.schemas import AccountSummary
+from app.modules.dashboard.coverage_schemas import WeeklyCoverageResponse
 from app.modules.shared.schemas import DashboardModel
 from app.modules.usage.schemas import MetricsTrends, UsageWindow, UsageWindowResponse
 
@@ -122,3 +123,4 @@ class DashboardProjectionsResponse(DashboardModel):
     depletion_primary: DepletionResponse | None = None
     depletion_secondary: DepletionResponse | None = None
     weekly_credit_pace: WeeklyCreditPaceResponse | None = None
+    weekly_coverage: WeeklyCoverageResponse | None = None

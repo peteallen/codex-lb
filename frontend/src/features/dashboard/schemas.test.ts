@@ -16,6 +16,7 @@ import {
   RequestLogFilterOptionsSchema,
   RequestLogsResponseSchema,
   UsageWindowSchema,
+  WeeklyCoverageResponseSchema,
 } from "@/features/dashboard/schemas";
 import { createAccountSummary, createDashboardOverview } from "@/test/mocks/factories";
 
@@ -200,6 +201,96 @@ describe("DashboardOverviewSchema", () => {
     });
 
     expect(parsed.timeframe.key).toBe("custom");
+  });
+});
+
+describe("WeeklyCoverageResponseSchema", () => {
+  it("parses additive coverage projections without exposing credit assumptions", () => {
+    const parsed = WeeklyCoverageResponseSchema.parse({
+      status: "ready",
+      generatedAt: ISO,
+      horizonAt: "2026-01-15T00:00:00+00:00",
+      paceBasis: "current_window_average",
+      routingStrategy: "reset_drain",
+      warnings: ["outside_usage"],
+      accounts: [
+        {
+          accountId: "acc-1",
+          label: "Account 1",
+          planType: "pro",
+          status: "ready",
+          reason: null,
+          remainingPercent: 70,
+          resetAt: "2026-01-08T00:00:00+00:00",
+          capacityWorkUnits: 100,
+          sampleCount: 4,
+          observedDropPercent: 12,
+          intervals: [
+            {
+              startAt: ISO,
+              endAt: "2026-01-08T00:00:00+00:00",
+              state: "available",
+            },
+          ],
+        },
+      ],
+      intervals: [
+        {
+          startAt: ISO,
+          endAt: "2026-01-15T00:00:00+00:00",
+          state: "available",
+        },
+      ],
+      minimumReserveHours: 4.5,
+      minimumReserveAt: "2026-01-05T00:00:00+00:00",
+    });
+
+    expect(parsed.paceBasis).toBe("current_window_average");
+    expect(parsed.accounts[0]?.capacityWorkUnits).toBe(100);
+    expect(parsed.intervals[0]?.state).toBe("available");
+    expect(parsed.accounts[0]?.quotaPaceStatus).toBe("unavailable");
+    expect(parsed.accounts[0]?.diagnostics.discardedIntervalCount).toBe(0);
+    expect(parsed.accounts[0]?.diagnostics.unpricedModels).toEqual([]);
+  });
+
+  it("parses independent account pace projections and evidence diagnostics", () => {
+    const parsed = WeeklyCoverageResponseSchema.parse({
+      status: "limited",
+      generatedAt: ISO,
+      horizonAt: "2026-01-15T00:00:00+00:00",
+      paceBasis: "current_window_average",
+      routingStrategy: "reset_drain",
+      warnings: ["incomplete_evidence"],
+      accounts: [{
+        accountId: "acc-1",
+        label: "Account 1",
+        planType: "pro",
+        status: "learning",
+        reason: "unpriced_models",
+        remainingPercent: 64,
+        resetAt: "2026-01-08T00:00:00+00:00",
+        capacityWorkUnits: null,
+        sampleCount: 2,
+        observedDropPercent: 9,
+        intervals: [],
+        quotaPaceStatus: "exhausts_before_reset",
+        usedPercentPerDay: 11.25,
+        projectedExhaustionAt: "2026-01-06T00:00:00+00:00",
+        projectedRemainingAtReset: 0,
+        diagnostics: {
+          discardedIntervalCount: 3,
+          unpricedModels: ["codex-auto-review"],
+        },
+      }],
+      intervals: [],
+      minimumReserveHours: null,
+      minimumReserveAt: null,
+    });
+
+    expect(parsed.accounts[0]?.quotaPaceStatus).toBe("exhausts_before_reset");
+    expect(parsed.accounts[0]?.projectedExhaustionAt).toBe("2026-01-06T00:00:00+00:00");
+    expect(parsed.accounts[0]?.diagnostics.discardedIntervalCount).toBe(3);
+    expect(parsed.accounts[0]?.diagnostics.unpricedModels).toEqual(["codex-auto-review"]);
   });
 });
 

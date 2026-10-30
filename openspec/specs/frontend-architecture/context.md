@@ -3,6 +3,16 @@
 Normative requirements live in [`spec.md`](./spec.md). This document currently
 covers the progressive-disclosure navigation and settings model.
 
+## Weekly coverage
+
+Dashboard projections can include an additive `weeklyCoverage` response. When
+present it replaces the legacy weekly pace card, including when the new result
+is learning or limited. The existing pooled quota charts remain removed.
+Availability segments encode time rather than summed credits or percentages.
+The initial viewport is seven days, while the headline considers all fourteen
+forecast days. Account evidence expands on demand. The model, scope and failure
+states are owned by [weekly-coverage](../weekly-coverage/spec.md).
+
 ## Progressive disclosure (nav + settings)
 
 ### Purpose

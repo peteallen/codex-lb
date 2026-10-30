@@ -139,6 +139,62 @@ const WeeklyCreditPaceSchema = z.object({
   confidence: z.enum(["high", "medium", "low"]),
 });
 
+export const WeeklyCoverageIntervalSchema = z.object({
+  startAt: z.iso.datetime({ offset: true }),
+  endAt: z.iso.datetime({ offset: true }),
+  state: z.enum(["available", "exhausted"]),
+});
+
+export const WeeklyCoverageQuotaPaceStatusSchema = z.enum([
+  "unavailable",
+  "no_usage",
+  "lasts_until_reset",
+  "exhausts_before_reset",
+  "exhausted",
+]);
+
+export const WeeklyCoverageAccountDiagnosticsSchema = z.object({
+  discardedIntervalCount: z.number().int().nonnegative().default(0),
+  unpricedModels: z.array(z.string()).default([]),
+});
+
+export const WeeklyCoverageAccountSchema = z.object({
+  accountId: z.string(),
+  label: z.string(),
+  planType: z.string(),
+  status: z.enum(["ready", "learning", "limited", "excluded"]),
+  reason: z.string().nullable(),
+  remainingPercent: z.number().nullable(),
+  resetAt: z.iso.datetime({ offset: true }).nullable(),
+  // This is deliberately kept in the API type for the simulator, but the
+  // dashboard must explain evidence instead of exposing an abstract unit.
+  capacityWorkUnits: z.number().nullable(),
+  sampleCount: z.number().int().nonnegative(),
+  observedDropPercent: z.number(),
+  intervals: z.array(WeeklyCoverageIntervalSchema),
+  quotaPaceStatus: WeeklyCoverageQuotaPaceStatusSchema.default("unavailable"),
+  usedPercentPerDay: z.number().nullable().default(null),
+  projectedExhaustionAt: z.iso.datetime({ offset: true }).nullable().default(null),
+  projectedRemainingAtReset: z.number().nullable().default(null),
+  diagnostics: WeeklyCoverageAccountDiagnosticsSchema.default(() => ({
+    discardedIntervalCount: 0,
+    unpricedModels: [],
+  })),
+});
+
+export const WeeklyCoverageResponseSchema = z.object({
+  status: z.enum(["ready", "learning", "limited", "no_eligible_accounts"]),
+  generatedAt: z.iso.datetime({ offset: true }),
+  horizonAt: z.iso.datetime({ offset: true }),
+  paceBasis: z.literal("current_window_average"),
+  routingStrategy: z.string(),
+  warnings: z.array(z.string()),
+  accounts: z.array(WeeklyCoverageAccountSchema),
+  intervals: z.array(WeeklyCoverageIntervalSchema),
+  minimumReserveHours: z.number().nullable(),
+  minimumReserveAt: z.iso.datetime({ offset: true }).nullable(),
+});
+
 export const DashboardOverviewSchema = z.object({
   lastSyncAt: z.iso.datetime({ offset: true }).nullable(),
   timeframe: DashboardOverviewTimeframeSchema,
@@ -165,6 +221,7 @@ export const DashboardProjectionsSchema = z.object({
   depletionPrimary: DepletionSchema.nullable().optional(),
   depletionSecondary: DepletionSchema.nullable().optional(),
   weeklyCreditPace: WeeklyCreditPaceSchema.nullable().optional(),
+  weeklyCoverage: WeeklyCoverageResponseSchema.nullable().optional(),
 });
 
 const RequestLogCostBreakdownSchema = z.object({
@@ -277,6 +334,12 @@ export type RequestLogFilterOptions = z.infer<typeof RequestLogFilterOptionsSche
 export type FilterState = z.infer<typeof FilterStateSchema>;
 export type Depletion = z.infer<typeof DepletionSchema>;
 export type ServerWeeklyCreditPace = z.infer<typeof WeeklyCreditPaceSchema>;
+export type WeeklyCoverageInterval = z.infer<typeof WeeklyCoverageIntervalSchema>;
+export type WeeklyCoverageQuotaPaceStatus = z.infer<typeof WeeklyCoverageQuotaPaceStatusSchema>;
+export type WeeklyCoverageAccountDiagnostics = z.infer<typeof WeeklyCoverageAccountDiagnosticsSchema>;
+export type WeeklyCoverageAccount = z.infer<typeof WeeklyCoverageAccountSchema>;
+export type WeeklyCoverageResponse = z.infer<typeof WeeklyCoverageResponseSchema>;
+export type WeeklyCoverage = WeeklyCoverageResponse;
 
 export const DashboardViewSchema = z.enum(["request-logs", "conversations"]);
 export type DashboardView = z.infer<typeof DashboardViewSchema>;
