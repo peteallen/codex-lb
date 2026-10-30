@@ -1,5 +1,14 @@
 # Verification: upstream denials and usage retries
 
+## Review correction (2026-10-30)
+
+The archived change was rechecked against the externally visible HTTP bridge
+and streamed Responses paths. The correction gates all four HTTP bridge
+connection/reattachment 401 refresh decisions on the typed refreshable-auth
+classification, and makes permanent streamed terminal failures await API-key
+reservation settlement before account-health writes. Regression coverage now
+exercises both paths with real imported accounts and API-key reservations.
+
 ## Result
 
 All six implementation/verification tasks are complete. Both owning capabilities have been synced to their main specifications, including their operational context. Changes remain local; no commit, publication, deployment, service restart, or historical account reactivation was performed. Pre-existing local voice files and edits were preserved.
@@ -13,6 +22,8 @@ All six implementation/verification tasks are complete. Both owning capabilities
 | Revocation requires reauthentication | Shared terminal code tables, existing guarded auth manager writes and proxy retry gates | Usage cycles skip revoked accounts, guarded OAuth status handling, HTTP/compact/WebSocket call stops |
 | Unknown 403 fails closed | Shared classification and terminal authorization helper before overload/failover | Both HTTP routes, post-refresh 403, capacity-like messages and WebSocket handshake denials |
 | Reservation settlement precedes health/status updates | Streaming, compact and WebSocket terminal boundaries | Real API-key reservation rows are released before status or health callbacks for token_revoked and unknown 403 |
+| HTTP bridge terminal auth does not replay | Bridge connection and reattachment auth gates | `test_v1_responses_http_bridge_terminal_auth_does_not_force_refresh_or_fail_over` proves a `401 token_revoked` is surfaced after one connection attempt with no forced refresh |
+| Streamed terminal auth settles before health | Normal streamed `response.failed` completion and terminal stream handling | `test_terminal_auth_sse_releases_real_reservation_before_status_write` observes the reservation row as `released` inside `mark_permanent_failure` for a real `response.created` → `response.failed(token_revoked)` stream |
 | Bare usage 402/404 does not deactivate | Explicit-evidence usage classifier | Bare failures retain status; explicit codes/messages still deactivate or require reauthentication |
 | Native refresh and recognized fallback preserved | Access-token expiry exception and existing exact quota/model/security guards | Access token_expired refresh succeeds; OAuth token_expired stays permanent; existing quota, security, model and continuity suites pass |
 

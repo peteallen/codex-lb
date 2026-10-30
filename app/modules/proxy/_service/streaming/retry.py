@@ -12,7 +12,7 @@ from typing import Any, AsyncIterator, Mapping, cast
 import aiohttp
 
 from app.core.auth.refresh import RefreshError, is_transient_refresh_contention, refresh_contention_kind
-from app.core.balancer import failover_decision
+from app.core.balancer import PERMANENT_FAILURE_CODES, failover_decision
 from app.core.balancer.types import UpstreamError
 from app.core.clients.proxy import (
     ProxyResponseError,
@@ -449,11 +449,15 @@ class _StreamingRetryMixin:
 
         async def _settle_stream_usage_before_pending_penalty(
             current_settlement: _StreamSettlement,
+            *,
+            wait_for_settlement: bool = False,
         ) -> bool:
             apply_pending_penalty = post_refresh_transient_replacement_selected and bool(
                 pending_post_refresh_transient_penalties
             )
-            wait_for_health_write = apply_pending_penalty or bool(deferred_account_error_backoffs)
+            wait_for_health_write = (
+                wait_for_settlement or apply_pending_penalty or bool(deferred_account_error_backoffs)
+            )
             settle_kwargs = {"wait_for_settlement": True} if wait_for_health_write else {}
             settled_result = await proxy._settle_stream_api_key_usage(
                 api_key,
@@ -522,9 +526,9 @@ class _StreamingRetryMixin:
                 failed_session=failed_session,
             )
 
-        async def _settle_auth_denial_before_health(exc: ProxyResponseError) -> bool:
+        async def _settle_terminal_failure_before_health(*, terminal: bool) -> bool:
             nonlocal settled
-            if not is_terminal_authorization_denial(exc) or settled:
+            if not terminal or settled:
                 return True
             if settlement.usage_settlement_transferred:
                 return False
@@ -2032,7 +2036,10 @@ class _StreamingRetryMixin:
                                 else:
                                     settlement.error = tex.error
                                 settlement.account_health_error = _facade()._should_penalize_stream_error(error_code)
-                                settled = await _settle_stream_usage_before_pending_penalty(settlement)
+                                settled = await _settle_stream_usage_before_pending_penalty(
+                                    settlement,
+                                    wait_for_settlement=settlement.error_code in PERMANENT_FAILURE_CODES,
+                                )
                                 if settled and settlement.account_health_error:
                                     await proxy._handle_stream_error(
                                         account,
@@ -2235,7 +2242,9 @@ class _StreamingRetryMixin:
                                     health_write_allowed = await _drain_pending_post_refresh_penalty_on_terminal(
                                         settlement
                                     )
-                                    if not health_write_allowed or not await _settle_auth_denial_before_health(tex):
+                                    if not health_write_allowed or not await _settle_terminal_failure_before_health(
+                                        terminal=True
+                                    ):
                                         raise
                                 classified = await proxy._handle_stream_error(
                                     account,
@@ -2342,7 +2351,10 @@ class _StreamingRetryMixin:
                             break  # outer loop: select different account
                         finally:
                             pop_stream_timeout_overrides(stream_timeout_tokens)
-                        settled = await _settle_stream_usage_before_pending_penalty(settlement)
+                        settled = await _settle_stream_usage_before_pending_penalty(
+                            settlement,
+                            wait_for_settlement=settlement.error_code in PERMANENT_FAILURE_CODES,
+                        )
                         if settled and settlement.account_health_error:
                             await proxy._handle_stream_error(
                                 account,
@@ -2404,6 +2416,9 @@ class _StreamingRetryMixin:
                     continue
                 except _TerminalStreamError as exc:
                     health_write_allowed = await _drain_pending_post_refresh_penalty_on_terminal(settlement)
+                    health_write_allowed = health_write_allowed and await _settle_terminal_failure_before_health(
+                        terminal=exc.code in PERMANENT_FAILURE_CODES
+                    )
                     if health_write_allowed and _facade()._should_penalize_stream_error(exc.code):
                         await proxy._handle_stream_error(account, exc.error, exc.code)
                     return
@@ -2861,8 +2876,11 @@ class _StreamingRetryMixin:
                                 excluded_account_ids.add(account.id)
                                 continue
                             health_write_allowed = await _drain_pending_post_refresh_penalty_on_terminal(settlement)
-                            health_write_allowed = health_write_allowed and await _settle_auth_denial_before_health(
-                                retry_exc
+                            health_write_allowed = (
+                                health_write_allowed
+                                and await _settle_terminal_failure_before_health(
+                                    terminal=is_terminal_authorization_denial(retry_exc)
+                                )
                             )
                             if health_write_allowed:
                                 await proxy._handle_stream_error(
@@ -2947,7 +2965,9 @@ class _StreamingRetryMixin:
                             require_security_work_authorized = True
                             continue
                     health_write_allowed = await _drain_pending_post_refresh_penalty_on_terminal(settlement)
-                    health_write_allowed = health_write_allowed and await _settle_auth_denial_before_health(exc)
+                    health_write_allowed = health_write_allowed and await _settle_terminal_failure_before_health(
+                        terminal=is_terminal_authorization_denial(exc)
+                    )
                     if health_write_allowed and _facade()._should_penalize_stream_error(error_code):
                         await proxy._handle_stream_error(
                             account,
