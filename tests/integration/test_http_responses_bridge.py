@@ -1968,6 +1968,68 @@ async def test_v1_responses_http_bridge_fails_over_confirmed_proxy_connect_befor
 
 
 @pytest.mark.asyncio
+async def test_v1_responses_http_bridge_terminal_auth_does_not_force_refresh_or_fail_over(
+    async_client,
+    monkeypatch,
+):
+    _install_bridge_settings(monkeypatch, enabled=True)
+    first_account_id = await _import_account(
+        async_client,
+        "acc_http_bridge_terminal_auth_a",
+        "http-bridge-terminal-auth-a@example.com",
+    )
+    second_account_id = await _import_account(
+        async_client,
+        "acc_http_bridge_terminal_auth_b",
+        "http-bridge-terminal-auth-b@example.com",
+    )
+    first_account = await _get_account(first_account_id)
+    second_account = await _get_account(second_account_id)
+    connect_calls: list[str | None] = []
+    forced_refreshes: list[str] = []
+
+    async def fake_select_account_with_budget(self, deadline, *, exclude_account_ids=None, **kwargs):
+        del self, deadline, kwargs
+        excluded = set(exclude_account_ids or set())
+        account = second_account if first_account.id in excluded else first_account
+        return AccountSelection(account=account, error_message=None, error_code=None)
+
+    async def fake_ensure_fresh_with_budget(self, target, *, force=False, timeout_seconds):
+        del self, timeout_seconds
+        if force:
+            forced_refreshes.append(target.id)
+        return target
+
+    async def fake_connect_responses_websocket(headers, access_token, account_id_header, **kwargs):
+        del headers, access_token, kwargs
+        connect_calls.append(account_id_header)
+        raise proxy_module.ProxyResponseError(
+            401,
+            proxy_module.openai_error("token_revoked", "Authentication token was revoked"),
+        )
+
+    monkeypatch.setattr(proxy_module.ProxyService, "_select_account_with_budget", fake_select_account_with_budget)
+    monkeypatch.setattr(proxy_module.ProxyService, "_ensure_fresh_with_budget", fake_ensure_fresh_with_budget)
+    monkeypatch.setattr(proxy_module, "connect_responses_websocket", fake_connect_responses_websocket)
+
+    response = await async_client.post(
+        "/v1/responses",
+        json={
+            "model": "gpt-5.4",
+            "instructions": "Return exactly OK.",
+            "input": "hello",
+            "prompt_cache_key": "http-bridge-terminal-auth-key",
+            "stream": True,
+        },
+    )
+
+    assert response.status_code == 401
+    assert response.json()["error"]["code"] == "token_revoked"
+    assert connect_calls == [first_account.chatgpt_account_id]
+    assert forced_refreshes == []
+
+
+@pytest.mark.asyncio
 async def test_v1_responses_http_bridge_codex_session_uses_extended_idle_ttl(async_client, app_instance, monkeypatch):
     _install_bridge_settings_with_limits(monkeypatch, enabled=True, codex_idle_ttl_seconds=600.0)
     account_id = await _import_account(async_client, "acc_http_bridge_codex_ttl", "http-bridge-codex-ttl@example.com")

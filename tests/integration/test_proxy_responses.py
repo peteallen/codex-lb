@@ -3157,6 +3157,77 @@ async def test_terminal_auth_releases_real_reservation_before_status_write(async
 
 
 @pytest.mark.asyncio
+async def test_terminal_auth_sse_releases_real_reservation_before_status_write(async_client, monkeypatch):
+    from app.db.models import ApiKeyUsageReservation
+
+    auth = _make_auth_json("acc_terminal_sse_reservation", "terminal-sse-reservation@example.com")
+    response = await async_client.post(
+        "/api/accounts/import",
+        files={"auth_json": ("auth.json", json.dumps(auth), "application/json")},
+    )
+    assert response.status_code == 200
+    response = await async_client.put(
+        "/api/settings",
+        json={"apiKeyAuthEnabled": True, "totpRequiredOnLogin": False},
+    )
+    assert response.status_code == 200
+    response = await async_client.post(
+        "/api/api-keys/",
+        json={
+            "name": "terminal-auth-sse",
+            "limits": [{"limitType": "total_tokens", "limitWindow": "weekly", "maxValue": 1_000_000}],
+        },
+    )
+    assert response.status_code == 200
+    key = response.json()["key"]
+    key_id = response.json()["id"]
+    marks: list[str] = []
+    original_mark = proxy_module.LoadBalancer.mark_permanent_failure
+
+    async def mark(self, account, *args, **kwargs):
+        async with SessionLocal() as session:
+            rows = (
+                (
+                    await session.execute(
+                        select(ApiKeyUsageReservation).where(ApiKeyUsageReservation.api_key_id == key_id)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            assert len(rows) == 1
+            assert rows[0].status == "released"
+        marks.append(account.id)
+        return await original_mark(self, account, *args, **kwargs)
+
+    async def stream(*args, **kwargs):
+        del args, kwargs
+        yield (
+            'data: {"type":"response.created","response":{"id":"resp_terminal_sse",'
+            '"object":"response","status":"in_progress"}}\n\n'
+        )
+        yield (
+            'data: {"type":"response.failed","response":{"id":"resp_terminal_sse",'
+            '"object":"response","status":"failed","error":{"code":"token_revoked",'
+            '"message":"Authentication token was revoked"}}}\n\n'
+        )
+
+    monkeypatch.setattr(proxy_module.LoadBalancer, "mark_permanent_failure", mark)
+    monkeypatch.setattr(proxy_module, "core_stream_responses", stream)
+    response = await async_client.post(
+        "/backend-api/codex/responses",
+        headers={"Authorization": f"Bearer {key}"},
+        json={"model": "gpt-5.4", "instructions": "hi", "input": [], "stream": True},
+    )
+
+    assert response.status_code == 200
+    events = list(_iter_sse_events([line for line in response.text.splitlines() if line]))
+    failed = next(event for event in events if event["type"] == "response.failed")
+    assert failed["response"]["error"]["code"] == "token_revoked"
+    assert marks
+
+
+@pytest.mark.asyncio
 async def test_proxy_responses_access_token_expiry_retains_bounded_refresh(async_client, monkeypatch):
     auth = _make_auth_json("acc_expired_access", "expired-access@example.com")
     response = await async_client.post(
