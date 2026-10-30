@@ -9,9 +9,15 @@ classification, and makes permanent streamed terminal failures await API-key
 reservation settlement before account-health writes. Regression coverage now
 exercises both paths with real imported accounts and API-key reservations.
 
+On the combined October 30 branch, the HTTP bridge, Responses streaming, and
+usage API integration suites passed all 253 tests. Repository-wide Ruff,
+formatting, Ty, and proxy architecture checks passed. OpenSpec 1.7 strict
+validation passed all 181 active changes and main specifications. These are
+local checks; they do not establish live-provider or cloud CI behavior.
+
 ## Result
 
-All six implementation/verification tasks are complete. Both owning capabilities have been synced to their main specifications, including their operational context. Changes remain local; no commit, publication, deployment, service restart, or historical account reactivation was performed. Pre-existing local voice files and edits were preserved.
+All six implementation/verification tasks are complete. Both owning capabilities have been synced to their main specifications, including their operational context. At the original verification, changes remained local and pre-existing local voice files and edits were preserved. Publication and deployment are tracked separately from these local verification results.
 
 ## Requirement coverage
 
