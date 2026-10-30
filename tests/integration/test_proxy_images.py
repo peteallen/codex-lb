@@ -25,6 +25,7 @@ import app.modules.proxy.service as proxy_module
 from app.core.config.settings import Settings
 from app.core.exceptions import ProxyModelNotAllowed, ProxyRateLimitError
 from app.core.multipart import MultipartPolicy
+from app.core.openai.model_registry import get_model_registry
 from app.db.models import DashboardSettings
 
 pytestmark = pytest.mark.integration
@@ -305,7 +306,8 @@ async def test_images_generations_no_accounts_returns_5xx(async_client):
 
 
 @pytest.mark.asyncio
-async def test_images_generations_returns_envelope_on_success(async_client, monkeypatch, caplog):
+@pytest.mark.parametrize("route", ["/v1/images/generations", "/backend-api/codex/images/generations"])
+async def test_images_generations_returns_envelope_on_success(async_client, monkeypatch, caplog, route):
     await _import_account(async_client, "acc_images_basic", "img-basic@example.com")
 
     captured: dict[str, object] = {}
@@ -355,7 +357,7 @@ async def test_images_generations_returns_envelope_on_success(async_client, monk
 
     with caplog.at_level(logging.INFO, logger="app.modules.proxy.api"):
         response = await async_client.post(
-            "/v1/images/generations",
+            route,
             json={
                 "model": "gpt-image-2",
                 "prompt": "tiny red circle on white",
@@ -372,7 +374,7 @@ async def test_images_generations_returns_envelope_on_success(async_client, monk
     assert body["usage"] == {"input_tokens": 7, "output_tokens": 13, "total_tokens": 20}
 
     # The host model is hidden from clients but appears in the upstream call.
-    assert captured["model"] == "gpt-5.5"
+    assert captured["model"] == "gpt-5.6-luna"
     tools = cast(list[Any], captured["tools"])
     image_tool = cast(dict[str, Any], tools[0])
     assert image_tool["type"] == "image_generation"
@@ -1031,6 +1033,7 @@ async def test_images_edits_basic_round_trip(async_client, monkeypatch):
 
     async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False, **kwargs):
         del headers, access_token, base_url, raise_for_status, kwargs
+        captured["model"] = payload.model
         captured["input"] = payload.input
         captured["tools"] = list(payload.tools)
         captured["account_id"] = account_id
@@ -1076,6 +1079,7 @@ async def test_images_edits_basic_round_trip(async_client, monkeypatch):
     assert response.status_code == 200, response.text
     body = response.json()
     assert body["data"] == [{"b64_json": "EDITED_B64", "revised_prompt": "edited"}]
+    assert captured["model"] == "gpt-5.6-luna"
 
     # Verify the upstream payload contained the image as an input_image data
     # URL alongside the prompt text.
@@ -1102,6 +1106,7 @@ async def test_backend_codex_images_edits_json_data_urls_round_trip(async_client
 
     async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False, **kwargs):
         del headers, access_token, base_url, raise_for_status, kwargs
+        captured["model"] = payload.model
         captured["input"] = payload.input
         captured["tools"] = list(payload.tools)
         captured["account_id"] = account_id
@@ -1143,6 +1148,7 @@ async def test_backend_codex_images_edits_json_data_urls_round_trip(async_client
 
     assert response.status_code == 200, response.text
     body = response.json()
+    assert captured["model"] == "gpt-5.6-luna"
     assert body["data"] == [{"b64_json": "EDITED_B64", "revised_prompt": "edited"}]
     input_items = cast(list[dict[str, Any]], captured["input"])
     content = cast(list[dict[str, Any]], input_items[0]["content"])
@@ -1163,6 +1169,79 @@ async def test_backend_codex_images_edits_json_data_urls_round_trip(async_client
     assert len(image_parts) == 1
     image_url_value = cast(str, image_parts[0]["image_url"])
     assert image_url_value.startswith("data:image/png;base64,")
+
+
+@pytest.mark.asyncio
+async def test_codex_images_edit_uses_authoritative_current_host_when_legacy_host_is_suppressed(
+    async_client,
+    monkeypatch,
+):
+    account_id = "acc_images_authoritative"
+    await _import_account(async_client, account_id, "img-authoritative@example.com")
+
+    registry = get_model_registry()
+    preferred = registry.get_models_with_fallback()["gpt-5.6-luna"]
+    await registry.update(
+        {"plus": [preferred]},
+        per_account_results={account_id: ("plus", [preferred])},
+        active_account_plans={account_id: "plus"},
+    )
+    assert registry.is_suppressed_model("gpt-5.5") is True
+
+    captured: dict[str, object] = {}
+
+    async def fake_stream(
+        payload,
+        headers,
+        access_token,
+        selected_account_id,
+        base_url=None,
+        raise_for_status=False,
+        **kwargs,
+    ):
+        del headers, access_token, selected_account_id, base_url, raise_for_status, kwargs
+        captured["model"] = payload.model
+        captured["tools"] = list(payload.tools)
+        yield _sse(
+            {
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "image_generation_call",
+                    "id": "ig_authoritative",
+                    "status": "completed",
+                    "result": "AUTHORITATIVE_B64",
+                    "revised_prompt": "edited",
+                    "size": "1024x1024",
+                    "quality": "auto",
+                    "background": "auto",
+                    "output_format": "png",
+                },
+            }
+        )
+        yield _sse({"type": "response.completed", "response": {}})
+
+    async def fake_ensure_fresh(self, account, **kwargs):
+        del self, kwargs
+        return account
+
+    monkeypatch.setattr(proxy_module, "core_stream_responses", fake_stream)
+    monkeypatch.setattr(proxy_module.ProxyService, "_ensure_fresh_with_budget", fake_ensure_fresh)
+
+    image_bytes = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
+    image_url = f"data:image/png;base64,{base64.b64encode(image_bytes).decode('ascii')}"
+    response = await async_client.post(
+        "/backend-api/codex/images/edits",
+        json={
+            "model": "gpt-image-2",
+            "prompt": "make it green",
+            "images": [{"image_url": image_url}],
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["data"] == [{"b64_json": "AUTHORITATIVE_B64", "revised_prompt": "edited"}]
+    assert captured["model"] == "gpt-5.6-luna"
+    assert cast(dict[str, Any], cast(list[Any], captured["tools"])[0])["model"] == "gpt-image-2"
 
 
 @pytest.mark.asyncio
