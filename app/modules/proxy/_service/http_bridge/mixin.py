@@ -1821,7 +1821,7 @@ class _HTTPBridgeMixin(
                 ):
                     selected_account_lease = None
                     continue
-                if exc.status_code != 401 or _remaining_budget_seconds(deadline) <= 0:
+                if not exc.is_refreshable_auth_error or _remaining_budget_seconds(deadline) <= 0:
                     await self._load_balancer.release_account_lease(selected_account_lease)
                     selected_account_lease = None
                     raise
@@ -1857,7 +1857,7 @@ class _HTTPBridgeMixin(
                     ):
                         selected_account_lease = None
                         continue
-                    if retry_exc.status_code != 401:
+                    if not retry_exc.is_refreshable_auth_error:
                         await self._load_balancer.release_account_lease(selected_account_lease)
                         selected_account_lease = None
                         raise
@@ -2286,7 +2286,7 @@ class _HTTPBridgeMixin(
                 record_selected_account_takeover(account.id)
                 break
             except ProxyResponseError as exc:
-                if exc.status_code != 401 or _remaining_budget_seconds(deadline) <= 0:
+                if not exc.is_refreshable_auth_error or _remaining_budget_seconds(deadline) <= 0:
                     await release_selected_account_lease()
                     complete_failed_handoff()
                     raise
@@ -2309,7 +2309,7 @@ class _HTTPBridgeMixin(
                     record_selected_account_takeover(account.id)
                     break
                 except ProxyResponseError as retry_exc:
-                    if retry_exc.status_code != 401:
+                    if not retry_exc.is_refreshable_auth_error:
                         await release_selected_account_lease()
                         complete_failed_handoff()
                         raise
