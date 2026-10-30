@@ -120,6 +120,12 @@ def _account_to_summary(
     primary_usage = _usable_usage_entry(primary_usage)
     secondary_usage = _usable_usage_entry(secondary_usage)
     monthly_usage = _usable_usage_entry(monthly_usage)
+    if not usage_core.is_current_monthly_window(
+        usage_history_to_window_row(monthly_usage) if monthly_usage is not None else None,
+        usage_history_to_window_row(primary_usage) if primary_usage is not None else None,
+        usage_history_to_window_row(secondary_usage) if secondary_usage is not None else None,
+    ):
+        monthly_usage = None
     effective_primary_usage, effective_secondary_usage = _effective_usage_windows(
         primary_usage,
         secondary_usage,

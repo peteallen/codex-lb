@@ -3816,3 +3816,25 @@ async def test_api_key_fair_share_concurrent_sticky_selections_cannot_overshoot_
     # The commit re-check kept heavy at exactly its share across both paths.
     heavy_total = sum((runtime.stream_key_inflight or {}).get("heavy", 0) for runtime in balancer._runtime.values())
     assert heavy_total == 2
+
+
+@pytest.mark.asyncio
+async def test_force_probe_uses_fresh_weekly_pressure_over_old_monthly_balance() -> None:
+    from datetime import timedelta
+
+    account = _make_account("acc-probe-stale-monthly")
+    account.plan_type = "pro"
+    now_epoch = int(time.time())
+    weekly = _usage_row(91, account.id, window="primary", reset_at=now_epoch + 4 * 86400)
+    weekly.used_percent = 100.0
+    weekly.window_minutes = 10080
+    monthly = _usage_row(92, account.id, window="monthly", reset_at=now_epoch + 5 * 86400)
+    monthly.used_percent = 0.0
+    monthly.window_minutes = 43200
+    monthly.recorded_at = weekly.recorded_at - timedelta(days=20)
+    usage_repo = _StubUsageRepository({account.id: weekly}, {}, {account.id: monthly})
+    balancer = LoadBalancer(lambda: _repo_factory(_StubAccountsRepository([account]), usage_repo))
+    balancer._runtime[account.id] = RuntimeState(health_tier=HEALTH_TIER_PROBING, probe_success_streak=2)
+    await balancer.record_probe_result(account_id=account.id, http_status=200)
+    assert balancer._runtime[account.id].health_tier == HEALTH_TIER_DRAINING
+    assert balancer._runtime[account.id].probe_success_streak == 0

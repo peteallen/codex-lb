@@ -1626,3 +1626,57 @@ async def test_dashboard_overview_exposes_zero_previous_window_totals_when_full_
             "costUsd": 0.0,
         },
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["/api/dashboard/overview", "/api/accounts"])
+@pytest.mark.parametrize("plan", ["pro", "prolite", "promax"])
+@pytest.mark.parametrize("current_window", ["weekly", "monthly"])
+async def test_account_surfaces_select_current_quota_regime(async_client, db_setup, path, plan, current_window):
+    now = utcnow().replace(microsecond=0)
+    weekly_reset = int(naive_utc_to_epoch(now + timedelta(days=4)))
+    monthly_reset = int(naive_utc_to_epoch(now + timedelta(days=5)))
+    account_id = "acc_current_quota"
+    account = _make_account(account_id, "current-quota@example.com", plan_type=plan, status=AccountStatus.RATE_LIMITED)
+    account.blocked_at = int(naive_utc_to_epoch(now - timedelta(days=1)))
+    async with SessionLocal() as session:
+        await AccountsRepository(session).upsert(account)
+        usage = UsageRepository(session)
+        await usage.add_entry(
+            account_id,
+            100.0,
+            window="primary",
+            window_minutes=10080,
+            reset_at=weekly_reset,
+            recorded_at=now - timedelta(minutes=1),
+        )
+        await usage.add_entry(
+            account_id, 0.0, window="secondary", window_minutes=0, recorded_at=now - timedelta(days=1)
+        )
+        await usage.add_entry(
+            account_id,
+            0.0,
+            window="monthly",
+            window_minutes=43200,
+            reset_at=monthly_reset,
+            recorded_at=now if current_window == "monthly" else now - timedelta(days=20),
+        )
+    response = await async_client.get(path)
+    assert response.status_code == 200
+    row = next(item for item in response.json()["accounts"] if item["accountId"] == account_id)
+    if current_window == "weekly":
+        assert row["usage"]["monthlyRemainingPercent"] is None
+        assert row["windowMinutesMonthly"] is None
+        assert row["resetAtMonthly"] is None
+        assert row["usage"]["secondaryRemainingPercent"] == 0.0
+        assert row["windowMinutesSecondary"] == 10080
+        assert row["resetAtSecondary"] == (now + timedelta(days=4)).isoformat() + "Z"
+        assert row["status"] in ("rate_limited", "quota_exceeded")
+        summary = await async_client.get("/api/usage/summary")
+        assert summary.status_code == 200
+        assert summary.json()["monthlyWindow"] is None
+    else:
+        assert row["usage"]["monthlyRemainingPercent"] == 100.0
+        assert row["windowMinutesMonthly"] == 43200
+        assert row["windowMinutesSecondary"] is None
+        assert row["usage"]["secondaryRemainingPercent"] is None

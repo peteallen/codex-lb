@@ -491,3 +491,69 @@ async def test_probe_uses_default_model_when_body_omitted(async_client, monkeypa
     # *some* model string rather than coupling the test to the constant.
     assert isinstance(captured["model"], str)
     assert captured["model"]
+
+
+@pytest.mark.asyncio
+async def test_probe_transport_omits_unsupported_field_and_preserves_quota_block(async_client, monkeypatch):
+    import time
+
+    from sqlalchemy import update
+
+    from app.db.models import Account, AccountStatus
+    from app.db.session import SessionLocal
+
+    account_id = await _import_test_account(async_client, email="probe-quota@example.com", account_id="acc_probe_quota")
+    async with SessionLocal() as session:
+        await session.execute(
+            update(Account)
+            .where(Account.id == account_id)
+            .values(status=AccountStatus.RATE_LIMITED, reset_at=int(time.time() + 3600), blocked_at=int(time.time()))
+        )
+        await session.commit()
+
+    class Response:
+        status = 429
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+    class Session:
+        def post(self, url, *, headers, json, timeout):
+            assert url.endswith("/backend-api/codex/responses")
+            assert "max_output_tokens" not in json
+            assert json["stream"] is True
+            assert json["store"] is False
+            return Response()
+
+    class Lease:
+        async def __aenter__(self):
+            return Session()
+
+        async def __aexit__(self, *_args):
+            return False
+
+    async def fresh_usage(**_kwargs):
+        return UsagePayload.model_validate(
+            {
+                "plan_type": "pro",
+                "rate_limit": {
+                    "primary_window": {
+                        "used_percent": 100,
+                        "limit_window_seconds": 604800,
+                        "reset_at": int(time.time() + 3600),
+                    },
+                },
+            }
+        )
+
+    monkeypatch.setattr("app.modules.accounts.service.lease_http_session", lambda: Lease())
+    monkeypatch.setattr("app.modules.usage.updater.fetch_usage", fresh_usage)
+    response = await async_client.post(f"/api/accounts/{account_id}/probe")
+    assert response.status_code == 200, response.text
+    result = response.json()
+    assert result["probeStatusCode"] == 429
+    assert result["primaryUsedPercentAfter"] == 100
+    assert result["accountStatusAfter"] == "rate_limited"

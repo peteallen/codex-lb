@@ -12,7 +12,7 @@ from typing import Any, AsyncIterator, Protocol, TypeVar, cast
 
 from app.core.config.settings import get_settings
 from app.core.plan_types import is_pro_family_plan
-from app.core.usage import capacity_for_plan
+from app.core.usage import capacity_for_plan, is_current_monthly_window
 from app.db.models import Account, AccountLimitWarmup, AccountStatus, UsageHistory
 from app.db.session import detach_session_objects, get_background_session
 from app.modules.accounts.background_repository import BackgroundAccountsRepository
@@ -25,6 +25,7 @@ from app.modules.proxy.rate_limit_cache import get_rate_limit_headers_cache
 from app.modules.request_logs.repository import RequestLogsRepository
 from app.modules.settings.repository import SettingsRepository
 from app.modules.usage import updater as usage_updater_module
+from app.modules.usage.mappers import usage_history_to_window_row
 from app.modules.usage.repository import UsageRepository
 from app.modules.usage.updater import build_background_usage_updater
 
@@ -243,12 +244,14 @@ class UsageRefreshScheduler:
                         before_secondary=_select_long_window_entries(
                             accounts=refreshed_selected_accounts,
                             monthly_entries=before_monthly,
+                            primary_entries=before_primary,
                             secondary_entries=before_secondary,
                         ),
                         after_primary=after_primary,
                         after_secondary=_select_long_window_entries(
                             accounts=refreshed_selected_accounts,
                             monthly_entries=after_monthly,
+                            primary_entries=after_primary,
                             secondary_entries=after_secondary,
                         ),
                         refresh_started_at=refresh_started_at,
@@ -338,6 +341,7 @@ async def reconcile_recoverable_account_statuses(
             secondary_entry=_select_long_window_entry(
                 account=account,
                 monthly_entry=latest_monthly.get(account.id),
+                primary_entry=latest_primary.get(account.id),
                 secondary_entry=latest_secondary.get(account.id),
             ),
         )
@@ -379,7 +383,14 @@ def _select_long_window_entry(
     account: Account,
     monthly_entry: UsageHistory | None,
     secondary_entry: UsageHistory | None,
+    primary_entry: UsageHistory | None = None,
 ) -> UsageHistory | None:
+    if not is_current_monthly_window(
+        usage_history_to_window_row(monthly_entry) if monthly_entry is not None else None,
+        usage_history_to_window_row(primary_entry) if primary_entry is not None else None,
+        usage_history_to_window_row(secondary_entry) if secondary_entry is not None else None,
+    ):
+        monthly_entry = None
     if monthly_entry is not None and (
         capacity_for_plan(account.plan_type, "monthly") is not None or is_pro_family_plan(account.plan_type)
     ):
@@ -392,12 +403,14 @@ def _select_long_window_entries(
     accounts: list[Account],
     monthly_entries: dict[str, UsageHistory],
     secondary_entries: dict[str, UsageHistory],
+    primary_entries: dict[str, UsageHistory],
 ) -> dict[str, UsageHistory]:
     selected: dict[str, UsageHistory] = {}
     for account in accounts:
         entry = _select_long_window_entry(
             account=account,
             monthly_entry=monthly_entries.get(account.id),
+            primary_entry=primary_entries.get(account.id),
             secondary_entry=secondary_entries.get(account.id),
         )
         if entry is not None:
