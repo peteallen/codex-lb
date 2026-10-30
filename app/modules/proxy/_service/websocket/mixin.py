@@ -459,6 +459,7 @@ from app.modules.proxy.helpers import (
     _normalize_error_code,
     _parse_openai_error,
     _upstream_error_from_openai,
+    is_terminal_authorization_denial,
     is_upstream_overload_error,
 )
 from app.modules.proxy.http_bridge_forwarding import (
@@ -3739,6 +3740,8 @@ class _WebSocketMixin:
                 continue
             except ProxyResponseError as exc:
                 confirmed_pre_dispatch = is_confirmed_pre_dispatch_transport_error(exc)
+                if is_terminal_authorization_denial(exc):
+                    await proxy._release_websocket_request_state_reservation(request_state)
                 if selected_account_model_replacement:
                     # The account/model retry budget selected this replacement;
                     # its connection failure must be surfaced rather than
@@ -4222,7 +4225,7 @@ class _WebSocketMixin:
                     request_state=request_state,
                 )
                 return None
-            if exc.status_code != 401 or force_refresh:
+            if not exc.is_refreshable_auth_error or force_refresh:
                 raise
             return await proxy._retry_websocket_connect_after_401(
                 account,
@@ -4499,7 +4502,7 @@ class _WebSocketMixin:
         candidates_remaining = max_attempts - attempt
         if confirmed_pre_dispatch:
             action = "surface" if require_preferred_account or candidates_remaining <= 0 else "failover_next"
-        elif exc.status_code == 401 and candidates_remaining > 0:
+        elif exc.is_refreshable_auth_error and candidates_remaining > 0:
             action = "failover_next"
         elif deterministic_failover_enabled:
             action = failover_decision(

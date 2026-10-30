@@ -75,6 +75,7 @@ from app.modules.proxy.helpers import (
     _parse_openai_error,
     _upstream_error_from_openai,
     classify_upstream_failure,
+    is_terminal_authorization_denial,
     is_upstream_model_capacity_error,
     is_upstream_overload_error,
 )
@@ -521,6 +522,17 @@ class _StreamingRetryMixin:
                 failed_session=failed_session,
             )
 
+        async def _settle_auth_denial_before_health(exc: ProxyResponseError) -> bool:
+            nonlocal settled
+            if not is_terminal_authorization_denial(exc) or settled:
+                return True
+            if settlement.usage_settlement_transferred:
+                return False
+            settled = await proxy._settle_stream_api_key_usage(
+                api_key, api_key_reservation, settlement, request_id, wait_for_settlement=True
+            )
+            return settled
+
         async def _settle_process_network_budget_exhaustion(
             account: Account,
             settlement: _StreamSettlement,
@@ -576,8 +588,12 @@ class _StreamingRetryMixin:
             )
             return True
 
-        async def _recover_preaccepted_overload(account: Account, code: str | None, error: UpstreamError) -> bool:
+        async def _recover_preaccepted_overload(
+            account: Account, code: str | None, error: UpstreamError, *, http_status: int | None = None
+        ) -> bool:
             nonlocal current_account_lease, affinity, preferred_account_id, require_preferred_account, headers
+            if http_status in {401, 403}:
+                return False
             if settlement.downstream_visible or settlement.response_id is not None:
                 return False
             if not is_upstream_overload_error(code, error.get("message")):
@@ -649,6 +665,8 @@ class _StreamingRetryMixin:
                     ):
                         yield line
                 except ProxyResponseError as exc:
+                    if exc.status_code in {401, 403} or exc.is_terminal_auth_error:
+                        raise
                     if is_confirmed_pre_dispatch_transport_error(exc):
                         # Keep dispatch provenance intact for the outer account
                         # failover handler. Converting this into the generic
@@ -2032,7 +2050,14 @@ class _StreamingRetryMixin:
                                 if isinstance(tex, ProxyResponseError)
                                 else tex.code
                             )
-                            if await _recover_preaccepted_overload(account, overload_code, overload_error):
+                            if isinstance(tex, ProxyResponseError) and tex.is_terminal_auth_error:
+                                raise
+                            if await _recover_preaccepted_overload(
+                                account,
+                                overload_code,
+                                overload_error,
+                                http_status=tex.status_code if isinstance(tex, ProxyResponseError) else None,
+                            ):
                                 break
                             if isinstance(tex, ProxyResponseError) and tex.status_code != 500:
                                 error = _parse_openai_error(tex.payload)
@@ -2206,6 +2231,12 @@ class _StreamingRetryMixin:
                                         attempt + 1,
                                     )
                                     break
+                                if is_terminal_authorization_denial(tex):
+                                    health_write_allowed = await _drain_pending_post_refresh_penalty_on_terminal(
+                                        settlement
+                                    )
+                                    if not health_write_allowed or not await _settle_auth_denial_before_health(tex):
+                                        raise
                                 classified = await proxy._handle_stream_error(
                                     account,
                                     _upstream_error_from_openai(error),
@@ -2394,7 +2425,7 @@ class _StreamingRetryMixin:
                             raise
                         yield await _render_account_model_rejection(exc, account_id=account.id)
                         return
-                    if exc.status_code == 401:
+                    if exc.is_refreshable_auth_error:
                         remaining_budget = _facade()._remaining_budget_seconds(deadline)
                         if remaining_budget <= 0:
                             _facade().logger.warning(
@@ -2684,7 +2715,10 @@ class _StreamingRetryMixin:
                                 error.type if error else None,
                             )
                             if await _recover_preaccepted_overload(
-                                account, error_code, _upstream_error_from_openai(error)
+                                account,
+                                error_code,
+                                _upstream_error_from_openai(error),
+                                http_status=retry_exc.status_code,
                             ):
                                 continue
                             if getattr(retry_exc, _POST_REFRESH_TRANSIENT_EXHAUSTED_ATTR, False):
@@ -2791,7 +2825,7 @@ class _StreamingRetryMixin:
                                 phase="first_event",
                             )
                             candidates_remaining = max_attempts - attempt - 1
-                            if retry_exc.status_code == 401 and candidates_remaining > 0:
+                            if retry_exc.is_refreshable_auth_error and candidates_remaining > 0:
                                 action = "failover_next"
                             elif getattr(base_settings, "deterministic_failover_enabled", True):
                                 action = failover_decision(
@@ -2827,6 +2861,9 @@ class _StreamingRetryMixin:
                                 excluded_account_ids.add(account.id)
                                 continue
                             health_write_allowed = await _drain_pending_post_refresh_penalty_on_terminal(settlement)
+                            health_write_allowed = health_write_allowed and await _settle_auth_denial_before_health(
+                                retry_exc
+                            )
                             if health_write_allowed:
                                 await proxy._handle_stream_error(
                                     account,
@@ -2910,6 +2947,7 @@ class _StreamingRetryMixin:
                             require_security_work_authorized = True
                             continue
                     health_write_allowed = await _drain_pending_post_refresh_penalty_on_terminal(settlement)
+                    health_write_allowed = health_write_allowed and await _settle_auth_denial_before_health(exc)
                     if health_write_allowed and _facade()._should_penalize_stream_error(error_code):
                         await proxy._handle_stream_error(
                             account,

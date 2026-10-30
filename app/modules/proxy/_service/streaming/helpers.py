@@ -442,7 +442,7 @@ def _should_retry_transient_stream_error(
     *,
     response_id: str | None = None,
 ) -> bool:
-    if code is None or code == "stream_idle_timeout":
+    if code is None or code == "stream_idle_timeout" or code in PERMANENT_FAILURE_CODES:
         return False
     if code == PROCESS_NETWORK_UNAVAILABLE_CODE:
         # Serialized terminal events arrive only after upstream dispatch. The

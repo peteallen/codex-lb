@@ -498,3 +498,42 @@ class TestSelectAccountHealthTier:
         result = select_account(states, routing_strategy="capacity_weighted", deterministic_probe=True)
         assert result.account is not None
         assert result.account.account_id == "healthy"
+
+
+@pytest.mark.parametrize("http_status", [401, 403])
+@pytest.mark.parametrize("code", ["upstream_error", "server_error", "unknown_denial"])
+def test_unknown_auth_denial_precedes_generic_transient(http_status, code):
+    result = classify_upstream_failure(
+        error_code=code,
+        error=UpstreamError(message="The selected model is at capacity"),
+        http_status=http_status,
+        phase="first_event",
+    )
+    assert result["failure_class"] == "non_retryable"
+    assert (
+        failover_decision(
+            failure_class=result["failure_class"],
+            downstream_visible=False,
+            candidates_remaining=1,
+        )
+        == "surface"
+    )
+
+
+@pytest.mark.parametrize("code", ["token_revoked", "session_revoked", "authentication_token_revoked"])
+def test_terminal_credentials_precede_server_status(code):
+    from app.core.auth.refresh import classify_refresh_error
+    from app.core.balancer.logic import account_status_for_permanent_failure
+    from app.core.clients.proxy import ProxyResponseError
+    from app.db.models import AccountStatus
+
+    assert classify_refresh_error(code)
+    assert account_status_for_permanent_failure(code) == AccountStatus.REAUTH_REQUIRED
+    result = classify_upstream_failure(
+        error_code=code,
+        error=UpstreamError(message="Revoked"),
+        http_status=503,
+        phase="connect",
+    )
+    assert result["failure_class"] == "non_retryable"
+    assert not ProxyResponseError(401, {"error": {"code": code}}).is_refreshable_auth_error
