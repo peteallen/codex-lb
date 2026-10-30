@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import random
 import re
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+from math import isfinite
 
 # Units the retry hint may use, longest-first within each family so that, for
 # example, ``ms`` is preferred over ``m`` and ``minutes`` over ``m``.
@@ -46,6 +49,23 @@ _BACKOFF_INITIAL_DELAY_MS = 200
 _BACKOFF_FACTOR = 2.0
 _BACKOFF_JITTER_MIN = 0.9
 _BACKOFF_JITTER_MAX = 1.1
+
+
+def parse_retry_after_header(value: str | None) -> float | None:
+    """Parse Retry-After seconds or an HTTP date without shortening server waits."""
+    if value is None:
+        return None
+    try:
+        seconds = float(value)
+    except ValueError:
+        try:
+            deadline = parsedate_to_datetime(value)
+            if deadline.tzinfo is None:
+                deadline = deadline.replace(tzinfo=timezone.utc)
+            return max(0.0, (deadline - datetime.now(timezone.utc)).total_seconds())
+        except (ValueError, TypeError, OverflowError):
+            return None
+    return seconds if isfinite(seconds) and seconds >= 0 else None
 
 
 def parse_retry_after(message: str) -> float | None:

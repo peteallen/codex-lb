@@ -1,0 +1,34 @@
+# Verification: upstream denials and usage retries
+
+## Result
+
+All six implementation/verification tasks are complete. Both owning capabilities have been synced to their main specifications, including their operational context. Changes remain local; no commit, publication, deployment, service restart, or historical account reactivation was performed. Pre-existing local voice files and edits were preserved.
+
+## Requirement coverage
+
+| Behavior | Implementation | Regression evidence |
+| --- | --- | --- |
+| Retry-After floor on both transports and both usage operations | usage client retry policy and shared HTTP header parser | Numeric/date/malformed/missing headers, lowercase routed headers, bounded attempts and cancellation |
+| Final Retry-After postpones polling | UsageFetchError metadata and existing process-local cooldown | Final error metadata and polling before/after deadline, including 401 without forced refresh |
+| Revocation requires reauthentication | Shared terminal code tables, existing guarded auth manager writes and proxy retry gates | Usage cycles skip revoked accounts, guarded OAuth status handling, HTTP/compact/WebSocket call stops |
+| Unknown 403 fails closed | Shared classification and terminal authorization helper before overload/failover | Both HTTP routes, post-refresh 403, capacity-like messages and WebSocket handshake denials |
+| Reservation settlement precedes health/status updates | Streaming, compact and WebSocket terminal boundaries | Real API-key reservation rows are released before status or health callbacks for token_revoked and unknown 403 |
+| Bare usage 402/404 does not deactivate | Explicit-evidence usage classifier | Bare failures retain status; explicit codes/messages still deactivate or require reauthentication |
+| Native refresh and recognized fallback preserved | Access-token expiry exception and existing exact quota/model/security guards | Access token_expired refresh succeeds; OAuth token_expired stays permanent; existing quota, security, model and continuity suites pass |
+
+## Validation
+
+Validation used `.venv/bin/python` (CPython 3.14.7 in this checkout), Ruff, ty, and the cached OpenSpec 1.3.0 CLI. Upstream traffic was stubbed; the real WebSocket liveness check used only a local loopback server.
+
+- Broad affected unit suites: 1,555 passed. A final rerun of the affected usage, auth classification, failover and security subset passed 242 checks.
+- Final HTTP Responses, compact, files and transcription integration suites: 170 passed.
+- WebSocket Responses and model-rejection integration suites: 139 passed, one local network test deselected. The deselected loopback test passed separately outside the sandbox; its sandbox failure was permission to bind 127.0.0.1, not a product assertion failure.
+- Additional focused terminal-auth, Retry-After and reservation ordering checks passed. Tests for repeated generic 401 now stub refresh explicitly and prove the intended same-account refresh followed by fallback without contacting OAuth.
+- Ruff check and format check, ty on affected application modules, and git diff --check passed.
+- Strict OpenSpec validation: change passed and all 50 main specifications passed.
+
+The WebSocket suite emitted a Starlette/httpx deprecation warning and an aiosqlite worker warning about a closed test event loop in an existing capability-carrier test. All assertions passed. That separate lifecycle warning was not changed by this implementation.
+
+## Operational limits
+
+Polling cooldowns are process-local and do not survive restarts or coordinate replicas. Valid server waits are not shortened by the local exponential cap and remain cancellable. The implementation does not identify why OpenAI terminated any account, and deployment remains a separate step.

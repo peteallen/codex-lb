@@ -662,6 +662,14 @@ async def test_proxy_responses_repeated_401_after_refresh_fails_over(async_clien
 
     captured_account_ids: list[str | None] = []
     invalidated_account_id: str | None = None
+    forced_refreshes: list[str] = []
+
+    async def fake_ensure_fresh(self, account, **kwargs):
+        if kwargs.get("force"):
+            forced_refreshes.append(account.chatgpt_account_id)
+        return account
+
+    monkeypatch.setattr(proxy_module.ProxyService, "_ensure_fresh_with_budget", fake_ensure_fresh)
 
     async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False, **kwargs):
         del payload, headers, access_token, base_url, raise_for_status, kwargs
@@ -693,7 +701,9 @@ async def test_proxy_responses_repeated_401_after_refresh_fails_over(async_clien
     assert event["type"] == "response.completed"
     assert event["response"]["id"] == "resp_stream_failover"
     assert captured_account_ids[0] == invalidated_account_id
-    assert captured_account_ids[1] != invalidated_account_id
+    assert captured_account_ids[:2] == [invalidated_account_id, invalidated_account_id]
+    assert captured_account_ids[2] != invalidated_account_id
+    assert forced_refreshes == [invalidated_account_id]
 
 
 @pytest.mark.asyncio
@@ -3016,3 +3026,167 @@ async def test_v1_responses_normalizes_tool_messages(async_client, monkeypatch):
         {"type": "function_call_output", "call_id": "call_1", "output": '{"ok":true}'},
         {"role": "user", "content": [{"type": "input_text", "text": "continue"}]},
     ]
+
+
+@pytest.mark.parametrize("endpoint", ["/backend-api/codex/responses", "/v1/responses"])
+@pytest.mark.parametrize("case", ["unknown_403", "403_after_refresh", "token_revoked", "revoked_500"])
+@pytest.mark.parametrize("message", ["Access denied", "The selected model is at capacity"])
+@pytest.mark.asyncio
+async def test_proxy_responses_terminal_auth_does_not_replay(async_client, monkeypatch, endpoint, case, message):
+    from app.db.models import AccountStatus
+
+    for suffix in ("a", "b"):
+        auth_json = _make_auth_json(f"acc_auth_denial_{suffix}", f"auth-denial-{suffix}@example.com")
+        response = await async_client.post(
+            "/api/accounts/import",
+            files={"auth_json": ("auth.json", json.dumps(auth_json), "application/json")},
+        )
+        assert response.status_code == 200
+
+    calls: list[str] = []
+    forced_refreshes: list[str] = []
+
+    async def ensure_fresh(self, account, **kwargs):
+        if kwargs.get("force"):
+            forced_refreshes.append(account.id)
+        return account
+
+    async def fake_stream(payload, headers, access_token, account_id, **kwargs):
+        calls.append(account_id)
+        if case == "403_after_refresh" and len(calls) == 1:
+            raise proxy_module.ProxyResponseError(401, {"error": {"code": "invalid_api_key"}})
+        if case in {"token_revoked", "revoked_500"}:
+            raise proxy_module.ProxyResponseError(
+                500 if case == "revoked_500" else 401,
+                {"error": {"code": "token_revoked", "message": message}},
+            )
+        raise proxy_module.ProxyResponseError(403, {"error": {"message": message}})
+        yield  # Keep the upstream stub an async generator.
+
+    monkeypatch.setattr(proxy_module.ProxyService, "_ensure_fresh_with_budget", ensure_fresh)
+    monkeypatch.setattr(proxy_module, "core_stream_responses", fake_stream)
+    response = await async_client.post(
+        endpoint,
+        json={"model": "gpt-5.4", "instructions": "hi", "input": [], "stream": True},
+    )
+    expected_calls = 2 if case == "403_after_refresh" else 1
+    assert len(calls) == expected_calls
+    assert len(set(calls)) == 1
+    assert len(forced_refreshes) == (1 if case == "403_after_refresh" else 0)
+    expected_code = "token_revoked" if case in {"token_revoked", "revoked_500"} else "upstream_error"
+    if response.status_code == 200:
+        event = _extract_first_event([line for line in response.text.splitlines() if line])
+        assert event["type"] == "response.failed"
+        assert event["response"]["error"]["code"] == expected_code
+    else:
+        assert response.status_code == (500 if case == "revoked_500" else 401 if case == "token_revoked" else 403)
+        assert response.json()["error"].get("code", "upstream_error") == expected_code
+    if case in {"token_revoked", "revoked_500"}:
+        async with SessionLocal() as session:
+            rows = (await session.execute(select(Account))).scalars().all()
+            assert sum(row.status == AccountStatus.REAUTH_REQUIRED for row in rows) == 1
+
+
+@pytest.mark.parametrize("compact", [False, True])
+@pytest.mark.parametrize("code", [None, "token_revoked"])
+@pytest.mark.asyncio
+async def test_terminal_auth_releases_real_reservation_before_status_write(async_client, monkeypatch, compact, code):
+    from app.db.models import ApiKeyUsageReservation
+
+    auth = _make_auth_json("acc_terminal_reservation", "terminal-reservation@example.com")
+    response = await async_client.post(
+        "/api/accounts/import",
+        files={"auth_json": ("auth.json", json.dumps(auth), "application/json")},
+    )
+    assert response.status_code == 200
+    response = await async_client.put(
+        "/api/settings",
+        json={"apiKeyAuthEnabled": True, "totpRequiredOnLogin": False},
+    )
+    assert response.status_code == 200
+    response = await async_client.post(
+        "/api/api-keys/",
+        json={
+            "name": "terminal-auth",
+            "limits": [{"limitType": "total_tokens", "limitWindow": "weekly", "maxValue": 1_000_000}],
+        },
+    )
+    assert response.status_code == 200
+    key = response.json()["key"]
+    key_id = response.json()["id"]
+    marks = []
+    method_name = "mark_permanent_failure" if code is not None else "record_error"
+    original_mark = getattr(proxy_module.LoadBalancer, method_name)
+
+    async def mark(self, account, *args, **kwargs):
+        async with SessionLocal() as session:
+            rows = (
+                (
+                    await session.execute(
+                        select(ApiKeyUsageReservation).where(ApiKeyUsageReservation.api_key_id == key_id)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            assert len(rows) == 1
+            assert rows[0].status == "released"
+        marks.append(code)
+        return await original_mark(self, account, *args, **kwargs)
+
+    status = 401 if code is not None else 403
+
+    async def stream(*args, **kwargs):
+        raise proxy_module.ProxyResponseError(status, {"error": {"code": code}})
+        yield
+
+    async def compact_call(*args, **kwargs):
+        raise proxy_module.ProxyResponseError(status, {"error": {"code": code}})
+
+    monkeypatch.setattr(proxy_module.LoadBalancer, method_name, mark)
+    monkeypatch.setattr(proxy_module, "core_stream_responses", stream)
+    monkeypatch.setattr(proxy_module, "core_compact_responses", compact_call)
+    endpoint = "/backend-api/codex/responses/compact" if compact else "/backend-api/codex/responses"
+    response = await async_client.post(
+        endpoint,
+        headers={"Authorization": f"Bearer {key}"},
+        json={"model": "gpt-5.4", "instructions": "hi", "input": []},
+    )
+    assert response.status_code == status
+    assert marks and all(marked_code == code for marked_code in marks)
+
+
+@pytest.mark.asyncio
+async def test_proxy_responses_access_token_expiry_retains_bounded_refresh(async_client, monkeypatch):
+    auth = _make_auth_json("acc_expired_access", "expired-access@example.com")
+    response = await async_client.post(
+        "/api/accounts/import",
+        files={"auth_json": ("auth.json", json.dumps(auth), "application/json")},
+    )
+    assert response.status_code == 200
+    forced_refreshes = []
+    calls = 0
+
+    async def ensure_fresh(self, account, **kwargs):
+        if kwargs.get("force"):
+            forced_refreshes.append(account.id)
+        return account
+
+    async def stream(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise proxy_module.ProxyResponseError(401, {"error": {"code": "token_expired"}})
+        yield 'data: {"type":"response.completed","response":{"id":"resp_refreshed","status":"completed"}}\n\n'
+
+    monkeypatch.setattr(proxy_module.ProxyService, "_ensure_fresh_with_budget", ensure_fresh)
+    monkeypatch.setattr(proxy_module, "core_stream_responses", stream)
+    response = await async_client.post(
+        "/backend-api/codex/responses",
+        json={"model": "gpt-5.4", "instructions": "hi", "input": [], "stream": True},
+    )
+    assert response.status_code == 200
+    assert calls == 2
+    assert len(forced_refreshes) == 1
+    event = _extract_first_event([line for line in response.text.splitlines() if line])
+    assert event["type"] == "response.completed"

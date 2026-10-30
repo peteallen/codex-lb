@@ -20,6 +20,9 @@ PERMANENT_FAILURE_CODES = {
     "refresh_token_invalidated": "Refresh token was revoked - re-login required",
     "invalid_grant": "Refresh token grant invalid - re-login required",
     "token_invalidated": "Authentication token invalidated - re-login required",
+    "token_revoked": "Authentication token was revoked - re-login required",
+    "session_revoked": "ChatGPT session was revoked - re-login required",
+    "authentication_token_revoked": "Authentication token was revoked - re-login required",
     # ``token_expired`` from the OAuth refresh endpoint means the refresh
     # request itself failed because the refresh token (or the session it
     # belonged to) is no longer usable -- access-token-only expiry would have
@@ -41,6 +44,9 @@ REAUTH_REQUIRED_FAILURE_CODES = frozenset(
         "refresh_token_invalidated",
         "invalid_grant",
         "token_invalidated",
+        "token_revoked",
+        "session_revoked",
+        "authentication_token_revoked",
         "token_expired",
         "app_session_terminated",
         "account_session_expired",

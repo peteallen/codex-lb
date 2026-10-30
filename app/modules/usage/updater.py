@@ -583,16 +583,24 @@ class UsageUpdater:
             if _should_deactivate_for_usage_error(exc):
                 await self._deactivate_for_client_error(account, exc)
                 return AccountRefreshResult(usage_written=False, fetch_succeeded=False)
-            if access_token_override is not None:
-                _mark_usage_refresh_auth_cooldown(account.id, exc.status_code)
+            if access_token_override is not None or (
+                exc.retry_after_seconds is not None and exc.retry_after_seconds > 0
+            ):
+                _mark_usage_refresh_auth_cooldown(
+                    account.id, exc.status_code, retry_after_seconds=exc.retry_after_seconds
+                )
                 return AccountRefreshResult(usage_written=False, fetch_succeeded=False)
             if exc.status_code != 401 or not self._auth_manager:
-                _mark_usage_refresh_auth_cooldown(account.id, exc.status_code)
+                _mark_usage_refresh_auth_cooldown(
+                    account.id, exc.status_code, retry_after_seconds=exc.retry_after_seconds
+                )
                 return AccountRefreshResult(usage_written=False, fetch_succeeded=False)
             try:
                 account = await self._auth_manager.ensure_fresh(account, force=True)
             except RefreshError:
-                _mark_usage_refresh_auth_cooldown(account.id, exc.status_code)
+                _mark_usage_refresh_auth_cooldown(
+                    account.id, exc.status_code, retry_after_seconds=exc.retry_after_seconds
+                )
                 return AccountRefreshResult(usage_written=False, fetch_succeeded=False)
             access_token = self._encryptor.decrypt(account.access_token_encrypted)
             try:
@@ -615,7 +623,9 @@ class UsageUpdater:
                 if _should_deactivate_for_usage_error(retry_exc):
                     await self._deactivate_for_client_error(account, retry_exc)
                 else:
-                    _mark_usage_refresh_auth_cooldown(account.id, retry_exc.status_code)
+                    _mark_usage_refresh_auth_cooldown(
+                        account.id, retry_exc.status_code, retry_after_seconds=retry_exc.retry_after_seconds
+                    )
                 return AccountRefreshResult(usage_written=False, fetch_succeeded=False)
 
         if payload is None:
@@ -1412,10 +1422,7 @@ def _reset_at(reset_at: int | None, reset_after_seconds: int | None, now_epoch: 
     return now_epoch + max(0, int(reset_after_seconds))
 
 
-# The usage endpoint can return 403 for accounts that are still otherwise usable
-# for proxy traffic, so treat it as a refresh failure instead of a permanent
-# account-level deactivation signal.
-_DEACTIVATING_USAGE_STATUS_CODES = {402, 404}
+# An HTTP status alone cannot establish account or credential termination.
 _DEACTIVATING_USAGE_MESSAGE_HINTS = (
     "your openai account has been deactivated",
     "account has been deactivated",
@@ -1423,8 +1430,6 @@ _DEACTIVATING_USAGE_MESSAGE_HINTS = (
 
 
 def _should_deactivate_for_usage_error(exc: UsageFetchError) -> bool:
-    if exc.status_code in _DEACTIVATING_USAGE_STATUS_CODES:
-        return True
     if exc.code in PERMANENT_FAILURE_CODES:
         return True
     lowered = exc.message.lower()
@@ -1441,13 +1446,17 @@ async def _resolve_upstream_route_for_account(account: Account, *, operation: st
         )
 
 
-def _mark_usage_refresh_auth_cooldown(account_id: str, status_code: int) -> None:
-    if status_code not in {401, 403}:
-        return
-    cooldown_seconds = max(0.0, float(get_settings().usage_refresh_auth_failure_cooldown_seconds))
+def _mark_usage_refresh_auth_cooldown(
+    account_id: str, status_code: int, *, retry_after_seconds: float | None = None
+) -> None:
+    """Defer process-local polling for auth failures and server-directed waits."""
+    cooldown_seconds = max(0.0, retry_after_seconds or 0.0)
+    if status_code in {401, 403}:
+        cooldown_seconds = max(cooldown_seconds, float(get_settings().usage_refresh_auth_failure_cooldown_seconds))
     if cooldown_seconds <= 0:
         return
-    _usage_refresh_auth_cooldowns[account_id] = time.monotonic() + cooldown_seconds
+    deadline = time.monotonic() + cooldown_seconds
+    _usage_refresh_auth_cooldowns[account_id] = max(_usage_refresh_auth_cooldowns.get(account_id, 0.0), deadline)
 
 
 def _is_usage_refresh_in_cooldown(account_id: str) -> bool:

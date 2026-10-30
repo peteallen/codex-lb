@@ -5,7 +5,9 @@ from typing import Iterable
 from pydantic import ValidationError
 
 from app.core import usage as usage_core
+from app.core.balancer import PERMANENT_FAILURE_CODES
 from app.core.balancer.types import ClassifiedFailure, FailureClass, FailurePhase, UpstreamError
+from app.core.clients.proxy import ProxyResponseError
 from app.core.errors import OpenAIErrorDetail, OpenAIErrorEnvelope
 from app.core.openai.models import OpenAIError
 from app.core.plan_types import normalize_rate_limit_plan_type
@@ -72,7 +74,7 @@ def is_upstream_model_capacity_error(message: str | None) -> bool:
 
 def is_upstream_overload_error(code: str | None, message: str | None) -> bool:
     """Recognize explicit capacity rejection without treating quota as overload."""
-    if code in _RATE_LIMIT_CODES or code in _QUOTA_CODES:
+    if code in PERMANENT_FAILURE_CODES or code in _RATE_LIMIT_CODES or code in _QUOTA_CODES:
         return False
     return code in {"overloaded_error", "server_is_overloaded"} or is_upstream_model_capacity_error(message)
 
@@ -85,10 +87,14 @@ def classify_upstream_failure(
     phase: FailurePhase,
 ) -> ClassifiedFailure:
     failure_class: FailureClass
-    if error_code in _RATE_LIMIT_CODES:
+    if error_code in PERMANENT_FAILURE_CODES:
+        failure_class = "non_retryable"
+    elif error_code in _RATE_LIMIT_CODES:
         failure_class = "rate_limit"
     elif error_code in _QUOTA_CODES:
         failure_class = "quota"
+    elif http_status in {401, 403}:
+        failure_class = "non_retryable"
     elif (
         error_code in _TRANSIENT_CODES
         or is_upstream_model_capacity_error(error.get("message"))
@@ -103,6 +109,23 @@ def classify_upstream_failure(
         error_code=error_code,
         error=error,
         http_status=http_status,
+    )
+
+
+def is_terminal_authorization_denial(exc: ProxyResponseError) -> bool:
+    if exc.is_terminal_auth_error:
+        return True
+    if exc.status_code != 403:
+        return False
+    error = _parse_openai_error(exc.payload)
+    return (
+        classify_upstream_failure(
+            error_code=_normalize_error_code(error.code if error else None, error.type if error else None),
+            error=_upstream_error_from_openai(error),
+            http_status=exc.status_code,
+            phase="connect",
+        )["failure_class"]
+        == "non_retryable"
     )
 
 

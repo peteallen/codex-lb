@@ -3026,34 +3026,45 @@ class StubAccountsRepository:
         return (email, chatgpt_account_id, workspace_id) in self.taken_workspace_slots
 
 
+@pytest.mark.parametrize("status", [402, 404])
+@pytest.mark.parametrize(
+    ("code", "message", "expected_status"),
+    [
+        (None, "Endpoint unavailable", None),
+        ("account_deactivated", "Account unavailable", AccountStatus.DEACTIVATED),
+        (None, "Your OpenAI account has been deactivated", AccountStatus.DEACTIVATED),
+        ("token_revoked", "Token revoked", AccountStatus.REAUTH_REQUIRED),
+    ],
+)
 @pytest.mark.asyncio
-async def test_usage_updater_deactivates_on_account_invalid_4xx(monkeypatch) -> None:
-    monkeypatch.setenv("CODEX_LB_USAGE_REFRESH_ENABLED", "true")
+async def test_usage_updater_requires_terminal_evidence_for_402_404(
+    monkeypatch, status, code, message, expected_status
+) -> None:
     from app.core.clients.usage import UsageFetchError
     from app.core.config.settings import get_settings
 
+    monkeypatch.setenv("CODEX_LB_USAGE_REFRESH_ENABLED", "true")
     get_settings.cache_clear()
 
-    async def stub_fetch_usage_402(**_: Any) -> UsagePayload:
-        raise UsageFetchError(402, "Payment Required")
+    async def stub_fetch_usage(**_: Any) -> UsagePayload:
+        raise UsageFetchError(status, message, code=code)
 
-    monkeypatch.setattr("app.modules.usage.updater.fetch_usage", stub_fetch_usage_402)
-
+    monkeypatch.setattr("app.modules.usage.updater.fetch_usage", stub_fetch_usage)
     usage_repo = StubUsageRepository()
     accounts_repo = StubAccountsRepository()
     updater = UsageUpdater(usage_repo, accounts_repo=accounts_repo)
-
-    acc = _make_account("acc_402", "workspace_402", email="payment@example.com")
+    acc = _make_account(f"acc_{status}", f"workspace_{status}", email="usage@example.com")
     accounts_repo.accounts_by_id[acc.id] = acc
 
     await updater.refresh_accounts([acc], latest_usage={})
 
-    assert len(accounts_repo.status_updates) == 1
-    update = accounts_repo.status_updates[0]
-    assert update["account_id"] == "acc_402"
-    assert update["status"] == AccountStatus.DEACTIVATED
-    assert "402" in update["deactivation_reason"]
-    assert "Payment Required" in update["deactivation_reason"]
+    if expected_status is None:
+        assert accounts_repo.status_updates == []
+        assert acc.status == AccountStatus.ACTIVE
+    else:
+        assert len(accounts_repo.status_updates) == 1
+        assert accounts_repo.status_updates[0]["status"] == expected_status
+        assert acc.status == expected_status
 
 
 @pytest.mark.asyncio
@@ -3144,6 +3155,9 @@ async def test_usage_updater_does_not_deactivate_on_401(monkeypatch) -> None:
             "Your session has been terminated. Please sign in again.",
             "terminated",
         ),
+        ("token_revoked", "Token revoked", "revoked"),
+        ("session_revoked", "Session revoked", "revoked"),
+        ("authentication_token_revoked", "Token revoked", "revoked"),
     ],
 )
 @pytest.mark.asyncio
@@ -3159,7 +3173,11 @@ async def test_usage_updater_marks_session_failures_as_reauth_required(
 
     get_settings.cache_clear()
 
+    calls = 0
+
     async def stub_fetch_usage_401_session_failure(**_: Any) -> UsagePayload:
+        nonlocal calls
+        calls += 1
         raise UsageFetchError(401, message, code=error_code)
 
     monkeypatch.setattr("app.modules.usage.updater.fetch_usage", stub_fetch_usage_401_session_failure)
@@ -3180,6 +3198,8 @@ async def test_usage_updater_marks_session_failures_as_reauth_required(
     assert "401" in update["deactivation_reason"]
     assert message_hint in update["deactivation_reason"]
     assert acc.status == AccountStatus.REAUTH_REQUIRED
+    await updater.refresh_accounts([acc], latest_usage={})
+    assert calls == 1
 
 
 @pytest.mark.asyncio
@@ -4930,3 +4950,40 @@ async def test_refresh_accounts_does_not_repeat_post_reset_quota_probe(monkeypat
 
     updater = UsageUpdater(StubUsageRepository(), accounts_repo=None)
     await updater.refresh_accounts([acc], latest_usage={acc.id: latest})
+
+
+@pytest.mark.parametrize("status", [401, 429, 503])
+@pytest.mark.asyncio
+async def test_usage_updater_defers_next_cycle_until_retry_after(monkeypatch, status):
+    from app.core.clients.usage import UsageFetchError
+    from app.core.config.settings import get_settings
+
+    monkeypatch.setenv("CODEX_LB_USAGE_REFRESH_ENABLED", "true")
+    monkeypatch.setenv("CODEX_LB_USAGE_REFRESH_AUTH_FAILURE_COOLDOWN_SECONDS", "0")
+    get_settings.cache_clear()
+    clock = 100.0
+    monkeypatch.setattr(usage_updater_module.time, "monotonic", lambda: clock)
+    calls = 0
+
+    async def fetch(**kwargs):
+        nonlocal calls
+        calls += 1
+        raise UsageFetchError(status, "Wait", retry_after_seconds=60)
+
+    monkeypatch.setattr(usage_updater_module, "fetch_usage", fetch)
+    repo = StubAccountsRepository()
+    account = _make_account("acc_server_wait", "workspace_server_wait", email="wait@example.com")
+    repo.accounts_by_id[account.id] = account
+    from unittest.mock import AsyncMock
+
+    auth_manager = AsyncMock()
+    updater = UsageUpdater(StubUsageRepository(), accounts_repo=repo, auth_manager=auth_manager)
+    await updater.refresh_accounts([account], latest_usage={})
+    clock = 159.0
+    await updater.refresh_accounts([account], latest_usage={})
+    assert calls == 1
+    clock = 161.0
+    await updater.refresh_accounts([account], latest_usage={})
+    assert calls == 2
+    assert repo.status_updates == []
+    auth_manager.ensure_fresh.assert_not_awaited()

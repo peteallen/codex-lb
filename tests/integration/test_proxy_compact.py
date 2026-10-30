@@ -883,7 +883,7 @@ async def test_proxy_compact_repeated_401_after_refresh_fails_over(async_client,
 
 
 @pytest.mark.asyncio
-async def test_proxy_compact_token_invalidated_marks_reauth_and_fails_over(async_client, monkeypatch):
+async def test_proxy_compact_token_invalidated_marks_reauth_and_stops_call(async_client, monkeypatch):
     first_email = "compact-token-invalidated-a@example.com"
     first_raw_account_id = "acc_compact_token_invalidated_a"
     first_auth_json = _make_auth_json(first_raw_account_id, first_email)
@@ -943,11 +943,9 @@ async def test_proxy_compact_token_invalidated_marks_reauth_and_fails_over(async
 
     payload = {"model": "gpt-5.1", "instructions": "hi", "input": []}
     response = await async_client.post("/backend-api/codex/responses/compact", json=payload)
-    assert response.status_code == 200
-    assert response.json()["object"] == "response.compaction"
-    assert captured_account_ids[:2] == [invalidated_upstream_account_id, invalidated_upstream_account_id]
-    assert captured_account_ids[2] in {first_upstream_account_id, second_upstream_account_id}
-    assert captured_account_ids[2] != invalidated_upstream_account_id
+    assert response.status_code == 401
+    assert response.json()["error"]["code"] == "token_invalidated"
+    assert captured_account_ids == [invalidated_upstream_account_id]
 
     invalidated_account_id = (
         first_account_id if invalidated_upstream_account_id == first_upstream_account_id else second_account_id
@@ -969,6 +967,10 @@ async def test_proxy_compact_token_invalidated_marks_reauth_and_fails_over(async
     assert overview_response.status_code == 200
     overview_accounts = {account["accountId"]: account for account in overview_response.json()["accounts"]}
     assert overview_accounts[invalidated_account_id]["status"] == "reauth_required"
+
+    response = await async_client.post("/backend-api/codex/responses/compact", json=payload)
+    assert response.status_code == 200
+    assert captured_account_ids[1] != invalidated_upstream_account_id
 
 
 @pytest.mark.asyncio
@@ -1600,3 +1602,41 @@ async def test_proxy_compact_output_round_trips_into_followup_responses_without_
 
     assert response.status_code == 200
     assert seen_inputs == [compact_window["output"]]
+
+
+@pytest.mark.parametrize(("status", "code"), [(403, None), (401, "token_revoked"), (500, "token_revoked")])
+@pytest.mark.asyncio
+async def test_proxy_compact_terminal_auth_does_not_replay(async_client, monkeypatch, status, code):
+    for suffix in ("a", "b"):
+        auth = _make_auth_json(f"acc_compact_denial_{suffix}", f"compact-denial-{suffix}@example.com")
+        response = await async_client.post(
+            "/api/accounts/import",
+            files={"auth_json": ("auth.json", json.dumps(auth), "application/json")},
+        )
+        assert response.status_code == 200
+    calls = []
+    forced_refreshes = []
+
+    async def ensure_fresh(self, account, **kwargs):
+        if kwargs.get("force"):
+            forced_refreshes.append(account.id)
+        return account
+
+    async def compact(payload, headers, access_token, account_id, **kwargs):
+        calls.append(account_id)
+        raise ProxyResponseError(status, {"error": {"code": code, "message": "The selected model is at capacity"}})
+
+    monkeypatch.setattr(proxy_module.ProxyService, "_ensure_fresh_with_budget", ensure_fresh)
+    monkeypatch.setattr(proxy_module, "core_compact_responses", compact)
+    response = await async_client.post(
+        "/backend-api/codex/responses/compact",
+        json={"model": "gpt-5.4", "instructions": "hi", "input": []},
+    )
+    assert response.status_code == status
+    assert len(calls) == 1
+    assert forced_refreshes == []
+    if code is not None:
+        assert response.json()["error"]["code"] == code
+        async with SessionLocal() as session:
+            accounts = (await session.execute(select(Account))).scalars().all()
+            assert sum(account.status == AccountStatus.REAUTH_REQUIRED for account in accounts) == 1
