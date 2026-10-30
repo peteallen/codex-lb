@@ -30,22 +30,21 @@ def _make_account(account_id: str, email: str, plan_type: str = "plus") -> Accou
 
 
 @pytest.mark.asyncio
-async def test_usage_summary_empty_returns_zeroes(async_client):
+async def test_usage_summary_empty_preserves_unknown_quota_and_zero_activity(async_client):
     response = await async_client.get("/api/usage/summary")
     assert response.status_code == 200
     payload = response.json()
 
-    primary = payload["primaryWindow"]
-    assert primary["remainingPercent"] == 0.0
-    assert primary["capacityCredits"] == 0.0
-    assert primary["remainingCredits"] == 0.0
-    assert primary["windowMinutes"] == 300
-
-    secondary = payload["secondaryWindow"]
-    assert secondary["remainingPercent"] == 0.0
-    assert secondary["capacityCredits"] == 0.0
-    assert secondary["remainingCredits"] == 0.0
-    assert secondary["windowMinutes"] == 10080
+    # Without any quota observations, the nullable window contract must not
+    # invent zero capacity, an exhausted percentage, or a window duration.
+    for window_key in ("primaryWindow", "secondaryWindow"):
+        assert payload[window_key] == {
+            "remainingPercent": None,
+            "capacityCredits": None,
+            "remainingCredits": None,
+            "resetAt": None,
+            "windowMinutes": None,
+        }
 
     cost = payload["cost"]
     assert cost["currency"] == "USD"
