@@ -21,6 +21,7 @@ import {
   formatPercent,
   formatPercentNullable,
   formatPercentValue,
+  formatSlug,
   formatQuotaResetLabel,
   formatQuotaResetMeta,
   formatRate,
@@ -121,6 +122,11 @@ describe("formatters", () => {
     const formatted = formatTimeLong("2026-01-01T00:00:00.000Z");
     expect(formatted.time).not.toBe("--");
     expect(formatted.date).not.toBe("--");
+  });
+
+  it("uses verified display labels for Pro-family plan identities", () => {
+    expect(formatSlug("promax")).toBe("Pro Max");
+    expect(formatSlug("prolite")).toBe("Pro Lite");
   });
 
   it("formats conversation durations as two units", () => {

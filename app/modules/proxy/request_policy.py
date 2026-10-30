@@ -234,6 +234,11 @@ def apply_enforced_service_tier_model_fallback(
     service_tier = payload.service_tier
     if not service_tier_was_enforced or service_tier is None:
         return False
+    # Ultrafast is an explicit entitlement and price choice. Keep it intact
+    # so account-tier eligibility rejects unavailable access rather than
+    # silently executing an enforced Ultrafast request at Standard speed.
+    if service_tier == "ultrafast":
+        return False
 
     model_registry = registry or get_model_registry()
     advertises_service_tier = getattr(model_registry, "model_advertises_service_tier", None)

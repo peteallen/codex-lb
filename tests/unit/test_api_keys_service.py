@@ -462,9 +462,11 @@ class _FakeUsageRepository(UsageRepository):
         *,
         primary: dict[str, UsageHistory],
         secondary: dict[str, UsageHistory],
+        monthly: dict[str, UsageHistory] | None = None,
     ) -> None:
         self._primary = primary
         self._secondary = secondary
+        self._monthly = monthly or {}
         self.calls: list[tuple[str | None, list[str] | None]] = []
 
     async def latest_by_account(
@@ -474,7 +476,9 @@ class _FakeUsageRepository(UsageRepository):
         account_ids: Collection[str] | None = None,
     ) -> dict[str, UsageHistory]:
         self.calls.append((window, None if account_ids is None else list(account_ids)))
-        source = self._secondary if window == "secondary" else self._primary
+        source = {"primary": self._primary, "secondary": self._secondary, "monthly": self._monthly}.get(
+            window or "primary", {}
+        )
         rows = dict(source)
         if account_ids is not None:
             allowed = set(account_ids)
@@ -1030,6 +1034,7 @@ async def test_list_keys_uses_only_assigned_accounts_for_pooled_credits() -> Non
     assert cast(_FakeUsageRepository, service._usage_repository).calls == [
         ("primary", ["acc-a"]),
         ("secondary", ["acc-a"]),
+        ("monthly", ["acc-a"]),
     ]
 
 
@@ -1087,7 +1092,7 @@ async def test_list_keys_falls_back_to_all_accounts_when_key_is_unassigned() -> 
     assert listed[0].pooled_credits is not None
     assert repo.list_all_accounts_calls == 1
     assert account_calls_after_list == []
-    assert usage_repo.calls == [("primary", None), ("secondary", None)]
+    assert usage_repo.calls == [("primary", None), ("secondary", None), ("monthly", None)]
 
 
 @pytest.mark.asyncio

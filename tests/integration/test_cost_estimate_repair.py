@@ -180,3 +180,54 @@ async def test_repair_scope_and_unpublished_prices(db_setup):
         await session.rollback()
         with pytest.raises(ValueError, match="No published"):
             await repair_cost_estimates(session, models=["unknown"])
+
+
+@pytest.mark.asyncio
+async def test_repair_new_gpt6_models_preview_and_apply(db_setup):
+    when = datetime(2026, 9, 29, 10)
+    rows = [
+        ("gpt-6.1-sol", None, 1.11),
+        ("gpt-6-sol", None, 1.115),
+        ("gpt-6-luna", None, 0.05575),
+        ("gpt-6-astra", "ultrafast", 33.45),
+    ]
+    async with SessionLocal() as session:
+        for index, (model, service_tier, _) in enumerate(rows):
+            session.add(
+                RequestLog(
+                    request_id=f"repair-{index}",
+                    requested_at=when,
+                    model=model,
+                    service_tier=service_tier,
+                    status="success",
+                    input_tokens=100_000,
+                    cached_input_tokens=50_000,
+                    cache_write_tokens=10_000,
+                    output_tokens=100_000,
+                    cost_usd=0,
+                )
+            )
+        await session.commit()
+
+        preview = await repair_cost_estimates(
+            session,
+            models=[model for model, _, _ in rows],
+            since=when,
+        )
+        assert preview.scanned == 4
+        assert preview.changed == 4
+        assert preview.missing_cache_write_counts == 0
+        assert preview.delta_usd == pytest.approx(sum(expected for _, _, expected in rows))
+        assert (await session.scalars(select(RequestLog.cost_usd).order_by(RequestLog.id))).all() == [0, 0, 0, 0]
+
+        await session.rollback()
+        applied = await repair_cost_estimates(
+            session,
+            models=[model for model, _, _ in rows],
+            since=when,
+            apply=True,
+        )
+        assert applied.changed == 4
+        assert (await session.scalars(select(RequestLog.cost_usd).order_by(RequestLog.id))).all() == [
+            pytest.approx(expected) for _, _, expected in rows
+        ]

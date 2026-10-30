@@ -4,7 +4,7 @@ import { describe, expect, it } from "vitest";
 import { UsageDonuts } from "@/features/dashboard/components/usage-donuts";
 
 /** Helper to build a minimal RemainingItem for tests. */
-function item(overrides: { accountId: string; label: string; value: number; remainingPercent: number; color: string }) {
+function item(overrides: { accountId: string; label: string; value: number | null; remainingPercent: number | null; color: string }) {
   return { ...overrides, labelSuffix: "", isEmail: true };
 }
 
@@ -106,5 +106,22 @@ describe("UsageDonuts", () => {
     const capacity = screen.getAllByTestId("donut-center-capacity").map((node) => node.textContent);
     expect(remaining).toEqual(["120", "7,331"]);
     expect(capacity).toEqual(["225", "7,560"]);
+  });
+
+  it("shows the reported percentage when absolute credits are unknown", async () => {
+    render(
+      <UsageDonuts
+        primaryItems={[item({ accountId: "acc-promax", label: "promax@example.com", value: null, remainingPercent: 25, color: "#7bb661" })]}
+        secondaryItems={[]}
+        primaryTotal={null}
+        secondaryTotal={null}
+        primaryCenterValue={null}
+        secondaryCenterValue={null}
+      />,
+    );
+
+    expect(await screen.findByText("promax@example.com")).toBeInTheDocument();
+    expect(screen.getByTestId("donut-legend-0")).toHaveTextContent("25%");
+    expect(screen.getAllByTestId("donut-center-capacity")[0]).toHaveTextContent("--");
   });
 });

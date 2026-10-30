@@ -458,6 +458,74 @@ async def test_quota_planner_warm_now_refuses_superseded_short_window(async_clie
 
 
 @pytest.mark.asyncio
+async def test_quota_planner_warm_now_uses_monthly_window_for_promax(async_client, db_setup):
+    del db_setup
+    encryptor = TokenEncryptor()
+    now_epoch = int(utcnow().replace(tzinfo=timezone.utc).timestamp())
+    async with SessionLocal() as session:
+        account = Account(
+            id="acc-superseded-promax",
+            email="superseded-promax@example.test",
+            plan_type="promax",
+            access_token_encrypted=encryptor.encrypt("access"),
+            refresh_token_encrypted=encryptor.encrypt("refresh"),
+            id_token_encrypted=encryptor.encrypt("id"),
+            last_refresh=utcnow(),
+            status=AccountStatus.ACTIVE,
+        )
+        session.add(account)
+        session.add(
+            UsageHistory(
+                account_id=account.id,
+                used_percent=40.0,
+                recorded_at=utcnow() - timedelta(hours=3),
+                window="primary",
+                reset_at=now_epoch - 7200,
+                window_minutes=300,
+            )
+        )
+        session.add(
+            UsageHistory(
+                account_id=account.id,
+                used_percent=40.0,
+                recorded_at=utcnow(),
+                window="monthly",
+                reset_at=now_epoch + 30 * 24 * 3600,
+                window_minutes=43200,
+            )
+        )
+        repo = QuotaPlannerRepository(session)
+        await repo.upsert_settings(
+            PlannerSettings(
+                mode="auto",
+                timezone="UTC",
+                working_days=(0, 1, 2, 3, 4),
+                working_hours_start="09:00",
+                working_hours_end="18:00",
+                prewarm_enabled=True,
+                prewarm_lead_minutes=300,
+                max_warmups_per_day=3,
+                max_warmup_credits_per_day=1.0,
+                min_expected_gain=1.0,
+                forecast_quantile="p75",
+                allow_synthetic_traffic=True,
+                warmup_model_preference="gpt-5.4-mini",
+                dry_run=False,
+            )
+        )
+
+    response = await async_client.post(
+        "/api/quota-planner/warm-now",
+        json={"accountId": account.id, "model": "gpt-5.4-mini"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "skipped"
+    assert payload["reason"] == "no_short_window"
+
+
+@pytest.mark.asyncio
 async def test_quota_planner_cancel_decision(async_client, db_setup):
     del db_setup
     async with SessionLocal() as session:

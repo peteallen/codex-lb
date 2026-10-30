@@ -597,12 +597,20 @@ class ModelRegistry:
         return tier_plans.get(normalized_service_tier, frozenset())
 
     def account_ids_for_model_service_tier(self, slug: str, service_tier: str | None) -> frozenset[str] | None:
-        if service_tier is None or self._snapshot is None:
+        if service_tier is None:
+            return None
+        normalized_service_tier = canonical_service_tier_value(service_tier)
+        # This entitlement is narrower than generic Pro model access. Until
+        # account catalogs establish it, no subscription account is eligible.
+        if normalized_service_tier == "ultrafast" and (
+            self._snapshot is None or not self._snapshot.account_catalogs_authoritative
+        ):
+            return frozenset()
+        if self._snapshot is None:
             return None
         if not self._snapshot.account_catalogs_authoritative:
             return None
         normalized_slug = slug.strip().lower()
-        normalized_service_tier = canonical_service_tier_value(service_tier)
         if not normalized_slug or not normalized_service_tier:
             return None
 

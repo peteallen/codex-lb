@@ -80,7 +80,6 @@ CAPACITY_PLAN_ALIASES = {
     "go": "free",
     "free_workspace": "free",
     "quorum": "free",
-    "unknown": "free",
 }
 
 HEALTH_TIER_HEALTHY = 0
@@ -440,12 +439,17 @@ def _prefer_earlier_reset_candidates(
 
 
 def _fallback_secondary_capacity_credits(plan_type: str | None) -> float:
+    """Return only a known legacy capacity; unknown plans stay capacityless.
+
+    The selector's percentage fallback handles unknown subscription
+    allowances. This helper remains for callers that need a numeric ordering
+    key, but must never turn an unknown plan into free-plan capacity.
+    """
     normalized = (plan_type or "").strip().lower()
-    resolved_plan = CAPACITY_PLAN_ALIASES.get(normalized, normalized or UNKNOWN_PLAN_FALLBACK)
-    return PLAN_CAPACITY_CREDITS_SECONDARY.get(
-        resolved_plan,
-        PLAN_CAPACITY_CREDITS_SECONDARY[UNKNOWN_PLAN_FALLBACK],
-    )
+    if not normalized:
+        return 0.0
+    resolved_plan = CAPACITY_PLAN_ALIASES.get(normalized, normalized)
+    return PLAN_CAPACITY_CREDITS_SECONDARY.get(resolved_plan, 0.0)
 
 
 def select_account(
@@ -736,7 +740,10 @@ def select_account(
         return SelectionResult(selected, None)
 
     if routing_strategy == "sequential_drain":
-        selected = min(available, key=_sequential_drain_sort_key)
+        if _has_unknown_secondary_capacity(available):
+            selected = min(available, key=_percentage_drain_sort_key)
+        else:
+            selected = min(available, key=_sequential_drain_sort_key)
         return SelectionResult(selected, None)
 
     if routing_strategy == "reset_drain":
@@ -768,10 +775,20 @@ def select_account(
             else effective_pool
         )
         if deterministic_probe:
-            selected = min(candidate_pool, key=lambda state: _capacity_probe_sort_key_with_cost(state, routing_costs))
+            selected = min(
+                candidate_pool,
+                key=lambda state: _capacity_probe_sort_key_with_cost(
+                    state,
+                    routing_costs,
+                    percentage_basis=_has_unknown_secondary_capacity(candidate_pool),
+                ),
+            )
         else:
             candidate_pool = _lowest_planner_cost_candidates(candidate_pool, routing_costs)
-            selected = _select_capacity_weighted(candidate_pool)
+            selected = _select_capacity_weighted(
+                candidate_pool,
+                percentage_basis=_has_unknown_secondary_capacity(candidate_pool),
+            )
     elif routing_strategy == "relative_availability":
         candidate_pool = _lowest_planner_cost_candidates(effective_pool, routing_costs)
         selected = _select_relative_availability(
@@ -780,6 +797,7 @@ def select_account(
             power=relative_availability_power,
             top_k=relative_availability_top_k,
             deterministic_probe=deterministic_probe,
+            percentage_basis=_has_unknown_secondary_capacity(candidate_pool),
         )
     elif routing_strategy == "fill_first":
         candidate_pool = (
@@ -835,13 +853,31 @@ def _remaining_secondary_credits(state: AccountState) -> float:
     capacity = (
         state.priority_capacity_credits if state.priority_capacity_credits is not None else state.capacity_credits
     )
-    if capacity is None:
-        capacity = _fallback_secondary_capacity_credits(state.plan_type)
-    elif capacity <= 0:
+    if capacity is None or capacity <= 0:
         return 0.0
     primary_used = _priority_primary_used(state)
     used_pct = _priority_secondary_used(state, primary_used)
     return max(0.0, capacity * (1.0 - min(used_pct, 100.0) / 100.0))
+
+
+def _secondary_capacity(state: AccountState) -> float | None:
+    return state.priority_capacity_credits if state.priority_capacity_credits is not None else state.capacity_credits
+
+
+def _has_unknown_secondary_capacity(states: Iterable[AccountState]) -> bool:
+    return any(_secondary_capacity(state) is None for state in states)
+
+
+def _remaining_secondary_weight(state: AccountState, *, percentage_basis: bool) -> float:
+    if not percentage_basis:
+        return _remaining_secondary_credits(state)
+    # A configured zero-capacity plan is known to have no long-window quota.
+    # Keep that distinct from an unknown allowance, which receives the shared
+    # percentage basis below.
+    if _secondary_capacity(state) == 0.0:
+        return 0.0
+    used_pct = _priority_secondary_used(state, _priority_primary_used(state))
+    return max(0.0, 100.0 - min(float(used_pct), 100.0))
 
 
 def _priority_primary_used(state: AccountState) -> float:
@@ -883,8 +919,8 @@ def _relative_availability_remaining_seconds(state: AccountState, current: float
     return max(0.0, float(reset_at) - current)
 
 
-def _relative_availability_raw_score(state: AccountState, current: float) -> float:
-    remaining_credits = _remaining_secondary_credits(state)
+def _relative_availability_raw_score(state: AccountState, current: float, *, percentage_basis: bool = False) -> float:
+    remaining_credits = _remaining_secondary_weight(state, percentage_basis=percentage_basis)
     if remaining_credits <= 0.0:
         return 0.0
     return remaining_credits / _relative_availability_divisor_seconds(state, current)
@@ -902,6 +938,7 @@ def _log_relative_availability_candidate_scores(
     raw_scores: list[tuple[AccountState, float]],
     *,
     current: float,
+    percentage_basis: bool,
 ) -> None:
     for state, raw_score in raw_scores:
         remaining_seconds = _relative_availability_remaining_seconds(state, current)
@@ -911,7 +948,7 @@ def _log_relative_availability_candidate_scores(
                 "remaining_credits=%.2f remaining_minutes=%.2f score_per_minute=%.6f"
             ),
             _relative_availability_label(state),
-            _remaining_secondary_credits(state),
+            _remaining_secondary_weight(state, percentage_basis=percentage_basis),
             remaining_seconds / 60.0,
             _relative_availability_score_per_minute(raw_score),
         )
@@ -921,11 +958,12 @@ def _log_relative_availability_top_k(
     weighted_candidates: list[tuple[AccountState, float, float]],
     *,
     current: float,
+    percentage_basis: bool,
 ) -> None:
     formatted_candidates = ", ".join(
         (
             f"account={_relative_availability_label(state)} "
-            f"remaining_credits={_remaining_secondary_credits(state):.2f} "
+            f"remaining_credits={_remaining_secondary_weight(state, percentage_basis=percentage_basis):.2f} "
             f"remaining_minutes={_relative_availability_remaining_seconds(state, current) / 60.0:.2f} "
             f"score_per_minute={_relative_availability_score_per_minute(raw_score):.6f} "
             f"weight={weight:.8f}"
@@ -941,9 +979,13 @@ def _relative_availability_weighted_candidates(
     current: float,
     power: float,
     top_k: int,
+    percentage_basis: bool,
 ) -> list[tuple[AccountState, float, float]]:
-    raw_scores = [(state, _relative_availability_raw_score(state, current)) for state in available]
-    _log_relative_availability_candidate_scores(raw_scores, current=current)
+    raw_scores = [
+        (state, _relative_availability_raw_score(state, current, percentage_basis=percentage_basis))
+        for state in available
+    ]
+    _log_relative_availability_candidate_scores(raw_scores, current=current, percentage_basis=percentage_basis)
     best_raw_score = max((score for _, score in raw_scores), default=0.0)
     if best_raw_score <= 0.0:
         return []
@@ -969,7 +1011,7 @@ def _relative_availability_weighted_candidates(
     )
     safe_top_k = max(1, top_k)
     top_candidates = weighted[:safe_top_k]
-    _log_relative_availability_top_k(top_candidates, current=current)
+    _log_relative_availability_top_k(top_candidates, current=current, percentage_basis=percentage_basis)
     return top_candidates
 
 
@@ -979,6 +1021,7 @@ def _log_relative_availability_winner(
     current: float,
     weight: float | None,
     raw_score: float,
+    percentage_basis: bool,
 ) -> None:
     remaining_seconds = _relative_availability_remaining_seconds(winner, current)
     logger.info(
@@ -987,7 +1030,7 @@ def _log_relative_availability_winner(
             "remaining_credits=%.2f remaining_minutes=%.2f score_per_minute=%.6f weight=%s"
         ),
         _relative_availability_label(winner),
-        _remaining_secondary_credits(winner),
+        _remaining_secondary_weight(winner, percentage_basis=percentage_basis),
         remaining_seconds / 60.0,
         _relative_availability_score_per_minute(raw_score),
         f"{weight:.8f}" if weight is not None else "fallback",
@@ -1001,12 +1044,14 @@ def _select_relative_availability(
     power: float,
     top_k: int,
     deterministic_probe: bool,
+    percentage_basis: bool = False,
 ) -> AccountState:
     weighted_candidates = _relative_availability_weighted_candidates(
         available,
         current=current,
         power=power,
         top_k=top_k,
+        percentage_basis=percentage_basis,
     )
     if not weighted_candidates:
         winner = min(available, key=_usage_sort_key)
@@ -1014,12 +1059,19 @@ def _select_relative_availability(
             winner,
             current=current,
             weight=None,
-            raw_score=_relative_availability_raw_score(winner, current),
+            raw_score=_relative_availability_raw_score(winner, current, percentage_basis=percentage_basis),
+            percentage_basis=percentage_basis,
         )
         return winner
     if deterministic_probe:
         winner, weight, raw_score = weighted_candidates[0]
-        _log_relative_availability_winner(winner, current=current, weight=weight, raw_score=raw_score)
+        _log_relative_availability_winner(
+            winner,
+            current=current,
+            weight=weight,
+            raw_score=raw_score,
+            percentage_basis=percentage_basis,
+        )
         return winner
     states = [state for state, _, _ in weighted_candidates]
     weights = [weight for _, weight, _ in weighted_candidates]
@@ -1030,13 +1082,20 @@ def _select_relative_availability(
             winner,
             current=current,
             weight=None,
-            raw_score=_relative_availability_raw_score(winner, current),
+            raw_score=_relative_availability_raw_score(winner, current, percentage_basis=percentage_basis),
+            percentage_basis=percentage_basis,
         )
         return winner
     winner = random.choices(states, weights=weights, k=1)[0]
     for state, weight, raw_score in weighted_candidates:
         if state.account_id == winner.account_id:
-            _log_relative_availability_winner(winner, current=current, weight=weight, raw_score=raw_score)
+            _log_relative_availability_winner(
+                winner,
+                current=current,
+                weight=weight,
+                raw_score=raw_score,
+                percentage_basis=percentage_basis,
+            )
             break
     return winner
 
@@ -1124,6 +1183,13 @@ def _sequential_drain_sort_key(state: AccountState) -> tuple[float, str, str]:
     )
 
 
+def _percentage_drain_sort_key(state: AccountState) -> tuple[float, float, float, str]:
+    """Drain the most-used account first when absolute capacities are mixed."""
+    primary_used = _priority_primary_used(state)
+    secondary_used = _priority_secondary_used(state, primary_used)
+    return -secondary_used, -primary_used, state.last_selected_at or 0.0, state.account_id
+
+
 def _weekly_reset_timestamp(state: AccountState, current: float) -> float:
     if state.secondary_reset_at is not None and float(state.secondary_reset_at) > current:
         return float(state.secondary_reset_at)
@@ -1158,11 +1224,13 @@ def _reset_drain_sort_key(state: AccountState, current: float) -> tuple[int, flo
 def _capacity_probe_sort_key_with_cost(
     state: AccountState,
     routing_costs: RoutingCostsByAccount | None,
+    *,
+    percentage_basis: bool = False,
 ) -> tuple[float, float, float, float, float, str]:
     secondary_used, primary_used, last_selected, account_id = _usage_sort_key(state)
     return (
         _planner_cost(state, routing_costs),
-        -_remaining_secondary_credits(state),
+        -_remaining_secondary_weight(state, percentage_basis=percentage_basis),
         secondary_used,
         primary_used,
         last_selected,
@@ -1180,9 +1248,9 @@ def _lowest_planner_cost_candidates(
     return [state for state in available if _planner_cost(state, routing_costs) == lowest_cost]
 
 
-def _select_capacity_weighted(available: list[AccountState]) -> AccountState:
-    """Select an account with probability proportional to remaining secondary credits."""
-    weights = [_remaining_secondary_credits(s) for s in available]
+def _select_capacity_weighted(available: list[AccountState], *, percentage_basis: bool = False) -> AccountState:
+    """Select by absolute credits or common remaining percentage basis."""
+    weights = [_remaining_secondary_weight(s, percentage_basis=percentage_basis) for s in available]
     total = sum(weights)
     if total <= 0.0:
         # All accounts exhausted — fall back to deterministic usage-weighted

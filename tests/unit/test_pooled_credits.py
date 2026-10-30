@@ -29,7 +29,7 @@ def _make_account(account_id: str, plan_type: str = "plus") -> Account:
 def _make_usage(
     account_id: str,
     window: str,
-    used_percent: float,
+    used_percent: float | None,
     *,
     window_minutes: int = 300,
 ) -> UsageHistory:
@@ -92,7 +92,7 @@ class TestComputePooledCredits:
         assert result.remaining_percent_primary < 80.0
         assert result.remaining_percent_secondary is not None
         assert result.remaining_percent_secondary < 90.0
-        assert result.capacity_credits_primary == 225.0 + 1500.0
+        assert result.capacity_credits_primary is None
 
     def test_free_tier_hides_primary_bar(self) -> None:
         acc_free = _make_account("acc-free", "free")
@@ -146,7 +146,7 @@ class TestComputePooledCredits:
         assert result.remaining_percent_secondary is None
         assert result.capacity_credits_primary == 0.0
 
-    def test_assigned_accounts_without_usage_history_hide_primary_but_count_capacity(self) -> None:
+    def test_accounts_without_usage_history_do_not_invent_available_quota(self) -> None:
         acc_a = _make_account("acc-a", "plus")
 
         result = _compute_pooled_credits(
@@ -156,11 +156,12 @@ class TestComputePooledCredits:
             secondary_usage={},
         )
 
-        # No live primary sample exists, so the pooled primary bar reads
-        # absent rather than an optimistic 100%; capacity still counts.
+        # No reported window exists; neither short nor long windows imply
+        # an optimistic 100% available quota.
         assert result.remaining_percent_primary is None
-        assert result.remaining_percent_secondary == pytest.approx(100.0)
-        assert result.capacity_credits_primary == 225.0
+        assert result.remaining_percent_secondary is None
+        assert result.remaining_percent_monthly is None
+        assert result.capacity_credits_primary is None
 
     def test_expired_primary_samples_hide_the_pooled_primary_bar(self) -> None:
         import time as _time
@@ -237,7 +238,7 @@ class TestComputePooledCredits:
         # than zeroing into a 100%-free pool.
         assert result.remaining_percent_secondary == pytest.approx(0.0)
 
-    def test_mixed_plans_sums_capacity(self) -> None:
+    def test_mixed_unknown_plans_average_percentages_without_partial_capacity(self) -> None:
         acc_plus = _make_account("acc-plus", "plus")
         acc_pro = _make_account("acc-pro", "pro")
 
@@ -254,9 +255,51 @@ class TestComputePooledCredits:
             },
         )
 
-        assert result.capacity_credits_primary == 225.0 + 1500.0
-        assert result.remaining_percent_primary is not None
-        assert result.remaining_percent_primary > 0
+        assert result.capacity_credits_primary is None
+        assert result.remaining_percent_primary == pytest.approx(70.0)
+        assert result.remaining_percent_secondary == pytest.approx(70.0)
+
+    def test_unknown_capacity_without_percentage_makes_pool_percentage_unavailable(self) -> None:
+        acc_plus = _make_account("acc-plus", "plus")
+        acc_pro = _make_account("acc-pro", "pro")
+
+        result = _compute_pooled_credits(
+            assigned_account_ids=[acc_plus.id, acc_pro.id],
+            all_accounts=[acc_plus, acc_pro],
+            primary_usage={},
+            secondary_usage={
+                acc_plus.id: _make_usage(acc_plus.id, "secondary", 50.0, window_minutes=10080),
+                # The Pro row is a real but incomplete observation. A mixed
+                # pool cannot report the Plus percentage as the whole pool.
+                acc_pro.id: _make_usage(acc_pro.id, "secondary", None, window_minutes=10080),
+            },
+        )
+
+        assert result.capacity_credits_primary is None
+        assert result.remaining_percent_secondary is None
+
+    @pytest.mark.parametrize("plan_type", ["pro", "prolite", "promax"])
+    def test_monthly_only_pro_pool_keeps_reported_percentage(self, plan_type: str) -> None:
+        account = _make_account("acc-pro", plan_type)
+        result = _compute_pooled_credits(
+            assigned_account_ids=[account.id],
+            all_accounts=[account],
+            primary_usage={},
+            secondary_usage={},
+            monthly_usage={account.id: _make_usage(account.id, "monthly", 25.0, window_minutes=43200)},
+        )
+        assert result.remaining_percent_primary is None
+        assert result.remaining_percent_secondary is None
+        assert result.remaining_percent_monthly == pytest.approx(75.0)
+
+    def test_missing_account_usage_does_not_dilute_exhausted_pool(self) -> None:
+        result = _compute_pooled_credits(
+            assigned_account_ids=[],
+            all_accounts=[_make_account("measured", "promax"), _make_account("missing", "plus")],
+            primary_usage={},
+            secondary_usage={"measured": _make_usage("measured", "secondary", 100.0, window_minutes=10080)},
+        )
+        assert result.remaining_percent_secondary == 0.0
 
     def test_weekly_only_account_remapped(self) -> None:
         acc_free = _make_account("acc-free", "free")

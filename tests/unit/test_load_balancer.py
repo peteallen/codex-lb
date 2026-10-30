@@ -2218,6 +2218,30 @@ def test_state_from_account_keeps_active_account_selectable_when_primary_usage_s
     assert selection.account.account_id == state.account_id
 
 
+def test_state_from_account_preserves_incomplete_measured_primary_usage(monkeypatch):
+    now = 1_700_000_000.0
+    monkeypatch.setattr("app.modules.proxy.load_balancer.time.time", lambda: now)
+    monkeypatch.setattr("app.core.usage.quota.time.time", lambda: now)
+
+    incomplete_primary = UsageHistory(
+        id=1,
+        account_id="a",
+        recorded_at=_epoch_to_naive_utc(now - 30),
+        window="primary",
+        used_percent=100.0,
+        reset_at=None,
+        window_minutes=None,
+    )
+    state = _state_from_account(
+        account=_make_test_account(status=AccountStatus.ACTIVE),
+        primary_entry=incomplete_primary,
+        secondary_entry=None,
+        runtime=RuntimeState(),
+    )
+
+    assert state.used_percent == 100.0
+
+
 def test_state_from_account_keeps_raw_usage_evidence_separate_from_pressure(monkeypatch):
     now = 1_700_000_000.0
     future_reset = int(now + 300)
@@ -2654,6 +2678,53 @@ def test_state_from_account_ignores_stale_monthly_usage_after_upgrade(monkeypatc
     assert state.secondary_used_percent == 20.0
     assert state.secondary_reset_at == weekly_reset
     assert state.capacity_credits == usage_core.capacity_for_plan("plus", "secondary")
+
+
+def test_select_long_window_entry_keeps_monthly_usage_for_promax(monkeypatch):
+    now = 1_700_000_000.0
+    monthly_reset = int(now + 30 * 24 * 3600)
+    monkeypatch.setattr("app.modules.proxy.load_balancer.time.time", lambda: now)
+
+    account = _make_test_account(status=AccountStatus.ACTIVE, plan_type="promax")
+    monthly_entry = _make_test_usage(
+        window="monthly",
+        used_percent=25.0,
+        reset_at=monthly_reset,
+        recorded_at=_epoch_to_naive_utc(now - 30),
+        window_minutes=43200,
+    )
+
+    selected_entry = _select_long_window_entry(
+        account=account,
+        monthly_entry=monthly_entry,
+        secondary_entry=None,
+    )
+
+    assert selected_entry is monthly_entry
+
+
+def test_state_from_account_omits_primary_no_data_marker_for_promax(monkeypatch):
+    now = 1_700_000_000.0
+    weekly_reset = int(now + 7 * 24 * 3600)
+    monkeypatch.setattr("app.modules.proxy.load_balancer.time.time", lambda: now)
+    monkeypatch.setattr("app.core.usage.quota.time.time", lambda: now)
+
+    state = _state_from_account(
+        account=_make_test_account(status=AccountStatus.ACTIVE, plan_type="promax"),
+        primary_entry=_make_test_usage(window="primary", used_percent=0.0, reset_at=None, window_minutes=0),
+        secondary_entry=_make_test_usage(
+            window="secondary",
+            used_percent=25.0,
+            reset_at=weekly_reset,
+            window_minutes=10080,
+        ),
+        runtime=RuntimeState(),
+    )
+
+    assert state.primary_window_minutes is None
+    assert state.used_percent is None
+    assert state.secondary_used_percent == 25.0
+    assert state.capacity_credits is None
 
 
 def test_state_from_account_ignores_zero_capacity_monthly_primary_window(monkeypatch):
@@ -4638,7 +4709,7 @@ def test_select_account_capacity_weighted_zero_capacity_treated_as_zero_weight()
         assert result.account.account_id == "weighted"
 
 
-def test_select_account_capacity_weighted_unknown_plan_uses_conservative_fallback_weight():
+def test_select_account_capacity_weighted_unknown_plan_uses_common_percentage_weight():
     random.seed(34)
     n = 2000
     unknown_plan = AccountState(
@@ -4665,8 +4736,7 @@ def test_select_account_capacity_weighted_unknown_plan_uses_conservative_fallbac
         counts[result.account.account_id] += 1
 
     unknown_ratio = counts["unknown-plan"] / n
-    assert 0.05 <= unknown_ratio <= 0.25
-    assert counts["plus"] > counts["unknown-plan"]
+    assert 0.35 <= unknown_ratio <= 0.65
 
 
 @pytest.mark.parametrize("plan_type", ["pro", "prolite", "team", "business", "enterprise"])

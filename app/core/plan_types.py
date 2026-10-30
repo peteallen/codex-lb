@@ -7,6 +7,7 @@ ACCOUNT_PLAN_TYPES: Final[set[str]] = {
     "plus",
     "pro",
     "prolite",
+    "promax",
     "team",
     "business",
     "enterprise",
@@ -25,7 +26,10 @@ RATE_LIMIT_PLAN_TYPES: Final[set[str]] = {
 
 ACCOUNT_PLAN_EQUIVALENTS: Final[dict[str, frozenset[str]]] = {
     "prolite": frozenset({"pro"}),
+    "promax": frozenset({"pro"}),
 }
+
+PRO_FAMILY_PLAN_TYPES: Final[frozenset[str]] = frozenset({"pro", "prolite", "promax"})
 
 
 def _clean_plan_type(value: str | None) -> str | None:
@@ -81,3 +85,9 @@ def account_plan_matches_allowed(value: str | None, allowed_plans: AbstractSet[s
     if normalized is None:
         return False
     return bool(ACCOUNT_PLAN_EQUIVALENTS.get(normalized, frozenset()) & normalized_allowed)
+
+
+def is_pro_family_plan(value: str | None) -> bool:
+    """Return whether the stored plan is one of the observed Pro variants."""
+    normalized = normalize_account_plan_type(value)
+    return normalized in PRO_FAMILY_PLAN_TYPES

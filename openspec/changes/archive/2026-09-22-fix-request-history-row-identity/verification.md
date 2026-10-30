@@ -12,10 +12,6 @@
 - A temporary browser fixture using the real component reproduced six jumbled
   rows with the old key and exactly four correctly ordered rows with the fix.
   The fixture and preview server were removed after verification.
-- Fixture-based before/after captures of the request-history table are retained
-  under `screenshots/request-history-before.png` and
-  `screenshots/request-history-after.png`; both use synthetic duplicate
-  external request IDs while the refreshed state adds a new attempt.
 - Strict validation passed for the change and all 49 existing capability specs.
 - The local service was restarted and `/health/ready` reported database and
   bridge-ring health. Live OpenAPI exposes required string `logId`.

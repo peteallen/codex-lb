@@ -92,12 +92,16 @@ async def test_dashboard_overview_combines_data(async_client, db_setup):
             "acc_dash",
             20.0,
             window="primary",
+            reset_at=int(naive_utc_to_epoch(now + timedelta(minutes=295))),
+            window_minutes=300,
             recorded_at=primary_time,
         )
         await usage_repo.add_entry(
             "acc_dash",
             40.0,
             window="secondary",
+            reset_at=int(naive_utc_to_epoch(now + timedelta(days=4))),
+            window_minutes=10080,
             recorded_at=secondary_time,
         )
         await logs_repo.add_log(
@@ -539,7 +543,7 @@ async def test_dashboard_overview_derives_quota_status_from_current_weekly_usage
 
 
 @pytest.mark.asyncio
-async def test_dashboard_overview_counts_prolite_capacity(async_client, db_setup):
+async def test_dashboard_overview_preserves_prolite_percentages_without_credit_capacity(async_client, db_setup):
     now = utcnow().replace(microsecond=0)
 
     async with SessionLocal() as session:
@@ -568,14 +572,51 @@ async def test_dashboard_overview_counts_prolite_capacity(async_client, db_setup
     account = payload["accounts"][0]
 
     assert account["planType"] == "prolite"
-    assert account["capacityCreditsPrimary"] == pytest.approx(1125.0)
-    assert account["remainingCreditsPrimary"] == pytest.approx(1125.0)
-    assert account["capacityCreditsSecondary"] == pytest.approx(37800.0)
-    assert account["remainingCreditsSecondary"] == pytest.approx(37800.0)
-    assert payload["summary"]["primaryWindow"]["capacityCredits"] == pytest.approx(1125.0)
-    assert payload["summary"]["primaryWindow"]["remainingCredits"] == pytest.approx(1125.0)
-    assert payload["summary"]["secondaryWindow"]["capacityCredits"] == pytest.approx(37800.0)
-    assert payload["summary"]["secondaryWindow"]["remainingCredits"] == pytest.approx(37800.0)
+    assert account["usage"]["primaryRemainingPercent"] == pytest.approx(100.0)
+    assert account["usage"]["secondaryRemainingPercent"] == pytest.approx(100.0)
+    assert account["capacityCreditsPrimary"] is None
+    assert account["remainingCreditsPrimary"] is None
+    assert account["capacityCreditsSecondary"] is None
+    assert account["remainingCreditsSecondary"] is None
+    assert payload["summary"]["primaryWindow"]["remainingPercent"] == pytest.approx(100.0)
+    assert payload["summary"]["primaryWindow"]["capacityCredits"] is None
+    assert payload["summary"]["primaryWindow"]["remainingCredits"] is None
+    assert payload["summary"]["secondaryWindow"]["remainingPercent"] == pytest.approx(100.0)
+    assert payload["summary"]["secondaryWindow"]["capacityCredits"] is None
+    assert payload["summary"]["secondaryWindow"]["remainingCredits"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("plan_type", ["pro", "prolite", "promax"])
+@pytest.mark.parametrize("unknown_sample_minutes", [0, 10])
+async def test_dashboard_projections_withholds_credit_forecast_for_unknown_pro_capacity(
+    async_client, db_setup, plan_type, unknown_sample_minutes
+):
+    now = utcnow()
+    reset_at = int(naive_utc_to_epoch(now + timedelta(days=4)))
+    async with SessionLocal() as session:
+        accounts_repo = AccountsRepository(session)
+        usage_repo = UsageRepository(session)
+        for account_id, plan in [("unknown-pro", plan_type), ("known-plus", "plus")]:
+            await accounts_repo.upsert(_make_account(account_id, f"{account_id}@example.com", plan_type=plan))
+            await usage_repo.add_entry(
+                account_id,
+                25.0,
+                window="secondary",
+                window_minutes=10080,
+                reset_at=reset_at,
+                recorded_at=now - timedelta(minutes=unknown_sample_minutes if account_id == "unknown-pro" else 0),
+            )
+    response = await async_client.get("/api/dashboard/projections")
+    assert response.status_code == 200
+    # An eligible Pro-family account has reported weekly usage but unknown
+    # absolute capacity. The dashboard must not present the known Plus subset
+    # as the complete pool, even when the Pro history is stale.
+    assert response.json()["weeklyCreditPace"] is None
+    overview = await async_client.get("/api/dashboard/overview")
+    assert overview.status_code == 200
+    assert overview.json()["summary"]["secondaryWindow"]["remainingPercent"] == 75.0
+    assert overview.json()["summary"]["secondaryWindow"]["capacityCredits"] is None
 
 
 @pytest.mark.asyncio
@@ -592,21 +633,21 @@ async def test_dashboard_projections_weekly_credit_pace_excludes_inactive_and_st
         accounts_repo = AccountsRepository(session)
         usage_repo = UsageRepository(session)
 
-        await accounts_repo.upsert(_make_account("acc_active_fresh", "fresh@example.com", plan_type="pro"))
+        await accounts_repo.upsert(_make_account("acc_active_fresh", "fresh@example.com", plan_type="enterprise"))
         await accounts_repo.upsert(
             _make_account(
                 "acc_quota_exceeded_fresh",
                 "quota@example.com",
-                plan_type="pro",
+                plan_type="enterprise",
                 status=AccountStatus.QUOTA_EXCEEDED,
             )
         )
-        await accounts_repo.upsert(_make_account("acc_active_stale", "stale@example.com", plan_type="pro"))
+        await accounts_repo.upsert(_make_account("acc_active_stale", "stale@example.com", plan_type="enterprise"))
         await accounts_repo.upsert(
             _make_account(
                 "acc_inactive_fresh",
                 "inactive@example.com",
-                plan_type="pro",
+                plan_type="enterprise",
                 status=AccountStatus.DEACTIVATED,
             )
         )
@@ -614,7 +655,7 @@ async def test_dashboard_projections_weekly_credit_pace_excludes_inactive_and_st
             _make_account(
                 "acc_reauth_fresh",
                 "reauth@example.com",
-                plan_type="pro",
+                plan_type="enterprise",
                 status=AccountStatus.REAUTH_REQUIRED,
             )
         )
@@ -673,6 +714,8 @@ async def test_dashboard_projections_weekly_credit_pace_excludes_inactive_and_st
     assert pace["scheduledUsedPercent"] == pytest.approx(42.857, abs=0.01)
     assert pace["scheduleGapCredits"] == pytest.approx(17_280.0, abs=1.0)
     assert pace["status"] == "ahead"
+    assert pace["proAccountEquivalentToCoverOverPlan"] is None
+    assert pace["proAccountsToCoverOverPlan"] is None
 
 
 @pytest.mark.asyncio
@@ -689,7 +732,7 @@ async def test_dashboard_projections_weekly_credit_pace_forecast_uses_recent_slo
         accounts_repo = AccountsRepository(session)
         usage_repo = UsageRepository(session)
 
-        await accounts_repo.upsert(_make_account("acc_recent_flat", "flat@example.com", plan_type="pro"))
+        await accounts_repo.upsert(_make_account("acc_recent_flat", "flat@example.com", plan_type="enterprise"))
         await usage_repo.add_entry(
             "acc_recent_flat",
             0.0,
@@ -748,7 +791,7 @@ async def test_dashboard_projections_weekly_credit_pace_smooths_displayed_gap(
         accounts_repo = AccountsRepository(session)
         usage_repo = UsageRepository(session)
 
-        await accounts_repo.upsert(_make_account("acc_smoothed", "smoothed@example.com", plan_type="pro"))
+        await accounts_repo.upsert(_make_account("acc_smoothed", "smoothed@example.com", plan_type="enterprise"))
         await usage_repo.add_entry(
             "acc_smoothed",
             0.0,
@@ -797,7 +840,9 @@ async def test_dashboard_projections_weekly_credit_pace_smoothing_resets_with_qu
         accounts_repo = AccountsRepository(session)
         usage_repo = UsageRepository(session)
 
-        await accounts_repo.upsert(_make_account("acc_reset_smooth", "reset-smooth@example.com", plan_type="pro"))
+        await accounts_repo.upsert(
+            _make_account("acc_reset_smooth", "reset-smooth@example.com", plan_type="enterprise")
+        )
         await usage_repo.add_entry(
             "acc_reset_smooth",
             99.0,
@@ -843,7 +888,7 @@ async def test_dashboard_projections_weekly_credit_pace_uses_configured_working_
         accounts_repo = AccountsRepository(session)
         usage_repo = UsageRepository(session)
 
-        await accounts_repo.upsert(_make_account("acc_weekdays", "weekdays@example.com", plan_type="pro"))
+        await accounts_repo.upsert(_make_account("acc_weekdays", "weekdays@example.com", plan_type="enterprise"))
         await usage_repo.add_entry(
             "acc_weekdays",
             80.0,
@@ -883,7 +928,7 @@ async def test_dashboard_projections_weekly_credit_pace_forecast_skips_non_worki
         usage_repo = UsageRepository(session)
 
         await accounts_repo.upsert(
-            _make_account("acc_weekday_forecast", "weekday-forecast@example.com", plan_type="pro")
+            _make_account("acc_weekday_forecast", "weekday-forecast@example.com", plan_type="enterprise")
         )
         await usage_repo.add_entry(
             "acc_weekday_forecast",

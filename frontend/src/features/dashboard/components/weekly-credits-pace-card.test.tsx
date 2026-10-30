@@ -21,7 +21,7 @@ const BASE_PACE: WeeklyCreditPace = {
   paceMultiplier: 50 / 14,
   throttleToPercent: 28,
   reduceByPercent: 72,
-  proAccountEquivalentToCoverOverPlan: 360_000 / 50_400,
+  proAccountEquivalentToCoverOverPlan: 7.1,
   proAccountsToCoverOverPlan: 8,
   projectedDepletionHours: 8,
   projectedMinimumRemainingCredits: 0,
@@ -95,13 +95,28 @@ describe("WeeklyCreditsPaceCard", () => {
         pace={{
           ...BASE_PACE,
           overPlanCredits: 26_750,
-          proAccountEquivalentToCoverOverPlan: 26_750 / 50_400,
+          proAccountEquivalentToCoverOverPlan: 0.53,
           proAccountsToCoverOverPlan: 1,
         }}
       />,
     );
 
     expect(screen.getByText("0.53x Pro weekly pool (~1 account)")).toBeInTheDocument();
+  });
+
+  it("does not infer a Pro-equivalent recommendation when the backend omits it", () => {
+    render(
+      <WeeklyCreditsPaceCard
+        pace={{
+          ...BASE_PACE,
+          proAccountEquivalentToCoverOverPlan: null,
+          proAccountsToCoverOverPlan: null,
+        }}
+      />,
+    );
+
+    expect(screen.getByText("360K credits projected short before reset")).toBeInTheDocument();
+    expect(screen.queryByText(/Pro weekly pool/)).not.toBeInTheDocument();
   });
 
   it("separates a current schedule gap from forecast recommendations", () => {
@@ -132,7 +147,7 @@ describe("WeeklyCreditsPaceCard", () => {
     expect(screen.queryByText("Pause")).not.toBeInTheDocument();
     expect(screen.queryByText("3h to return to schedule")).not.toBeInTheDocument();
     expect(screen.queryByText("Throttle")).not.toBeInTheDocument();
-    expect(screen.getByText("Add capacity")).toBeInTheDocument();
+    expect(screen.queryByText("Add capacity")).not.toBeInTheDocument();
     expect(screen.getByText("3.1K credits over planned usage now")).toBeInTheDocument();
     expect(screen.getByText("No weekly shortfall projected at recent pace")).toBeInTheDocument();
   });

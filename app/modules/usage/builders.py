@@ -250,6 +250,9 @@ def build_usage_summary_response(
     cost_override: UsageCostSummary | None = None,
 ) -> UsageSummaryResponse:
     account_map = {account.id: account for account in accounts}
+    primary_rows = _without_no_data_rows(primary_rows)
+    secondary_rows = _without_no_data_rows(secondary_rows)
+    monthly_rows = _without_no_data_rows(monthly_rows)
     primary_window = usage_core.summarize_usage_window(primary_rows, account_map, "primary")
     secondary_window = usage_core.summarize_usage_window(secondary_rows, account_map, "secondary")
     monthly_window = usage_core.summarize_usage_window(monthly_rows, account_map, "monthly") if monthly_rows else None
@@ -311,6 +314,24 @@ def _build_account_history(
     missing_remaining_percent: float | None,
 ) -> list[UsageHistoryItem]:
     usage_by_account = {row.account_id: row for row in usage_rows}
+    no_data_account_ids = {
+        row.account_id
+        for row in usage_rows
+        if usage_core.is_no_data_window(
+            used_percent=row.used_percent,
+            reset_at=row.reset_at,
+            window_minutes=row.window_minutes,
+        )
+    }
+    usage_by_account = {
+        account_id: row
+        for account_id, row in usage_by_account.items()
+        if not usage_core.is_no_data_window(
+            used_percent=row.used_percent,
+            reset_at=row.reset_at,
+            window_minutes=row.window_minutes,
+        )
+    }
 
     results: list[UsageHistoryItem] = []
     for account_id, account in account_map.items():
@@ -319,20 +340,32 @@ def _build_account_history(
         used_percent_value = float(used_percent) if used_percent is not None else None
         remaining_percent = usage_core.remaining_percent_from_used(used_percent_value)
         if remaining_percent is None:
-            remaining_percent = missing_remaining_percent
+            remaining_percent = None if account_id in no_data_account_ids else missing_remaining_percent
         capacity = usage_core.capacity_for_plan(account.plan_type, window)
         remaining_credits = usage_core.remaining_credits_from_percent(used_percent_value, capacity)
-        if remaining_credits is None and missing_remaining_percent is not None:
+        if remaining_credits is None and missing_remaining_percent is not None and capacity is not None:
             remaining_credits = capacity
         results.append(
             UsageHistoryItem(
                 account_id=account_id,
                 remaining_percent_avg=remaining_percent,
-                capacity_credits=float(capacity or 0.0),
-                remaining_credits=float(remaining_credits or 0.0),
+                capacity_credits=None if capacity is None else float(capacity),
+                remaining_credits=None if remaining_credits is None else float(remaining_credits),
             )
         )
     return results
+
+
+def _without_no_data_rows(rows: list[UsageWindowRow]) -> list[UsageWindowRow]:
+    return [
+        row
+        for row in rows
+        if not usage_core.is_no_data_window(
+            used_percent=row.used_percent,
+            reset_at=row.reset_at,
+            window_minutes=row.window_minutes,
+        )
+    ]
 
 
 def build_usage_metrics_from_aggregate(aggregate: UsageSummaryLogsAggregate | None) -> UsageMetricsSummary:
@@ -438,9 +471,9 @@ def _summary_payload_to_response(payload: UsageSummaryPayload) -> UsageSummaryRe
 
 
 def build_usage_window_summary_model(snapshot: UsageWindowSnapshot) -> UsageWindow:
-    capacity_credits = float(snapshot.capacity_credits)
-    remaining_credits = usage_core.remaining_credits_from_used(snapshot.used_credits, capacity_credits) or 0.0
-    remaining_percent = max(0.0, 100.0 - float(snapshot.used_percent)) if capacity_credits > 0 else 0.0
+    capacity_credits = snapshot.capacity_credits
+    remaining_credits = usage_core.remaining_credits_from_used(snapshot.used_credits, capacity_credits)
+    remaining_percent = None if snapshot.used_percent is None else max(0.0, 100.0 - float(snapshot.used_percent))
     return UsageWindow(
         remaining_percent=remaining_percent,
         capacity_credits=capacity_credits,

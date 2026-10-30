@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from math import ceil, isfinite
+from math import isfinite
 from typing import Literal
 
 from app.core.usage.depletion import EWMAState, ewma_update
@@ -11,7 +11,6 @@ from app.db.models import Account, AccountStatus, UsageHistory
 from app.modules.accounts.schemas import AccountSummary
 from app.modules.dashboard.schemas import WeeklyCreditPaceResponse, WeeklyCreditPaceStatus
 
-PRO_WEEKLY_CAPACITY_CREDITS = 50_400.0
 RECENT_BURN_WINDOW = timedelta(hours=6)
 MIN_FRESHNESS_SECONDS = 300.0
 FRESHNESS_MISSED_REFRESH_CYCLES = 3.0
@@ -89,11 +88,23 @@ def build_weekly_credit_pace(
     forecast_burn_rate_credits_per_hour = 0.0
 
     for summary in account_summaries:
+        account = accounts_by_id.get(summary.account_id)
+        if (
+            account is not None
+            and account.status in PACE_ELIGIBLE_ACCOUNT_STATUSES
+            and summary.window_minutes_secondary is not None
+            and summary.window_minutes_secondary > 0
+            and summary.capacity_credits_secondary is None
+        ):
+            # A known subset cannot establish the complete pool's burn rate or
+            # forecast, even when this account's latest history is stale. The
+            # account is still eligible for the pool, so dropping it would
+            # present a partial known-capacity result as complete.
+            return None
         timing = _weekly_timing(summary, now_ms)
         if timing is None:
             continue
 
-        account = accounts_by_id.get(summary.account_id)
         if account is None or account.status not in PACE_ELIGIBLE_ACCOUNT_STATUSES:
             inactive_account_count += 1
             continue
@@ -178,10 +189,6 @@ def build_weekly_credit_pace(
         else None
     )
     reduce_by_percent = 100.0 - throttle_to_percent if throttle_to_percent is not None else None
-    pro_equivalent = (
-        projected_shortfall_credits / PRO_WEEKLY_CAPACITY_CREDITS if projected_shortfall_credits > 0 else None
-    )
-    pro_accounts = ceil(pro_equivalent) if pro_equivalent is not None else None
 
     return WeeklyCreditPaceResponse(
         total_full_credits=total_full_credits,
@@ -200,8 +207,8 @@ def build_weekly_credit_pace(
         pace_multiplier=pace_multiplier,
         throttle_to_percent=throttle_to_percent,
         reduce_by_percent=reduce_by_percent,
-        pro_account_equivalent_to_cover_over_plan=pro_equivalent,
-        pro_accounts_to_cover_over_plan=pro_accounts,
+        pro_account_equivalent_to_cover_over_plan=None,
+        pro_accounts_to_cover_over_plan=None,
         projected_depletion_hours=projection.projected_depletion_hours,
         projected_minimum_remaining_credits=projection.projected_minimum_remaining_credits,
         forecast_burn_rate_credits_per_hour=forecast_rate,

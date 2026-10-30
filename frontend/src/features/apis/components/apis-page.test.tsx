@@ -149,6 +149,7 @@ describe("ApisPage", () => {
 				createApiKey({
 					pooledRemainingPercentPrimary: 67.5,
 					pooledRemainingPercentSecondary: 85,
+					pooledRemainingPercentMonthly: 42.5,
 					pooledCapacityCreditsPrimary: 225,
 				}),
 			],
@@ -156,6 +157,7 @@ describe("ApisPage", () => {
 
 		expect(screen.getByText("Pooled 5h")).toBeInTheDocument();
 		expect(screen.getByText("Pooled Weekly")).toBeInTheDocument();
+		expect(screen.getByText("Pooled Monthly")).toBeInTheDocument();
 		expect(screen.getByText("API Limit")).toBeInTheDocument();
 	});
 

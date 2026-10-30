@@ -121,6 +121,31 @@ describe("ApiKeyEditDialog", () => {
     expect(onSubmit.mock.calls[0][0].transportPolicyOverride).toBeNull();
   });
 
+  it("round-trips an existing Ultrafast enforced service tier", async () => {
+    const user = userEvent.setup();
+    const onSubmit = vi.fn().mockResolvedValue(undefined);
+    const apiKey = createApiKey({ enforcedServiceTier: "ultrafast" });
+
+    renderWithProviders(
+      <ApiKeyEditDialog
+        open
+        busy={false}
+        apiKey={apiKey}
+        onOpenChange={vi.fn()}
+        onSubmit={onSubmit}
+      />,
+    );
+
+    expect(screen.getByRole("combobox", { name: "Enforced service tier" })).toHaveTextContent("Ultrafast");
+    await user.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() => {
+      expect(onSubmit).toHaveBeenCalledTimes(1);
+    });
+
+    expect(onSubmit.mock.calls[0][0].enforcedServiceTier).toBe("ultrafast");
+  });
+
   it("includes limits when actual limit values change", async () => {
     const user = userEvent.setup();
     const onSubmit = vi.fn().mockResolvedValue(undefined);

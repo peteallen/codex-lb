@@ -17,6 +17,7 @@ import {
   RequestLogsResponseSchema,
   UsageWindowSchema,
 } from "@/features/dashboard/schemas";
+import { createAccountSummary, createDashboardOverview } from "@/test/mocks/factories";
 
 const ISO = "2026-01-01T00:00:00+00:00";
 
@@ -725,6 +726,51 @@ describe("AccountSummarySchema light contract", () => {
 
     expect(parsed.capacityCreditsSecondary).toBe(2000);
     expect(parsed.remainingCreditsSecondary).toBe(900);
+  });
+
+  it("accepts unknown absolute credit quantities while retaining the percentage", () => {
+    const parsed = DashboardOverviewSchema.parse({
+      ...createDashboardOverview(),
+      accounts: [
+        createAccountSummary({
+          planType: "promax",
+          usage: { primaryRemainingPercent: 75, secondaryRemainingPercent: 25 },
+          capacityCreditsPrimary: null,
+          remainingCreditsPrimary: null,
+          capacityCreditsSecondary: null,
+          remainingCreditsSecondary: null,
+        }),
+      ],
+      summary: {
+        ...createDashboardOverview().summary,
+        primaryWindow: {
+          ...createDashboardOverview().summary.primaryWindow,
+          remainingPercent: 75,
+          capacityCredits: null,
+          remainingCredits: null,
+        },
+        secondaryWindow: {
+          ...createDashboardOverview().summary.secondaryWindow!,
+          remainingPercent: 25,
+          capacityCredits: null,
+          remainingCredits: null,
+        },
+      },
+      windows: {
+        primary: {
+          ...createDashboardOverview().windows.primary,
+          accounts: [{ accountId: "acc_1", remainingPercentAvg: 75, capacityCredits: null, remainingCredits: null }],
+        },
+        secondary: {
+          ...createDashboardOverview().windows.secondary!,
+          accounts: [{ accountId: "acc_1", remainingPercentAvg: 25, capacityCredits: null, remainingCredits: null }],
+        },
+      },
+    });
+
+    expect(parsed.summary.secondaryWindow?.remainingPercent).toBe(25);
+    expect(parsed.summary.secondaryWindow?.capacityCredits).toBeNull();
+    expect(parsed.windows.secondary?.accounts[0]?.remainingCredits).toBeNull();
   });
 
   it("does not expose removed legacy fields", () => {

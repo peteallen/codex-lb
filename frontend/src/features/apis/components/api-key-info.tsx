@@ -47,6 +47,7 @@ export function ApiKeyInfo({
 	const models = apiKey.allowedModels?.join(", ") || t("apiKeys.modelSelect.all");
 	const enforcedModel = apiKey.enforcedModel || null;
 	const enforcedEffort = apiKey.enforcedReasoningEffort || null;
+	const enforcedServiceTier = apiKey.enforcedServiceTier || null;
 	const trafficClass = apiKey.trafficClass === "opportunistic" ? t("common.traffic.opportunistic") : t("common.traffic.foreground");
 	const usage = allowUsageSummaryFallback
 		? (usageSummary ?? apiKey.usageSummary)
@@ -81,6 +82,12 @@ export function ApiKeyInfo({
 					<div className="flex items-center justify-between gap-2">
 						<dt className="text-muted-foreground">{t("apiKeys.form.enforcedReasoning")}</dt>
 						<dd className="font-medium">{enforcedEffort}</dd>
+					</div>
+				) : null}
+				{enforcedServiceTier ? (
+					<div className="flex items-center justify-between gap-2">
+						<dt className="text-muted-foreground">{t("apiKeys.form.enforcedServiceTier")}</dt>
+						<dd className="font-medium">{t(`common.serviceTier.${enforcedServiceTier}`)}</dd>
 					</div>
 				) : null}
 				<div className="flex items-center justify-between gap-2">

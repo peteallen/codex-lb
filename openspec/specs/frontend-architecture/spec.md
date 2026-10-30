@@ -232,7 +232,7 @@ The dashboard request logs view SHALL allow operators to filter rows by one or m
 
 ### Requirement: Dashboard weekly credits pace
 
-The dashboard SHALL show weekly quota pace when account weekly capacity credits, remaining credits, reset time, and window length are available. The pace calculation MUST use credit totals rather than averaging per-account percentages, because weekly ChatGPT quota credits are not the same unit as raw request tokens. The dashboard MUST prefer the backend-provided `weeklyCreditPace` object from `GET /api/dashboard/overview` when present, and MAY fall back to a local calculation only for older responses that do not include that field. The dashboard projections payload SHALL expose smoothed weekly pace gap fields for display while preserving instantaneous live usage fields.
+The dashboard SHALL show weekly quota pace when account weekly capacity credits, remaining credits, reset time, and window length are available. If an otherwise eligible fresh weekly account has unknown absolute capacity, the whole-pool credit forecast SHALL be unavailable rather than show a partial capacity total. Pro-subscription purchase equivalents SHALL remain unavailable while Pro absolute allowances are unknown. The pace calculation MUST use credit totals rather than averaging per-account percentages, because weekly ChatGPT quota credits are not the same unit as raw request tokens. The dashboard MUST prefer the backend-provided `weeklyCreditPace` object from `GET /api/dashboard/overview` when present, and MAY fall back to a local calculation only for older responses that do not include that field. The dashboard projections payload SHALL expose smoothed weekly pace gap fields for display while preserving instantaneous live usage fields.
 
 #### Scenario: Weekly credits pace uses account reset deadlines
 
@@ -284,7 +284,7 @@ The dashboard SHALL show weekly quota pace when account weekly capacity credits,
 
 #### Scenario: Missing weekly credit data is omitted
 
-- **WHEN** an account is missing weekly capacity credits, remaining credits, reset time, or window length
+- **WHEN** an account with known capacity is missing remaining credits, reset time, or window length
 - **THEN** that account is omitted from weekly pace calculation
 
 #### Scenario: No valid weekly credit data hides pace

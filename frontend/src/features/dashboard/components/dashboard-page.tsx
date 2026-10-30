@@ -418,8 +418,8 @@ export function DashboardPage() {
               <UsageDonuts
                 primaryItems={view.primaryUsageItems}
                 secondaryItems={view.secondaryUsageItems}
-                primaryTotal={overview?.summary.primaryWindow.capacityCredits ?? 0}
-                secondaryTotal={overview?.summary.secondaryWindow?.capacityCredits ?? 0}
+                primaryTotal={overview?.summary.primaryWindow.capacityCredits ?? null}
+                secondaryTotal={overview?.summary.secondaryWindow?.capacityCredits ?? null}
                 primaryCenterValue={view.primaryTotal}
                 secondaryCenterValue={view.secondaryTotal}
                 safeLinePrimary={view.safeLinePrimary}
@@ -431,8 +431,8 @@ export function DashboardPage() {
             <UsageDonuts
               primaryItems={view.primaryUsageItems}
               secondaryItems={view.secondaryUsageItems}
-              primaryTotal={overview?.summary.primaryWindow.capacityCredits ?? 0}
-              secondaryTotal={overview?.summary.secondaryWindow?.capacityCredits ?? 0}
+              primaryTotal={overview?.summary.primaryWindow.capacityCredits ?? null}
+              secondaryTotal={overview?.summary.secondaryWindow?.capacityCredits ?? null}
               primaryCenterValue={view.primaryTotal}
               secondaryCenterValue={view.secondaryTotal}
               safeLinePrimary={view.safeLinePrimary}

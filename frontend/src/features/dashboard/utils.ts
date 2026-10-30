@@ -32,7 +32,7 @@ export type RemainingItem = {
   labelSuffix: string;
   /** True when the displayed label is the account email (should be blurred in privacy mode). */
   isEmail: boolean;
-  value: number;
+  value: number | null;
   remainingPercent: number | null;
   color: string;
 };
@@ -95,9 +95,9 @@ export type DashboardView = {
   primaryUsageItems: RemainingItem[];
   secondaryUsageItems: RemainingItem[];
   /** Sum of visible primary remaining items shown in the donut center label. */
-  primaryTotal: number;
+  primaryTotal: number | null;
   /** Sum of visible secondary remaining items shown in the donut center label. */
-  secondaryTotal: number;
+  secondaryTotal: number | null;
   requestLogs: RequestLog[];
   safeLinePrimary: SafeLineView | null;
   safeLineSecondary: SafeLineView | null;
@@ -124,8 +124,8 @@ export function buildDepletionView(depletion: Depletion | null | undefined): Saf
   return { safePercent: depletion.safeUsagePercent, riskLevel: depletion.riskLevel };
 }
 
-function buildWindowIndex(window: UsageWindow | null): Map<string, number> {
-  const index = new Map<string, number>();
+function buildWindowIndex(window: UsageWindow | null): Map<string, number | null> {
+  const index = new Map<string, number | null>();
   if (!window) {
     return index;
   }
@@ -175,7 +175,7 @@ export function applySecondaryConstraint(
   return primaryItems.map((item) => {
     const secondaryItem = secondaryByAccount.get(item.accountId);
     if (!secondaryItem) return item;
-    if (secondaryItem.remainingPercent == null) return item;
+    if (secondaryItem.remainingPercent == null || secondaryItem.value == null || item.value == null) return item;
     if (secondaryItem.value >= item.value) return item;
 
     const effectivePercent =
@@ -207,7 +207,7 @@ export function buildRemainingItems(
       if (windowKey === "primary" && isWeeklyOnlyAccount(account)) {
         return null;
       }
-      const remaining = usageIndex.get(account.accountId) ?? 0;
+      const remaining = usageIndex.get(account.accountId) ?? null;
       const rawLabel = account.displayName || account.email || account.accountId;
       const labelIsEmail = !!account.email && rawLabel === account.email;
       const labelSuffix = account.isEmailDuplicate === true
@@ -273,15 +273,22 @@ function buildStatComparison(
 }
 
 const TREND_COLORS = ["#3b82f6", "#8b5cf6", "#10b981", "#ef4444", "#f59e0b"];
-const PRO_WEEKLY_CAPACITY_CREDITS = 50_400;
 
 function trendPointsToValues(points: TrendPoint[]): { value: number }[] {
   return points.map((p) => ({ value: p.v }));
 }
 
 /** Sum the `value` fields of remaining items (clamped to >= 0). */
-export function sumRemaining(items: RemainingItem[]): number {
-  return items.reduce((sum, item) => sum + Math.max(0, item.value), 0);
+export function sumRemaining(items: RemainingItem[]): number | null {
+  if (items.some((item) => item.value === null)) {
+    return null;
+  }
+  return items.reduce((sum, item) => {
+    if (item.value === null) {
+      return sum;
+    }
+    return sum + Math.max(0, item.value);
+  }, 0);
 }
 
 function clamp(value: number, min: number, max: number): number {
@@ -505,6 +512,7 @@ export function buildWeeklyCreditPace(
   let totalActualRemainingCredits = 0;
   let totalExpectedRemainingCredits = 0;
   let accountCount = 0;
+  let hasIncompleteReportedWeeklyUsage = false;
   const weeklyAccounts: WeeklyPoolAccount[] = [];
 
   for (const account of accounts) {
@@ -512,6 +520,16 @@ export function buildWeeklyCreditPace(
     const remainingCredits = account.remainingCreditsSecondary;
     const resetAtMs = account.resetAtSecondary ? Date.parse(account.resetAtSecondary) : Number.NaN;
     const windowMinutes = account.windowMinutesSecondary;
+
+    const hasReportedWeeklyUsage =
+      account.usage?.secondaryRemainingPercent != null || account.resetAtSecondary != null;
+    if (
+      hasReportedWeeklyUsage &&
+      (!isPositiveFinite(fullCredits) || !isNonNegativeFinite(remainingCredits))
+    ) {
+      hasIncompleteReportedWeeklyUsage = true;
+      continue;
+    }
 
     if (
       !isPositiveFinite(fullCredits) ||
@@ -540,7 +558,7 @@ export function buildWeeklyCreditPace(
     });
   }
 
-  if (accountCount === 0 || totalFullCredits <= 0) {
+  if (hasIncompleteReportedWeeklyUsage || accountCount === 0 || totalFullCredits <= 0) {
     return null;
   }
 
@@ -573,11 +591,6 @@ export function buildWeeklyCreditPace(
         )
       : null;
   const reduceByPercent = throttleToPercent != null ? 100 - throttleToPercent : null;
-  const proAccountEquivalentToCoverOverPlan =
-    projectedShortfallCredits > 0 ? projectedShortfallCredits / PRO_WEEKLY_CAPACITY_CREDITS : null;
-  const proAccountsToCoverOverPlan =
-    projectedShortfallCredits > 0 ? Math.ceil(projectedShortfallCredits / PRO_WEEKLY_CAPACITY_CREDITS) : null;
-
   return {
     totalFullCredits,
     totalActualRemainingCredits,
@@ -595,8 +608,8 @@ export function buildWeeklyCreditPace(
     paceMultiplier,
     throttleToPercent,
     reduceByPercent,
-    proAccountEquivalentToCoverOverPlan,
-    proAccountsToCoverOverPlan,
+    proAccountEquivalentToCoverOverPlan: null,
+    proAccountsToCoverOverPlan: null,
     projectedDepletionHours: projection?.projectedDepletionHours ?? null,
     projectedMinimumRemainingCredits: projection?.projectedMinimumRemainingCredits ?? null,
     forecastBurnRateCreditsPerHour: projection ? projection.burnRateCreditsPerMs * 3_600_000 : null,

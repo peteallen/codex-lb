@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from datetime import datetime
 
+from cryptography.fernet import Fernet
+
+from app.core.crypto import TokenEncryptor
 from app.db.models import Account, AccountStatus, UsageHistory
 from app.modules.accounts import mappers
 from app.modules.accounts.mappers import (
@@ -55,6 +58,91 @@ def test_latest_usage_recorded_at_uses_newest_loaded_sample() -> None:
 
     assert _latest_usage_recorded_at(primary, secondary, monthly) == secondary.recorded_at
     assert _latest_usage_recorded_at(None, None, None) is None
+
+
+def test_account_summary_preserves_promax_monthly_usage_with_unknown_credits() -> None:
+    account = _account(AccountStatus.ACTIVE)
+    account.plan_type = "promax"
+    monthly = UsageHistory(
+        account_id=account.id,
+        window="monthly",
+        used_percent=25.0,
+        reset_at=1_900_000_000,
+        window_minutes=43_200,
+        recorded_at=datetime(2026, 1, 1, 12, 0, 0),
+    )
+
+    summary = mappers._account_to_summary(
+        account,
+        None,
+        None,
+        monthly,
+        None,
+        None,
+        None,
+        TokenEncryptor(key=Fernet.generate_key()),
+        include_auth=False,
+    )
+
+    assert summary.usage is not None
+    assert summary.usage.monthly_remaining_percent == 75.0
+    assert summary.reset_at_monthly is not None
+    assert summary.window_minutes_monthly == 43_200
+    assert summary.capacity_credits_monthly is None
+    assert summary.remaining_credits_monthly is None
+
+
+def test_account_summary_omits_primary_no_data_marker() -> None:
+    account = _account(AccountStatus.ACTIVE)
+    account.plan_type = "promax"
+    marker = UsageHistory(
+        account_id=account.id,
+        window="primary",
+        used_percent=0.0,
+        reset_at=None,
+        window_minutes=0,
+        recorded_at=datetime(2026, 1, 1, 12, 0, 0),
+    )
+    secondary = _secondary_usage(used_percent=25.0, reset_at=1_900_000_000)
+
+    summary = mappers._account_to_summary(
+        account,
+        marker,
+        secondary,
+        None,
+        None,
+        None,
+        None,
+        TokenEncryptor(key=Fernet.generate_key()),
+        include_auth=False,
+    )
+
+    assert summary.usage is not None
+    assert summary.usage.primary_remaining_percent is None
+    assert summary.usage.secondary_remaining_percent == 75.0
+    assert summary.window_minutes_primary is None
+
+
+def test_account_summary_preserves_incomplete_measured_primary_usage() -> None:
+    account = _account(AccountStatus.ACTIVE)
+    primary = _primary_usage(used_percent=100.0, reset_at=None, window_minutes=None)
+
+    summary = mappers._account_to_summary(
+        account,
+        primary,
+        None,
+        None,
+        None,
+        None,
+        None,
+        TokenEncryptor(key=Fernet.generate_key()),
+        include_auth=False,
+    )
+
+    assert summary.usage is not None
+    assert summary.usage.primary_remaining_percent == 0.0
+    assert summary.capacity_credits_primary == 225.0
+    assert summary.remaining_credits_primary == 0.0
 
 
 def _account(status: AccountStatus = AccountStatus.QUOTA_EXCEEDED) -> Account:

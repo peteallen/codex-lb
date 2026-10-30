@@ -32,6 +32,12 @@ class ModelPrice:
     priority_long_context_output_per_1m: float | None = None
     priority_long_context_cached_input_per_1m: float | None = None
     cache_write_multiplier: float = 1.0
+    ultrafast_input_per_1m: float | None = None
+    ultrafast_output_per_1m: float | None = None
+    ultrafast_cached_input_per_1m: float | None = None
+    ultrafast_long_context_input_per_1m: float | None = None
+    ultrafast_long_context_output_per_1m: float | None = None
+    ultrafast_long_context_cached_input_per_1m: float | None = None
 
 
 @dataclass(frozen=True)
@@ -101,9 +107,10 @@ def _normalize_usage(usage: UsageTokens | ResponseUsage | None) -> UsageTokens |
     )
 
 
-# Official API token rates verified 2026-09-04:
+# Official API token rates verified 2026-09-29:
 # https://developers.openai.com/api/docs/pricing
 # https://developers.openai.com/api/docs/models/gpt-6-astra
+# https://developers.openai.com/api/docs/models/gpt-6.1-sol
 # Sol promotional rates are published through at least 2026-11-21.
 DEFAULT_PRICING_MODELS: dict[str, ModelPrice] = {
     "gpt-6-astra": ModelPrice(
@@ -127,6 +134,78 @@ DEFAULT_PRICING_MODELS: dict[str, ModelPrice] = {
         long_context_input_per_1m=20.0,
         long_context_cached_input_per_1m=2.0,
         long_context_output_per_1m=75.0,
+        ultrafast_input_per_1m=60.0,
+        ultrafast_cached_input_per_1m=6.0,
+        ultrafast_output_per_1m=300.0,
+        ultrafast_long_context_input_per_1m=120.0,
+        ultrafast_long_context_cached_input_per_1m=12.0,
+        ultrafast_long_context_output_per_1m=450.0,
+    ),
+    "gpt-6.1-sol": ModelPrice(
+        cache_write_multiplier=1.25,
+        input_per_1m=2.0,
+        cached_input_per_1m=0.1,
+        output_per_1m=10.0,
+        priority_input_per_1m=4.0,
+        priority_cached_input_per_1m=0.2,
+        priority_output_per_1m=20.0,
+        priority_long_context_input_per_1m=8.0,
+        priority_long_context_cached_input_per_1m=0.4,
+        priority_long_context_output_per_1m=30.0,
+        flex_input_per_1m=1.0,
+        flex_cached_input_per_1m=0.05,
+        flex_output_per_1m=5.0,
+        flex_long_context_input_per_1m=2.0,
+        flex_long_context_cached_input_per_1m=0.1,
+        flex_long_context_output_per_1m=7.5,
+        long_context_threshold_tokens=272_000,
+        long_context_input_per_1m=4.0,
+        long_context_cached_input_per_1m=0.2,
+        long_context_output_per_1m=15.0,
+    ),
+    "gpt-6-sol": ModelPrice(
+        cache_write_multiplier=1.25,
+        input_per_1m=2.0,
+        cached_input_per_1m=0.2,
+        output_per_1m=10.0,
+        priority_input_per_1m=4.0,
+        priority_cached_input_per_1m=0.4,
+        priority_output_per_1m=20.0,
+        priority_long_context_input_per_1m=8.0,
+        priority_long_context_cached_input_per_1m=0.8,
+        priority_long_context_output_per_1m=30.0,
+        flex_input_per_1m=1.0,
+        flex_cached_input_per_1m=0.1,
+        flex_output_per_1m=5.0,
+        flex_long_context_input_per_1m=2.0,
+        flex_long_context_cached_input_per_1m=0.2,
+        flex_long_context_output_per_1m=7.5,
+        long_context_threshold_tokens=272_000,
+        long_context_input_per_1m=4.0,
+        long_context_cached_input_per_1m=0.4,
+        long_context_output_per_1m=15.0,
+    ),
+    "gpt-6-luna": ModelPrice(
+        cache_write_multiplier=1.25,
+        input_per_1m=0.1,
+        cached_input_per_1m=0.01,
+        output_per_1m=0.5,
+        priority_input_per_1m=0.2,
+        priority_cached_input_per_1m=0.02,
+        priority_output_per_1m=1.0,
+        priority_long_context_input_per_1m=0.4,
+        priority_long_context_cached_input_per_1m=0.04,
+        priority_long_context_output_per_1m=1.5,
+        flex_input_per_1m=0.05,
+        flex_cached_input_per_1m=0.005,
+        flex_output_per_1m=0.25,
+        flex_long_context_input_per_1m=0.1,
+        flex_long_context_cached_input_per_1m=0.01,
+        flex_long_context_output_per_1m=0.375,
+        long_context_threshold_tokens=272_000,
+        long_context_input_per_1m=0.2,
+        long_context_cached_input_per_1m=0.02,
+        long_context_output_per_1m=0.75,
     ),
     "gpt-5.6-sol": ModelPrice(
         cache_write_multiplier=1.25,
@@ -570,6 +649,12 @@ DEFAULT_MODEL_ALIASES: dict[str, str] = {
     "o4-mini-20*": "o4-mini",
     "gpt-5-search-api-20*": "gpt-5-search-api",
     "gpt-6-astra-20*": "gpt-6-astra",
+    "gpt-6.1-sol-20*": "gpt-6.1-sol",
+    "gpt-6-sol-20*": "gpt-6-sol",
+    "gpt-6-luna-20*": "gpt-6-luna",
+    "gpt-6.1-sol-snapshot": "gpt-6.1-sol",
+    "gpt-6-sol-snapshot": "gpt-6-sol",
+    "gpt-6-luna-snapshot": "gpt-6-luna",
     "gpt-daybreak-blue-latest": "gpt-5.6-sol",
     "gpt-daybreak-red-latest": "gpt-5.6-cyber",
     "gpt-5.6": "gpt-5.6-sol",
@@ -663,6 +748,13 @@ def _uses_flex_tier(service_tier: str | None) -> bool:
     return normalized == "flex"
 
 
+def _uses_ultrafast_tier(service_tier: str | None) -> bool:
+    normalized = _normalize_service_tier(service_tier)
+    if normalized is None:
+        return False
+    return normalized == "ultrafast"
+
+
 def _normalize_service_tier(service_tier: str | None) -> str | None:
     if service_tier is None:
         return None
@@ -685,6 +777,30 @@ def _effective_rates(
     input_rate = price.input_per_1m
     cached_rate = price.cached_input_per_1m if price.cached_input_per_1m is not None else input_rate
     output_rate = price.output_per_1m
+
+    if _uses_ultrafast_tier(service_tier):
+        if (
+            is_long_context
+            and price.ultrafast_long_context_input_per_1m is not None
+            and price.ultrafast_long_context_output_per_1m is not None
+        ):
+            ultrafast_long_cached = (
+                price.ultrafast_long_context_cached_input_per_1m
+                if price.ultrafast_long_context_cached_input_per_1m is not None
+                else price.ultrafast_long_context_input_per_1m
+            )
+            return (
+                price.ultrafast_long_context_input_per_1m,
+                ultrafast_long_cached,
+                price.ultrafast_long_context_output_per_1m,
+            )
+        if price.ultrafast_input_per_1m is not None and price.ultrafast_output_per_1m is not None:
+            ultrafast_cached = (
+                price.ultrafast_cached_input_per_1m
+                if price.ultrafast_cached_input_per_1m is not None
+                else price.ultrafast_input_per_1m
+            )
+            return price.ultrafast_input_per_1m, ultrafast_cached, price.ultrafast_output_per_1m
 
     if _uses_priority_tier(service_tier):
         if (

@@ -70,9 +70,9 @@ async def test_build_account_pool_usage_limits_latest_queries_to_assigned_accoun
         ("secondary", assigned_account_ids),
     ]
     assert result is not None
-    # No live primary sample -> the pooled primary percent reads absent.
+    # Missing usage observations do not imply an optimistic available quota.
     assert result.primary is None
-    assert result.secondary == pytest.approx(100.0)
+    assert result.secondary is None
 
 
 @pytest.mark.asyncio

@@ -23,8 +23,6 @@ PLAN_CAPACITY_CREDITS_PRIMARY = {
     "business": 225.0,
     "team": 225.0,
     "edu": 225.0,
-    "pro": 1500.0,
-    "prolite": 1125.0,
     "enterprise": 1500.0,
 }
 
@@ -34,8 +32,6 @@ PLAN_CAPACITY_CREDITS_SECONDARY = {
     "business": 7560.0,
     "team": 7560.0,
     "edu": 7560.0,
-    "pro": 50400.0,
-    "prolite": 37800.0,
     "enterprise": 50400.0,
 }
 
@@ -105,6 +101,21 @@ def _empty_window(
     )
 
 
+def is_no_data_window(
+    *,
+    used_percent: float | None,
+    reset_at: int | None,
+    window_minutes: int | None,
+) -> bool:
+    """Return whether a row is the exact persisted omitted-window marker.
+
+    Rows from older refreshes may have missing timing metadata while still
+    carrying a measured percentage. Only the explicit zero-duration marker
+    written by a complete refresh is authoritative omission evidence.
+    """
+    return used_percent == 0.0 and reset_at is None and window_minutes == 0
+
+
 def used_credits_from_percent(used_percent: float | None, capacity_credits: float | None) -> float | None:
     if used_percent is None or capacity_credits is None:
         return None
@@ -136,9 +147,9 @@ def remaining_credits_from_percent(
 
 def normalize_usage_window(summary: UsageWindowSummary) -> UsageWindowSnapshot:
     return UsageWindowSnapshot(
-        used_percent=float(summary.used_percent or 0.0),
-        capacity_credits=float(summary.capacity_credits),
-        used_credits=float(summary.used_credits),
+        used_percent=None if summary.used_percent is None else float(summary.used_percent),
+        capacity_credits=(None if summary.capacity_credits is None else float(summary.capacity_credits)),
+        used_credits=None if summary.used_credits is None else float(summary.used_credits),
         reset_at=summary.reset_at,
         window_minutes=summary.window_minutes,
     )
@@ -151,31 +162,69 @@ def summarize_usage_window(
 ) -> UsageWindowSummary:
     total_capacity = 0.0
     total_used = 0.0
+    known_capacity = True
+    has_real_rows = False
+    usage_percent_values: list[float] = []
+    has_unknown_capacity_without_percentage = False
     reset_candidates: list[int] = []
     window_minutes_values: set[int] = set()
 
     for row in usage_rows:
+        if is_no_data_window(
+            used_percent=row.used_percent,
+            reset_at=row.reset_at,
+            window_minutes=row.window_minutes,
+        ):
+            continue
+        has_real_rows = True
         if row.reset_at is not None:
             reset_candidates.append(row.reset_at)
         if row.window_minutes is not None and row.window_minutes > 0:
             window_minutes_values.add(row.window_minutes)
         account = account_map.get(row.account_id)
         capacity = capacity_for_plan(account.plan_type if account else None, window)
-        if row.used_percent is None or capacity is None:
+        if capacity is None:
+            known_capacity = False
+            if row.used_percent is not None:
+                usage_percent_values.append(float(row.used_percent))
+            else:
+                # Keep an incomplete unknown-capacity account in the pool's
+                # completeness decision instead of averaging only measured
+                # accounts and presenting that partial result as complete.
+                has_unknown_capacity_without_percentage = True
             continue
+        if row.used_percent is None or capacity <= 0.0:
+            continue
+        usage_percent_values.append(float(row.used_percent))
         total_capacity += capacity
         total_used += (capacity * float(row.used_percent)) / 100.0
+
+    if not has_real_rows:
+        return UsageWindowSummary(
+            used_percent=None,
+            capacity_credits=None,
+            used_credits=None,
+            reset_at=None,
+            window_minutes=None,
+        )
 
     window_minutes = _resolve_window_minutes(window, window_minutes_values)
 
     overall = None
-    if total_capacity > 0:
+    if not known_capacity:
+        if usage_percent_values and not has_unknown_capacity_without_percentage:
+            # Absolute allowances cannot be added safely when even one
+            # candidate is unknown. Equal-account percentage aggregation keeps
+            # every measured account represented without presenting a partial
+            # credit sum as the whole pool.
+            overall = sum(usage_percent_values) / len(usage_percent_values)
+    elif total_capacity > 0:
         overall = (total_used / total_capacity) * 100.0
     reset_at_value = min(reset_candidates) if reset_candidates else None
     return UsageWindowSummary(
         used_percent=float(overall) if overall is not None else None,
-        capacity_credits=float(total_capacity),
-        used_credits=float(total_used),
+        capacity_credits=None if not known_capacity else float(total_capacity),
+        used_credits=None if not known_capacity else float(total_used),
         reset_at=reset_at_value,
         window_minutes=window_minutes,
     )
@@ -274,8 +323,24 @@ def normalize_weekly_only_rows(
     # Some plans (notably free) can report only one weekly window in the
     # primary slot. Re-map those rows into secondary so downstream 5h/7d
     # consumers operate on consistent semantics.
-    primary_by_account = {row.account_id: row for row in primary_rows}
-    normalized_secondary_by_account = {row.account_id: row for row in secondary_rows}
+    primary_by_account = {
+        row.account_id: row
+        for row in primary_rows
+        if not is_no_data_window(
+            used_percent=row.used_percent,
+            reset_at=row.reset_at,
+            window_minutes=row.window_minutes,
+        )
+    }
+    normalized_secondary_by_account = {
+        row.account_id: row
+        for row in secondary_rows
+        if not is_no_data_window(
+            used_percent=row.used_percent,
+            reset_at=row.reset_at,
+            window_minutes=row.window_minutes,
+        )
+    }
 
     normalized_primary: list[UsageWindowRow] = []
 
@@ -298,17 +363,12 @@ def _has_real_quota_metadata(row: UsageWindowRow) -> bool:
 
 
 def _is_no_data_placeholder(row: UsageWindowRow) -> bool:
-    """A no-data placeholder is the absence of a measurement, not 0% used.
-
-    Such rows (no positive window duration AND no reset deadline) are written
-    when upstream omits a window slot entirely. Within the data-aware tiebreak
-    (same-fetch or indeterminate ordering), a placeholder must not displace a
-    row carrying real quota metadata. A newer cross-fetch placeholder can still
-    win via fetch ordering, which is intentional — the cross-fetch winner is
-    rendered per existing placeholder rules.
-    """
-    has_window = row.window_minutes is not None and row.window_minutes > 0
-    return not has_window and row.reset_at is None
+    """Return whether a row is the explicit omitted-window marker."""
+    return is_no_data_window(
+        used_percent=row.used_percent,
+        reset_at=row.reset_at,
+        window_minutes=row.window_minutes,
+    )
 
 
 def _should_prefer_primary_row(primary_row: UsageWindowRow, secondary_row: UsageWindowRow) -> bool:
