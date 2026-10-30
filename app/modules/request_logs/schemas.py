@@ -15,6 +15,7 @@ class RequestLogCostBreakdown(DashboardModel):
 
 
 class RequestLogEntry(DashboardModel):
+    log_id: str
     requested_at: datetime
     conversation_id: str | None = None
     account_id: str | None = None

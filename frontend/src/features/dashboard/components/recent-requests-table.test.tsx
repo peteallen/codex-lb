@@ -3,6 +3,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { useAuthStore } from "@/features/auth/hooks/use-auth";
 import { RecentRequestsTable } from "@/features/dashboard/components/recent-requests-table";
+import { RequestLogSchema } from "@/features/dashboard/schemas";
+import { formatDateTimeLines } from "@/utils/formatters";
+import { useDateDisplayFormatStore } from "@/hooks/use-date-format";
 
 const ISO = "2026-01-01T12:00:00+00:00";
 const NULL_FAILURE_METADATA = {
@@ -78,6 +81,69 @@ describe("RecentRequestsTable", () => {
     }
   });
 
+  it("preserves exact attempt rows and API order when shared request IDs refresh or leave the page", () => {
+    const attempt = (logId: string, requestId: string, accountId: string | null, requestedAt: string) =>
+      RequestLogSchema.parse({
+        logId,
+        requestId,
+        accountId,
+        requestedAt,
+        model: "gpt-6-sol",
+        status: "error",
+        errorCode: "model_not_found",
+        errorMessage: logId,
+        tokens: null,
+        cachedInputTokens: null,
+        reasoningEffort: null,
+        costUsd: null,
+        latencyMs: null,
+      });
+    const initial = [
+      attempt("4", "req-b", "openai5", "2026-09-23T03:37:53.909368Z"),
+      attempt("3", "req-b", "openai6", "2026-09-23T03:37:52.959694Z"),
+      attempt("2", "req-a", "openai5", "2026-09-23T03:37:50.877645Z"),
+      attempt("1", "req-a", "openai6", "2026-09-23T03:37:50.037085Z"),
+    ];
+    const refreshed = [
+      attempt("6", "req-c", "openai5", "2026-09-23T03:38:02.396128Z"),
+      attempt("5", "req-c", "openai6", "2026-09-23T03:38:01.582212Z"),
+      ...initial.slice(0, 2),
+    ];
+    const sameCorrelation = [
+      attempt("8", "req-d", null, ISO),
+      attempt("7", "req-d", null, ISO),
+    ];
+    const table = (requests: typeof initial) => (
+      <RecentRequestsTable {...PAGINATION_PROPS} accounts={[]} requests={requests} total={8} />
+    );
+    const assertRows = (requests: typeof initial) => {
+      const rows = screen.getAllByRole("row").slice(1);
+      expect(rows).toHaveLength(requests.length);
+      rows.forEach((row, index) => {
+        const request = requests[index];
+        const cells = within(row).getAllByRole("cell");
+        const time = formatDateTimeLines(request.requestedAt, useDateDisplayFormatStore.getState().dateDisplayFormat);
+        expect(cells[0]).toHaveTextContent(time.primary);
+        expect(cells[1]).toHaveTextContent(request.accountId ?? "Unassigned");
+        expect(within(row).getByText(request.errorMessage!, { exact: true })).toBeInTheDocument();
+      });
+    };
+    const { rerender } = render(table(initial));
+    assertRows(initial);
+
+    rerender(table(refreshed));
+    assertRows(refreshed);
+
+    rerender(table(initial));
+    assertRows(initial);
+
+    rerender(table(sameCorrelation));
+    assertRows(sameCorrelation);
+
+    rerender(table(sameCorrelation.slice(1)));
+    assertRows(sameCorrelation.slice(1));
+  });
+
   it("renders rows with status badges and supports request details and copy actions", async () => {
     const longError = "Rate limit reached while processing this request ".repeat(3);
     const writeText = vi.fn().mockResolvedValue(undefined);
@@ -112,6 +178,7 @@ describe("RecentRequestsTable", () => {
             planType: "plus",
             apiKeyName: "Key Alpha",
             apiKeyId: "key-alpha",
+            logId: "req-1",
             requestId: "req-1",
             conversationId: null,
             archiveRequestId: "archive-req-1",
@@ -213,6 +280,7 @@ describe("RecentRequestsTable", () => {
             planType: "plus",
             apiKeyName: "Key Speed",
             apiKeyId: "key-speed",
+            logId: "req-speed",
             requestId: "req-speed",
             conversationId: null,
             requestKind: "normal",
@@ -266,6 +334,7 @@ describe("RecentRequestsTable", () => {
             planType: "plus",
             apiKeyName: "Key Speed",
             apiKeyId: "key-speed",
+            logId: "req-toolonly",
             requestId: "req-toolonly",
             conversationId: null,
             requestKind: "normal",
@@ -322,6 +391,7 @@ describe("RecentRequestsTable", () => {
             planType: "plus",
             apiKeyName: "Key Speed",
             apiKeyId: "key-speed",
+            logId: "req-upstream-only",
             requestId: "req-upstream-only",
             conversationId: null,
             requestKind: "normal",
@@ -374,6 +444,7 @@ describe("RecentRequestsTable", () => {
             planType: "plus",
             apiKeyName: "Key Reasoning",
             apiKeyId: "key-reasoning",
+            logId: "req-reasoning",
             requestId: "req-reasoning",
             conversationId: null,
             requestKind: "normal",
@@ -425,6 +496,7 @@ describe("RecentRequestsTable", () => {
             planType: "plus",
             apiKeyName: "Key Reasoning",
             apiKeyId: "key-reasoning",
+            logId: "req-reasoning-only",
             requestId: "req-reasoning-only",
             conversationId: null,
             requestKind: "normal",
@@ -488,6 +560,7 @@ describe("RecentRequestsTable", () => {
             planType: null,
             apiKeyName: null,
             apiKeyId: null,
+            logId: "req-guest",
             requestId: "req-guest",
             archiveRequestId: null,
             conversationId: null,
@@ -546,6 +619,7 @@ describe("RecentRequestsTable", () => {
             planType: null,
             apiKeyName: null,
             apiKeyId: null,
+            logId: "req-normal",
             requestId: "req-normal",
             conversationId: null,
             requestKind: "normal",
@@ -579,6 +653,7 @@ describe("RecentRequestsTable", () => {
             planType: null,
             apiKeyName: null,
             apiKeyId: null,
+            logId: "req-warmup",
             requestId: "req-warmup",
             conversationId: null,
             requestKind: "warmup",
@@ -626,6 +701,7 @@ describe("RecentRequestsTable", () => {
             planType: null,
             apiKeyName: null,
             apiKeyId: null,
+            logId: "req-legacy",
             requestId: "req-legacy",
             conversationId: null,
             requestKind: "normal",
@@ -674,6 +750,7 @@ describe("RecentRequestsTable", () => {
             planType: null,
             apiKeyName: null,
             apiKeyId: null,
+            logId: "req-error-code",
             requestId: "req-error-code",
             conversationId: null,
             requestKind: "normal",
@@ -723,6 +800,7 @@ describe("RecentRequestsTable", () => {
             planType: "plus",
             apiKeyName: "Key Cost",
             apiKeyId: "key-cost",
+            logId: "req-cost",
             requestId: "req-cost",
             conversationId: null,
             requestKind: "normal",
@@ -781,6 +859,7 @@ describe("RecentRequestsTable", () => {
             planType: "plus",
             apiKeyName: "Key Agent",
             apiKeyId: "key-agent",
+            logId: "req-useragent",
             requestId: "req-useragent",
             conversationId: null,
             requestKind: "normal",
@@ -845,6 +924,7 @@ describe("RecentRequestsTable", () => {
             planType: null,
             apiKeyName: null,
             apiKeyId: null,
+            logId: "req-no-useragent",
             requestId: "req-no-useragent",
             conversationId: null,
             requestKind: "normal",
@@ -903,6 +983,7 @@ describe("RecentRequestsTable", () => {
             planType: null,
             apiKeyName: null,
             apiKeyId: null,
+            logId: "req-no-cost",
             requestId: "req-no-cost",
             conversationId: null,
             requestKind: "normal",
@@ -956,6 +1037,7 @@ describe("RecentRequestsTable", () => {
             planType: "plus",
             apiKeyName: "Key Partial",
             apiKeyId: "key-partial",
+            logId: "req-partial-cost",
             requestId: "req-partial-cost",
             conversationId: null,
             requestKind: "normal",
@@ -1014,6 +1096,7 @@ describe("RecentRequestsTable", () => {
             planType: "plus",
             apiKeyName: "Key Partial No Total",
             apiKeyId: "key-partial-no-total",
+            logId: "req-partial-no-total",
             requestId: "req-partial-no-total",
             conversationId: null,
             requestKind: "normal",
@@ -1072,6 +1155,7 @@ describe("RecentRequestsTable", () => {
             planType: "plus",
             apiKeyName: "Key Agent",
             apiKeyId: "key-agent",
+            logId: "req-useragent",
             requestId: "req-useragent",
             conversationId: null,
             requestKind: "normal",
@@ -1134,6 +1218,7 @@ describe("RecentRequestsTable", () => {
             planType: null,
             apiKeyName: null,
             apiKeyId: null,
+            logId: "req-no-useragent",
             requestId: "req-no-useragent",
             conversationId: null,
             requestKind: "normal",
@@ -1192,6 +1277,7 @@ describe("RecentRequestsTable", () => {
             planType: "plus",
             apiKeyName: "Key Total Only",
             apiKeyId: "key-total-only",
+            logId: "req-total-only-cost",
             requestId: "req-total-only-cost",
             conversationId: null,
             requestKind: "normal",
@@ -1249,6 +1335,7 @@ describe("RecentRequestsTable", () => {
             planType: "plus",
             apiKeyName: "Key Conv",
             apiKeyId: "key-conv",
+            logId: "req-conv-click",
             requestId: "req-conv-click",
             requestKind: "normal",
             model: "gpt-5.1",
@@ -1304,6 +1391,7 @@ describe("RecentRequestsTable", () => {
             planType: "plus",
             apiKeyName: "Key Text",
             apiKeyId: "key-text",
+            logId: "req-conv-text",
             requestId: "req-conv-text",
             requestKind: "normal",
             model: "gpt-5.1",
@@ -1362,6 +1450,7 @@ describe("RecentRequestsTable", () => {
             planType: "plus",
             apiKeyName: "Key Long",
             apiKeyId: "key-long",
+            logId: "req-long-cid",
             requestId: "req-long-cid",
             requestKind: "normal",
             model: "gpt-5.1",
@@ -1415,6 +1504,7 @@ describe("RecentRequestsTable", () => {
             planType: "plus",
             apiKeyName: "Key Long NH",
             apiKeyId: "key-long-nh",
+            logId: "req-long-cid-nh",
             requestId: "req-long-cid-nh",
             requestKind: "normal",
             model: "gpt-5.1",

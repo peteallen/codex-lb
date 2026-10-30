@@ -367,6 +367,7 @@ export function createRequestLogEntry(
 	overrides: Partial<RequestLogEntry> = {},
 ): RequestLogEntry {
 	return RequestLogSchema.parse({
+		logId: "log_1",
 		requestedAt: offsetIso(-1),
 		accountId: "acc_primary",
 		apiKeyId: "key_1",
@@ -407,6 +408,7 @@ export function createDefaultRequestLogs(): RequestLogEntry[] {
 	return [
 		createRequestLogEntry(),
 		createRequestLogEntry({
+			logId: "log_2",
 			requestId: "req_2",
 			accountId: "acc_secondary",
 			apiKeyId: "key_2",
@@ -420,6 +422,7 @@ export function createDefaultRequestLogs(): RequestLogEntry[] {
 			requestedAt: offsetIso(-2),
 		}),
 		createRequestLogEntry({
+			logId: "log_3",
 			requestId: "req_3",
 			apiKeyId: null,
 			apiKeyName: null,

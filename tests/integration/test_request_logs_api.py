@@ -137,6 +137,67 @@ async def test_request_logs_api_returns_recent(async_client, db_setup):
 
 
 @pytest.mark.asyncio
+async def test_request_logs_api_returns_stable_log_ids_for_duplicate_attempts(async_client, db_setup):
+    async with SessionLocal() as session:
+        accounts_repo = AccountsRepository(session)
+        logs_repo = RequestLogsRepository(session)
+        await accounts_repo.upsert(_make_account("acc_duplicate_attempts", "duplicate@example.com"))
+
+        requested_at = utcnow()
+        first = await logs_repo.add_log(
+            account_id="acc_duplicate_attempts",
+            request_id="req_duplicate_attempts",
+            model="gpt-6-sol",
+            input_tokens=10,
+            output_tokens=1,
+            latency_ms=100,
+            status="error",
+            error_code="model_not_found",
+            requested_at=requested_at,
+        )
+        second = await logs_repo.add_log(
+            account_id="acc_duplicate_attempts",
+            request_id="req_duplicate_attempts",
+            model="gpt-6-sol",
+            input_tokens=20,
+            output_tokens=2,
+            latency_ms=200,
+            status="error",
+            error_code="model_not_found",
+            requested_at=requested_at,
+        )
+
+    page = await async_client.get("/api/request-logs?limit=2")
+    assert page.status_code == 200
+    entries = page.json()["requests"]
+    assert [entry["logId"] for entry in entries] == [str(second.id), str(first.id)]
+    assert len({entry["logId"] for entry in entries}) == 2
+    assert [entry["requestId"] for entry in entries] == [
+        "req_duplicate_attempts",
+        "req_duplicate_attempts",
+    ]
+    assert [entry["accountId"] for entry in entries] == [
+        "acc_duplicate_attempts",
+        "acc_duplicate_attempts",
+    ]
+    assert entries[0]["requestedAt"] == entries[1]["requestedAt"]
+
+    repeated = await async_client.get("/api/request-logs?limit=2")
+    assert repeated.status_code == 200
+    assert [entry["logId"] for entry in repeated.json()["requests"]] == [
+        str(second.id),
+        str(first.id),
+    ]
+
+    first_page = await async_client.get("/api/request-logs?limit=1&offset=0")
+    second_page = await async_client.get("/api/request-logs?limit=1&offset=1")
+    assert first_page.status_code == 200
+    assert second_page.status_code == 200
+    assert first_page.json()["requests"][0]["logId"] == str(second.id)
+    assert second_page.json()["requests"][0]["logId"] == str(first.id)
+
+
+@pytest.mark.asyncio
 async def test_request_logs_api_returns_model_source_metadata(async_client, db_setup):
     del db_setup
     async with SessionLocal() as session:
