@@ -350,7 +350,8 @@ class Settings(BaseSettings):
     # ``images_default_model`` is the public model returned to clients when
     # they omit ``model``; it must remain in the ``gpt-image-*`` family. The
     # internal Responses host model used to invoke the ``image_generation``
-    # tool is a fixed constant in ``app/modules/proxy/api.py``.
+    # tool is selected from the live model registry by
+    # ``app.core.openai.host_models``.
     images_default_model: str = "gpt-image-2"
     # NOTE: there is intentionally no ``images_max_n`` setting. The
     # upstream ``image_generation`` tool path accepts only a single
