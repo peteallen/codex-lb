@@ -22,7 +22,6 @@ import { OverviewTimeframeSelect } from "@/features/dashboard/components/filters
 import { RequestFilters } from "@/features/dashboard/components/filters/request-filters";
 import { RecentRequestsTable } from "@/features/dashboard/components/recent-requests-table";
 import { StatsGrid } from "@/features/dashboard/components/stats-grid";
-import { UsageDonuts } from "@/features/dashboard/components/usage-donuts";
 import { WeeklyCreditsPaceCard } from "@/features/dashboard/components/weekly-credits-pace-card";
 import { useAuthStore } from "@/features/auth/hooks/use-auth";
 import { useDashboard, useDashboardProjections } from "@/features/dashboard/hooks/use-dashboard";
@@ -413,32 +412,7 @@ export function DashboardPage() {
           <>
             <StatsGrid stats={view.stats} />
 
-          {view.weeklyCreditPace ? (
-            <div className="grid gap-4 xl:grid-cols-[minmax(0,2fr)_minmax(18rem,1fr)]">
-              <UsageDonuts
-                primaryItems={view.primaryUsageItems}
-                secondaryItems={view.secondaryUsageItems}
-                primaryTotal={overview?.summary.primaryWindow.capacityCredits ?? null}
-                secondaryTotal={overview?.summary.secondaryWindow?.capacityCredits ?? null}
-                primaryCenterValue={view.primaryTotal}
-                secondaryCenterValue={view.secondaryTotal}
-                safeLinePrimary={view.safeLinePrimary}
-                safeLineSecondary={view.safeLineSecondary}
-              />
-              <WeeklyCreditsPaceCard pace={view.weeklyCreditPace} />
-            </div>
-          ) : (
-            <UsageDonuts
-              primaryItems={view.primaryUsageItems}
-              secondaryItems={view.secondaryUsageItems}
-              primaryTotal={overview?.summary.primaryWindow.capacityCredits ?? null}
-              secondaryTotal={overview?.summary.secondaryWindow?.capacityCredits ?? null}
-              primaryCenterValue={view.primaryTotal}
-              secondaryCenterValue={view.secondaryTotal}
-              safeLinePrimary={view.safeLinePrimary}
-              safeLineSecondary={view.safeLineSecondary}
-            />
-          )}
+          {view.weeklyCreditPace ? <WeeklyCreditsPaceCard pace={view.weeklyCreditPace} /> : null}
 
           <section className="space-y-4">
             <div className="flex flex-wrap items-center gap-3">

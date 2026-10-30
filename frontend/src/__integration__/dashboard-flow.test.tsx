@@ -241,8 +241,9 @@ describe("dashboard flow integration", () => {
       expect(screen.getByText("Requests (7d)")).toBeInTheDocument();
       expect(screen.getByText("424.24K")).toBeInTheDocument();
       expect(screen.queryByText("Account burn projection (5h/7d)")).not.toBeInTheDocument();
-      expect(screen.getByRole("heading", { name: "5-Hour Credits" })).toBeInTheDocument();
-      expect(screen.getByText("6,055")).toBeInTheDocument();
+      expect(screen.queryByRole("heading", { name: "5-Hour Credits" })).not.toBeInTheDocument();
+      expect(screen.queryByRole("heading", { name: "Weekly Credits" })).not.toBeInTheDocument();
+      expect(screen.getByRole("heading", { name: "Accounts" })).toBeInTheDocument();
       expect(
         screen.getByRole("button", { name: "Enable limit warm-up for Healthy Overview Account" }),
       ).toBeInTheDocument();
