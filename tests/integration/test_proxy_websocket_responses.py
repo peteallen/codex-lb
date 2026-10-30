@@ -28,6 +28,7 @@ from app.core.clients.proxy_websocket import (
     UPSTREAM_WEBSOCKET_LIVENESS_TIMEOUT_CODE,
     WebsocketsUpstreamWebSocket,
 )
+from app.core.errors import OpenAIErrorDetail, OpenAIErrorEnvelope
 from app.core.utils.request_id import get_request_id
 from app.core.utils.sse import format_sse_event
 from app.db.models import Account, AccountStatus, ApiKeyUsageReservation, RequestLog
@@ -12894,3 +12895,62 @@ def test_backend_responses_websocket_trusted_capability_pending_conflict_keeps_o
         "acct_ws_capability_conflict_ordinary_1",
         "acct_ws_capability_conflict_cyber_1",
     ]
+
+
+@pytest.mark.parametrize(
+    ("code", "status"),
+    [(None, 403), ("upstream_error", 403), ("unknown_denial", 403), ("token_revoked", 401), ("token_revoked", 500)],
+)
+def test_backend_responses_websocket_auth_denial_does_not_fail_over(app_instance, monkeypatch, code, status):
+    account = SimpleNamespace(id="acct_ws_denied")
+    connect_accounts: list[str] = []
+    error: OpenAIErrorDetail = {"message": "Access denied"}
+    if code is not None:
+        error["code"] = code
+    error_payload: OpenAIErrorEnvelope = {"error": error}
+
+    class FakeSettingsCache:
+        async def get(self):
+            return _websocket_settings()
+
+    async def allow_firewall(_websocket):
+        return None
+
+    async def allow_proxy_api_key(_authorization, **kwargs):
+        return None
+
+    async def select_account(self, deadline, **kwargs):
+        return account
+
+    async def open_attempt(self, account, headers, **kwargs):
+        connect_accounts.append(account.id)
+        raise proxy_module.ProxyResponseError(status, error_payload)
+
+    monkeypatch.setattr(proxy_api_module, "_websocket_firewall_denial_response", allow_firewall)
+    monkeypatch.setattr(proxy_api_module, "validate_proxy_api_key_authorization", allow_proxy_api_key)
+    monkeypatch.setattr(proxy_module, "get_settings_cache", lambda: FakeSettingsCache())
+    monkeypatch.setattr(proxy_module.ProxyService, "_select_websocket_connect_account", select_account)
+    monkeypatch.setattr(proxy_module.ProxyService, "_try_open_websocket_connect_attempt", open_attempt)
+    monkeypatch.setattr(proxy_module.LoadBalancer, "record_error", AsyncMock())
+    mark_permanent = AsyncMock()
+    monkeypatch.setattr(proxy_module.LoadBalancer, "mark_permanent_failure", mark_permanent)
+
+    with TestClient(app_instance) as client:
+        with client.websocket_connect("/backend-api/codex/responses") as websocket:
+            websocket.send_json(
+                {
+                    "type": "response.create",
+                    "model": "gpt-5.4",
+                    "instructions": "",
+                    "input": [],
+                }
+            )
+            event = json.loads(websocket.receive_text())
+
+    assert connect_accounts == [account.id]
+    assert event["type"] == "error"
+    assert event["error"]["message"] == "Access denied"
+    if code == "token_revoked":
+        mark_permanent.assert_awaited_once_with(account, code)
+    else:
+        mark_permanent.assert_not_awaited()

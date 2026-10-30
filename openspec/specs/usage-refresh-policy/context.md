@@ -143,3 +143,9 @@ Non-working days do not add projected burn, but they remain part of the
 operator-visible elapsed depletion time. An empty working-day set intentionally
 preserves the earlier all-days behavior, so this fork customization adds no
 required configuration or migration.
+
+## Authorization evidence and server-directed waits
+
+Bare usage HTTP 402/404 can reflect payment or endpoint failures without proving account termination. They leave the local account status unchanged; explicit account deactivation codes/messages remain authoritative. Explicit token/session revocation requires reauthentication and uses the existing guarded credential failure path. Historical deactivated slots are not automatically repaired by this change.
+
+Both usage transports, including reset-credit consumption, observe numeric and HTTP-date Retry-After as a minimum wait, with the existing exponential delay as fallback. A final usage error carries its remaining wait to the process-local refresh cooldown so a scheduler tick cannot immediately start a new attempt series. For example, a 503 with Retry-After: 60 postpones both a client retry and, if attempts are exhausted, the next polling cycle. Waits remain cancellable and the existing retry count remains bounded. Cooldowns do not persist across service restarts or coordinate replicas.

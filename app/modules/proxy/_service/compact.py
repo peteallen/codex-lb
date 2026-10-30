@@ -51,7 +51,12 @@ from app.modules.proxy.affinity import (
 )
 from app.modules.proxy.api_key_usage import estimate_api_key_request_usage
 from app.modules.proxy.continuity import resolve_required_account_id
-from app.modules.proxy.helpers import _header_account_id, _normalize_error_code, _parse_openai_error
+from app.modules.proxy.helpers import (
+    _header_account_id,
+    _normalize_error_code,
+    _parse_openai_error,
+    is_terminal_authorization_denial,
+)
 from app.modules.proxy.load_balancer import (
     AccountConcurrencyCaps,
     AccountLease,
@@ -1148,7 +1153,16 @@ class _CompactMixin:
                                 upstream_error_code=_proxy_response_error_code(exc),
                             )
                             raise compact_continuity_error from exc
-                        if exc.status_code == 401:
+                        if is_terminal_authorization_denial(exc):
+                            await proxy._settle_compact_api_key_usage(
+                                api_key=api_key,
+                                api_key_reservation=api_key_reservation,
+                                response=None,
+                                request_service_tier=request_service_tier,
+                            )
+                            await proxy._handle_proxy_error(account, exc)
+                            raise
+                        if exc.is_refreshable_auth_error:
                             if refresh_retry_used:
                                 try:
                                     await proxy._handle_proxy_error(account, exc)
@@ -1316,7 +1330,7 @@ class _CompactMixin:
                                 break
                             refresh_retry_used = True
                             continue
-                        if exc.status_code == 500:
+                        if exc.status_code == 500 and not exc.is_terminal_auth_error:
                             transient_retries += 1
                             if (
                                 transient_retries < _max_transient_same_account_retries()

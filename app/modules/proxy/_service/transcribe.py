@@ -293,7 +293,7 @@ class _TranscribeMixin:
                     ),
                 ) from refresh_exc
             except ProxyResponseError as exc:
-                if exc.status_code != 401:
+                if not exc.is_refreshable_auth_error:
                     failover = await proxy._retry_previsible_unary_call_failover(
                         exc,
                         account,
@@ -356,7 +356,7 @@ class _TranscribeMixin:
                     return result
                 except ProxyResponseError as retry_exc:
                     await proxy._handle_proxy_error(account, retry_exc)
-                    if retry_exc.status_code == 401:
+                    if retry_exc.is_refreshable_auth_error:
                         selection = await proxy._select_account_with_budget_compatible(
                             deadline,
                             request_id=request_id,

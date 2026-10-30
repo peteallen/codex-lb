@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Literal
+from typing import Literal, Mapping
 
 import aiohttp
 from aiohttp_retry import ExponentialRetry, RetryClient
@@ -21,6 +21,7 @@ from app.core.types import JsonObject
 from app.core.upstream_proxy import ResolvedUpstreamRoute
 from app.core.usage.models import UsagePayload
 from app.core.utils.request_id import get_request_id
+from app.core.utils.retry import parse_retry_after_header
 
 RETRYABLE_STATUS = {408, 429, 500, 502, 503, 504}
 RETRY_START_TIMEOUT = 0.5
@@ -46,11 +47,14 @@ class UsageErrorEnvelope(BaseModel):
 
 
 class UsageFetchError(Exception):
-    def __init__(self, status_code: int, message: str, code: str | None = None) -> None:
+    def __init__(
+        self, status_code: int, message: str, code: str | None = None, *, retry_after_seconds: float | None = None
+    ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.message = message
         self.code = code
+        self.retry_after_seconds = retry_after_seconds
 
 
 class ConsumeRateLimitResetCreditResponse(BaseModel):
@@ -104,25 +108,9 @@ async def fetch_usage(
                 retry_options=retry_options,
             ) as resp:
                 data = await _safe_json(resp)
-                if resp.status >= 400:
-                    code = _extract_error_code(data)
-                    message = _extract_error_message(data) or f"Usage fetch failed ({resp.status})"
-                    logger.warning(
-                        "Usage fetch failed request_id=%s status=%s code=%s message=%s",
-                        get_request_id(),
-                        resp.status,
-                        code,
-                        message,
-                    )
-                    raise UsageFetchError(resp.status, message, code=code)
-                try:
-                    return UsagePayload.model_validate(data)
-                except ValidationError as exc:
-                    logger.warning(
-                        "Usage fetch invalid payload request_id=%s",
-                        get_request_id(),
-                    )
-                    raise UsageFetchError(502, "Invalid usage payload") from exc
+                return _usage_payload_or_raise(
+                    data, resp.status, retry_after_seconds=_response_retry_after(resp.headers)
+                )
     except (aiohttp.ClientError, asyncio.TimeoutError, CodexTransportError) as exc:
         logger.warning(
             "Usage fetch error request_id=%s error=%s",
@@ -180,7 +168,9 @@ async def consume_rate_limit_reset_credit(
                 retry_options=retry_options,
             ) as resp:
                 data = await _safe_json(resp)
-                return _consume_rate_limit_reset_response_or_raise(data, resp.status)
+                return _consume_rate_limit_reset_response_or_raise(
+                    data, resp.status, retry_after_seconds=_response_retry_after(resp.headers)
+                )
     except (aiohttp.ClientError, asyncio.TimeoutError, CodexTransportError) as exc:
         logger.warning(
             "Usage limit reset consume error request_id=%s error=%s",
@@ -221,9 +211,9 @@ async def _fetch_usage_via_codex(
             data = await _safe_codex_json(resp)
             status = _codex_response_status(resp)
             if status in RETRYABLE_STATUS and attempt < attempts - 1:
-                await asyncio.sleep(_retry_delay_seconds(attempt))
+                await asyncio.sleep(_retry_delay_seconds(attempt, _response_retry_after(resp.headers)))
                 continue
-            return _usage_payload_or_raise(data, status)
+            return _usage_payload_or_raise(data, status, retry_after_seconds=_response_retry_after(resp.headers))
     finally:
         if owns_codex_client:
             close = getattr(active_codex_client, "close", None)
@@ -265,9 +255,11 @@ async def _consume_rate_limit_reset_via_codex(
             data = await _safe_codex_json(resp)
             status = _codex_response_status(resp)
             if status in RETRYABLE_STATUS and attempt < attempts - 1:
-                await asyncio.sleep(_retry_delay_seconds(attempt))
+                await asyncio.sleep(_retry_delay_seconds(attempt, _response_retry_after(resp.headers)))
                 continue
-            return _consume_rate_limit_reset_response_or_raise(data, status)
+            return _consume_rate_limit_reset_response_or_raise(
+                data, status, retry_after_seconds=_response_retry_after(resp.headers)
+            )
     finally:
         if owns_codex_client:
             close = getattr(active_codex_client, "close", None)
@@ -276,7 +268,7 @@ async def _consume_rate_limit_reset_via_codex(
     raise RuntimeError("unreachable usage limit reset retry state")
 
 
-def _usage_payload_or_raise(data: JsonObject, status: int) -> UsagePayload:
+def _usage_payload_or_raise(data: JsonObject, status: int, *, retry_after_seconds: float | None = None) -> UsagePayload:
     if status >= 400:
         code = _extract_error_code(data)
         message = _extract_error_message(data) or f"Usage fetch failed ({status})"
@@ -287,7 +279,7 @@ def _usage_payload_or_raise(data: JsonObject, status: int) -> UsagePayload:
             code,
             message,
         )
-        raise UsageFetchError(status, message, code=code)
+        raise UsageFetchError(status, message, code=code, retry_after_seconds=retry_after_seconds)
     try:
         return UsagePayload.model_validate(data)
     except ValidationError as exc:
@@ -301,6 +293,8 @@ def _usage_payload_or_raise(data: JsonObject, status: int) -> UsagePayload:
 def _consume_rate_limit_reset_response_or_raise(
     data: JsonObject,
     status: int,
+    *,
+    retry_after_seconds: float | None = None,
 ) -> ConsumeRateLimitResetCreditResponse:
     if status >= 400:
         code = _extract_error_code(data)
@@ -312,7 +306,7 @@ def _consume_rate_limit_reset_response_or_raise(
             code,
             message,
         )
-        raise UsageFetchError(status, message, code=code)
+        raise UsageFetchError(status, message, code=code, retry_after_seconds=retry_after_seconds)
     try:
         return ConsumeRateLimitResetCreditResponse.model_validate(data)
     except ValidationError as exc:
@@ -394,8 +388,15 @@ def _extract_error_code(payload: JsonObject) -> str | None:
     return None
 
 
+class _UsageRetry(ExponentialRetry):
+    def get_timeout(self, attempt: int, response: aiohttp.ClientResponse | None = None) -> float:
+        backoff = super().get_timeout(attempt, response)
+        server_delay = _response_retry_after(response.headers) if response is not None else None
+        return max(backoff, server_delay) if server_delay is not None else backoff
+
+
 def _retry_options(attempts: int) -> ExponentialRetry:
-    return ExponentialRetry(
+    return _UsageRetry(
         attempts=attempts,
         start_timeout=RETRY_START_TIMEOUT,
         max_timeout=RETRY_MAX_TIMEOUT,
@@ -406,5 +407,11 @@ def _retry_options(attempts: int) -> ExponentialRetry:
     )
 
 
-def _retry_delay_seconds(attempt: int) -> float:
-    return min(RETRY_MAX_TIMEOUT, RETRY_START_TIMEOUT * (2.0**attempt))
+def _response_retry_after(headers: Mapping[str, str]) -> float | None:
+    value = next((value for key, value in headers.items() if key.lower() == "retry-after"), None)
+    return parse_retry_after_header(value)
+
+
+def _retry_delay_seconds(attempt: int, server_delay: float | None = None) -> float:
+    backoff = min(RETRY_MAX_TIMEOUT, RETRY_START_TIMEOUT * (2.0**attempt))
+    return max(backoff, server_delay) if server_delay is not None else backoff

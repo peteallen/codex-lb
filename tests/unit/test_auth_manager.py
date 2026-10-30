@@ -2727,6 +2727,9 @@ async def test_claim_release_error_does_not_mask_refresh_body_error(monkeypatch)
             "app_session_terminated",
             "Your session has been terminated. Please sign in again.",
         ),
+        ("token_revoked", "Authentication token revoked"),
+        ("session_revoked", "Session revoked"),
+        ("authentication_token_revoked", "Authentication token revoked"),
     ],
 )
 @pytest.mark.asyncio

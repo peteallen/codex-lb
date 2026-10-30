@@ -1127,7 +1127,7 @@ class ProxyService(
                     ),
                 ) from refresh_exc
             except ProxyResponseError as exc:
-                if exc.status_code != 401:
+                if not exc.is_refreshable_auth_error:
                     failover = await self._retry_previsible_unary_call_failover(
                         exc,
                         account,
@@ -1140,7 +1140,7 @@ class ProxyService(
                         account_id_value = account.id
                         log_status = "success"
                         return response
-                if exc.status_code == 401:
+                if exc.is_refreshable_auth_error:
                     try:
                         remaining_budget = _remaining_budget_seconds(deadline)
                         if remaining_budget <= 0:
@@ -1174,7 +1174,7 @@ class ProxyService(
                             return response
                         except ProxyResponseError as retry_exc:
                             await self._handle_proxy_error(account, retry_exc)
-                            if retry_exc.status_code == 401:
+                            if retry_exc.is_refreshable_auth_error:
                                 selection = await self._select_account_with_budget_compatible(
                                     deadline,
                                     request_id=request_id,
@@ -1614,7 +1614,7 @@ class ProxyService(
         except ProxyResponseError as failover_exc:
             failover_failed_account = _proxy_response_failed_account(failover_exc, selection.account)
             setattr(failover_exc, _FAILED_ACCOUNT_ATTR, failover_failed_account)
-            if failover_exc.status_code != 401:
+            if not failover_exc.is_refreshable_auth_error:
                 await _handle_proxy_error(failover_failed_account, failover_exc)
             raise
         try:
@@ -1622,7 +1622,7 @@ class ProxyService(
         except ProxyResponseError as failover_exc:
             failover_failed_account = _proxy_response_failed_account(failover_exc, next_account)
             setattr(failover_exc, _FAILED_ACCOUNT_ATTR, failover_failed_account)
-            if failover_exc.status_code == 401:
+            if failover_exc.is_refreshable_auth_error:
                 remaining_budget = _remaining_budget_seconds(deadline)
                 if remaining_budget <= 0:
                     _raise_proxy_budget_exhausted()
@@ -1631,7 +1631,7 @@ class ProxyService(
                 except ProxyResponseError as refresh_exc:
                     refresh_failed_account = _proxy_response_failed_account(refresh_exc, next_account)
                     setattr(refresh_exc, _FAILED_ACCOUNT_ATTR, refresh_failed_account)
-                    if refresh_exc.status_code != 401:
+                    if not refresh_exc.is_refreshable_auth_error:
                         await _handle_proxy_error(refresh_failed_account, refresh_exc)
                     raise
                 try:

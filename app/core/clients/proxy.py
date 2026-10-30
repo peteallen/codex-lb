@@ -38,6 +38,7 @@ from aiohttp.client_ws import DEFAULT_WS_CLIENT_TIMEOUT, WebSocketDataQueue
 from aiohttp.http_websocket import WS_KEY, WebSocketReader, WebSocketWriter
 from multidict import CIMultiDict
 
+from app.core.balancer import PERMANENT_FAILURE_CODES
 from app.core.clients.codex import (
     CodexClient,
     CodexTransportError,
@@ -490,6 +491,19 @@ class ProxyResponseError(Exception):
         self.upstream_error_code = upstream_error_code
         self.failed_session = failed_session
         self.retry_after_seconds = retry_after_seconds
+
+    @property
+    def is_terminal_auth_error(self) -> bool:
+        error = self.payload.get("error")
+        code = error.get("code") if isinstance(error, dict) else None
+        normalized_code = code.strip().lower() if isinstance(code, str) else None
+        # An expired access token may still have a usable refresh token. The
+        # same code at the OAuth refresh boundary remains a permanent failure.
+        return normalized_code in PERMANENT_FAILURE_CODES and normalized_code != "token_expired"
+
+    @property
+    def is_refreshable_auth_error(self) -> bool:
+        return self.status_code == 401 and not self.is_terminal_auth_error
 
 
 def is_confirmed_pre_dispatch_transport_error(exc: ProxyResponseError) -> bool:
