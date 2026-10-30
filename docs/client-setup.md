@@ -2,9 +2,9 @@
 
 Point any OpenAI-compatible client at codex-lb. If [API key auth](api-keys.md) is enabled, pass a key from the dashboard as a Bearer token.
 
-Model availability is discovered from the upstream Codex model catalog and can vary by account plan, workspace, rollout, and upstream deprecation state. Prefer the live `GET /v1/models` or `GET /backend-api/codex/models` response over a copied static table when configuring clients or API-key model allowlists.
+Model availability is discovered from the upstream Codex model catalog and can vary by account plan, workspace, rollout, and upstream deprecation state. The current catalog includes `gpt-6.1-sol`, `gpt-6-astra`, `gpt-6-sol`, `gpt-6-luna`, and the GPT-5.6 family. Prefer the live `GET /v1/models` or `GET /backend-api/codex/models` response over a copied static table when configuring clients or API-key model allowlists.
 
-The examples below use the current frontier lineup: **`gpt-5.6-sol`** (strongest), **`gpt-5.6-terra`** (balanced), and **`gpt-5.6-luna`** (fast) — all 372k context. `gpt-5.5` and `gpt-5.4` are still served for older pinned clients; retired slugs such as `gpt-5.3-codex`, `gpt-5.3-codex-spark`, and `gpt-5.1-codex-mini` were dropped from the upstream bundled catalog and should no longer be used in new configs.
+The examples below use **`gpt-6.1-sol`**, **`gpt-6-sol`**, and **`gpt-6-luna`**. `gpt-6-astra` and the GPT-5.6 family remain available when their higher reasoning or speed characteristics are a better fit. `gpt-5.5` and `gpt-5.4` are still served for older pinned clients; retired slugs such as `gpt-5.3-codex`, `gpt-5.3-codex-spark`, and `gpt-5.1-codex-mini` were dropped from the upstream bundled catalog and should no longer be used in new configs.
 
 | Client | Endpoint | Config |
 |--------|----------|--------|
@@ -19,17 +19,28 @@ The examples below use the current frontier lineup: **`gpt-5.6-sol`** (strongest
 `~/.codex/config.toml`:
 
 ```toml
-model = "gpt-5.6-sol"
+model = "gpt-6.1-sol"
 model_reasoning_effort = "xhigh"
 model_provider = "codex-lb"
+
+[features]
+api_key_model_discovery = true
 
 [model_providers.codex-lb]
 name = "openai"  # required — enables remote /responses/compact. Lowercase since Codex 2026-05-23; older "OpenAI" stops resolving gpt-5.5
 base_url = "http://127.0.0.1:2455/backend-api/codex"
+model_catalog_url = "http://127.0.0.1:2455/backend-api/codex/models"
 wire_api = "responses"
 supports_websockets = true
 requires_openai_auth = true # required for codex app
 ```
+
+Codex 0.159 and newer classify a provider's `env_key` or
+`experimental_bearer_token` as API-key authentication. When that provider also
+uses a custom `base_url`, Codex skips model discovery unless
+`api_key_model_discovery` is enabled and `model_catalog_url` is set. Keep both
+settings pointed at codex-lb so the desktop model picker receives newly
+released models such as `gpt-6.1-sol`.
 
 This documented `requires_openai_auth = true` setup uses Codex-backed authentication and does not need an `x-openai-actor-authorization` marker to be eligible for Codex's built-in `$imagegen` tool. Provider configurations that intentionally skip OpenAI login have a different eligibility path; see the [Images compatibility context](https://github.com/Soju06/codex-lb/blob/main/openspec/specs/images-api-compat/context.md#codex-provider-eligibility).
 
@@ -70,6 +81,7 @@ When [API key auth](api-keys.md) is enabled:
 [model_providers.codex-lb]
 name = "openai"
 base_url = "http://127.0.0.1:2455/backend-api/codex"
+model_catalog_url = "http://127.0.0.1:2455/backend-api/codex/models"
 wire_api = "responses"
 env_key = "CODEX_LB_API_KEY"
 supports_websockets = true
