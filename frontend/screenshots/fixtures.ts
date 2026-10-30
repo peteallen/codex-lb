@@ -4,6 +4,7 @@ import {
   createApiKey,
   createDashboardAuthSession,
   createDashboardOverview,
+  createDashboardProjections,
   createDashboardSettings,
   createRequestLogEntry,
   createRequestLogFilterOptions,
@@ -14,6 +15,11 @@ import {
   type RequestLogEntry,
 } from "../src/test/mocks/factories";
 import type { RateLimitResetCreditsSnapshot } from "../src/features/accounts/schemas";
+import {
+  WeeklyCoverageResponseSchema,
+  type DashboardProjections,
+  type WeeklyCoverageResponse,
+} from "../src/features/dashboard/schemas";
 
 // ── Time helpers ──
 
@@ -30,6 +36,290 @@ function trendIso(hoursAgo: number): string {
 function futureIso(days: number): string {
   return new Date(Date.now() + days * 24 * 3600_000).toISOString();
 }
+
+function coverageOffsetIso(hours: number): string {
+  return offsetIso(hours * 60);
+}
+
+const COVERAGE_HORIZON_HOURS = 14 * 24;
+const COVERAGE_HORIZON_AT = coverageOffsetIso(COVERAGE_HORIZON_HOURS);
+
+const readyWeeklyCoverage: WeeklyCoverageResponse = WeeklyCoverageResponseSchema.parse({
+  status: "ready",
+  generatedAt: coverageOffsetIso(0),
+  horizonAt: COVERAGE_HORIZON_AT,
+  paceBasis: "current_window_average",
+  routingStrategy: "reset_drain",
+  warnings: [
+    "sticky_and_model_eligibility_approximation",
+    "routing_allocation_approximation",
+  ],
+  accounts: [
+    {
+      accountId: "coverage_pro_primary",
+      label: "Pro primary",
+      planType: "pro",
+      status: "ready",
+      reason: null,
+      remainingPercent: 32,
+      resetAt: coverageOffsetIso(72),
+      capacityWorkUnits: 10_000,
+      sampleCount: 8,
+      observedDropPercent: 18,
+      quotaPaceStatus: "exhausts_before_reset",
+      usedPercentPerDay: 10.5,
+      projectedExhaustionAt: coverageOffsetIso(42),
+      projectedRemainingAtReset: 0,
+      diagnostics: {
+        discardedIntervalCount: 2,
+        unpricedModels: ["codex-auto-review"],
+      },
+      intervals: [
+        { startAt: coverageOffsetIso(0), endAt: coverageOffsetIso(42), state: "available" },
+        { startAt: coverageOffsetIso(42), endAt: coverageOffsetIso(72), state: "exhausted" },
+        { startAt: coverageOffsetIso(72), endAt: COVERAGE_HORIZON_AT, state: "available" },
+      ],
+    },
+    {
+      accountId: "coverage_pro_max",
+      label: "Pro Max backup",
+      planType: "promax",
+      status: "ready",
+      reason: null,
+      remainingPercent: 71,
+      resetAt: coverageOffsetIso(132),
+      capacityWorkUnits: 26_000,
+      sampleCount: 11,
+      observedDropPercent: 9,
+      quotaPaceStatus: "lasts_until_reset",
+      usedPercentPerDay: 2.2,
+      projectedExhaustionAt: null,
+      projectedRemainingAtReset: 48,
+      diagnostics: {
+        discardedIntervalCount: 0,
+        unpricedModels: [],
+      },
+      intervals: [
+        { startAt: coverageOffsetIso(0), endAt: coverageOffsetIso(42), state: "available" },
+        { startAt: coverageOffsetIso(42), endAt: coverageOffsetIso(132), state: "exhausted" },
+        { startAt: coverageOffsetIso(132), endAt: COVERAGE_HORIZON_AT, state: "available" },
+      ],
+    },
+    {
+      accountId: "coverage_paused",
+      label: "Paused account",
+      planType: "pro",
+      status: "excluded",
+      reason: "paused",
+      remainingPercent: null,
+      resetAt: null,
+      capacityWorkUnits: null,
+      sampleCount: 0,
+      observedDropPercent: 0,
+      quotaPaceStatus: "unavailable",
+      usedPercentPerDay: null,
+      projectedExhaustionAt: null,
+      projectedRemainingAtReset: null,
+      diagnostics: {
+        discardedIntervalCount: 0,
+        unpricedModels: [],
+      },
+      intervals: [],
+    },
+  ],
+  intervals: [
+    { startAt: coverageOffsetIso(0), endAt: coverageOffsetIso(42), state: "available" },
+    { startAt: coverageOffsetIso(42), endAt: coverageOffsetIso(72), state: "exhausted" },
+    { startAt: coverageOffsetIso(72), endAt: COVERAGE_HORIZON_AT, state: "available" },
+  ],
+  minimumReserveHours: 0,
+  minimumReserveAt: coverageOffsetIso(42),
+});
+
+const learningWeeklyCoverage: WeeklyCoverageResponse = WeeklyCoverageResponseSchema.parse({
+  status: "learning",
+  generatedAt: coverageOffsetIso(0),
+  horizonAt: COVERAGE_HORIZON_AT,
+  paceBasis: "current_window_average",
+  routingStrategy: "reset_drain",
+  warnings: ["insufficient_calibration"],
+  accounts: [
+    {
+      accountId: "coverage_learning",
+      label: "Pro account",
+      planType: "pro",
+      status: "learning",
+      reason: "insufficient_calibration",
+      remainingPercent: 64,
+      resetAt: coverageOffsetIso(96),
+      capacityWorkUnits: null,
+      sampleCount: 2,
+      observedDropPercent: 7,
+      quotaPaceStatus: "exhausts_before_reset",
+      usedPercentPerDay: 9.5,
+      projectedExhaustionAt: coverageOffsetIso(72),
+      projectedRemainingAtReset: 0,
+      diagnostics: {
+        discardedIntervalCount: 3,
+        unpricedModels: ["codex-auto-review", "gpt-5.1"],
+      },
+      intervals: [],
+    },
+    readyWeeklyCoverage.accounts[2],
+  ],
+  intervals: [],
+  minimumReserveHours: null,
+  minimumReserveAt: null,
+});
+
+const limitedWeeklyCoverage: WeeklyCoverageResponse = WeeklyCoverageResponseSchema.parse({
+  status: "limited",
+  generatedAt: coverageOffsetIso(0),
+  horizonAt: COVERAGE_HORIZON_AT,
+  paceBasis: "current_window_average",
+  routingStrategy: "reset_drain",
+  warnings: ["incomplete_evidence", "insufficient_calibration"],
+  accounts: [
+    {
+      ...readyWeeklyCoverage.accounts[0],
+      accountId: "coverage_pro_one",
+      label: "Pro one",
+      status: "limited",
+      reason: "incomplete_work_history",
+      remainingPercent: 61,
+      resetAt: coverageOffsetIso(108),
+      quotaPaceStatus: "lasts_until_reset",
+      usedPercentPerDay: 4.8,
+      projectedExhaustionAt: null,
+      projectedRemainingAtReset: 38,
+      diagnostics: {
+        discardedIntervalCount: 1,
+        unpricedModels: [],
+      },
+      intervals: [],
+    },
+    {
+      ...readyWeeklyCoverage.accounts[0],
+      accountId: "coverage_pro_two",
+      label: "Pro two",
+      status: "limited",
+      reason: "insufficient_calibration",
+      remainingPercent: 76,
+      resetAt: coverageOffsetIso(108),
+      quotaPaceStatus: "lasts_until_reset",
+      usedPercentPerDay: 3.1,
+      projectedExhaustionAt: null,
+      projectedRemainingAtReset: 54,
+      diagnostics: {
+        discardedIntervalCount: 0,
+        unpricedModels: [],
+      },
+      intervals: [],
+    },
+    {
+      ...readyWeeklyCoverage.accounts[0],
+      accountId: "coverage_pro_three",
+      label: "Pro three",
+      status: "limited",
+      reason: "stale_usage",
+      remainingPercent: 83,
+      resetAt: coverageOffsetIso(120),
+      quotaPaceStatus: "unavailable",
+      usedPercentPerDay: null,
+      projectedExhaustionAt: null,
+      projectedRemainingAtReset: null,
+      diagnostics: {
+        discardedIntervalCount: 2,
+        unpricedModels: ["codex-auto-review"],
+      },
+      intervals: [],
+    },
+    {
+      ...readyWeeklyCoverage.accounts[0],
+      accountId: "coverage_pro_four",
+      label: "Pro four",
+      status: "limited",
+      reason: "unpriced_models",
+      remainingPercent: 48,
+      resetAt: coverageOffsetIso(84),
+      quotaPaceStatus: "exhausts_before_reset",
+      usedPercentPerDay: 13.2,
+      projectedExhaustionAt: coverageOffsetIso(60),
+      projectedRemainingAtReset: 0,
+      diagnostics: {
+        discardedIntervalCount: 0,
+        unpricedModels: ["codex-auto-review"],
+      },
+      intervals: [],
+    },
+    {
+      ...readyWeeklyCoverage.accounts[1],
+      accountId: "coverage_pro_max_live",
+      label: "Pro Max",
+      status: "limited",
+      reason: "external_or_unexplained_drawdown",
+      remainingPercent: 94,
+      resetAt: coverageOffsetIso(144),
+      quotaPaceStatus: "lasts_until_reset",
+      usedPercentPerDay: 1.1,
+      projectedExhaustionAt: null,
+      projectedRemainingAtReset: 87,
+      diagnostics: {
+        discardedIntervalCount: 0,
+        unpricedModels: [],
+      },
+      intervals: [],
+    },
+  ],
+  intervals: [],
+  minimumReserveHours: null,
+  minimumReserveAt: null,
+});
+
+export const weeklyCoverageReadyProjections: DashboardProjections = createDashboardProjections({
+  weeklyCoverage: readyWeeklyCoverage,
+});
+
+export const weeklyCoverageLearningProjections: DashboardProjections = createDashboardProjections({
+  weeklyCoverage: learningWeeklyCoverage,
+});
+
+export const weeklyCoverageLimitedProjections: DashboardProjections = createDashboardProjections({
+  weeklyCoverage: limitedWeeklyCoverage,
+});
+
+export const weeklyCoverageLegacyProjections: DashboardProjections = createDashboardProjections({
+  weeklyCreditPace: {
+    totalFullCredits: 95_000,
+    totalActualRemainingCredits: 55_000,
+    totalExpectedRemainingCredits: 64_000,
+    actualUsedPercent: 42,
+    scheduledUsedPercent: 32,
+    deltaPercent: 10,
+    scheduleGapCredits: 9_500,
+    smoothedDeltaPercent: 10,
+    smoothedScheduleGapCredits: 9_500,
+    paceGapSmoothingMinutes: 60,
+    overPlanCredits: 9_500,
+    projectedShortfallCredits: 0,
+    pauseForBreakEvenHours: null,
+    paceMultiplier: 1.2,
+    throttleToPercent: 82,
+    reduceByPercent: 18,
+    proAccountEquivalentToCoverOverPlan: 0.2,
+    proAccountsToCoverOverPlan: 1,
+    projectedDepletionHours: 120,
+    projectedMinimumRemainingCredits: 44_000,
+    forecastBurnRateCreditsPerHour: 1_200,
+    scheduledBurnRateCreditsPerHour: 950,
+    status: "danger",
+    accountCount: 7,
+    staleAccountCount: 0,
+    inactiveAccountCount: 0,
+    confidence: "medium",
+  },
+  weeklyCoverage: null,
+});
 
 // ── 7 accounts (6 plus + 1 pro) — based on real W04 proportions ──
 

@@ -14,11 +14,12 @@ import { useDashboardPreferencesStore } from "@/hooks/use-dashboard-preferences"
 
 import { DashboardPage } from "./dashboard-page";
 
-const { accountCardsSpy, accountListSpy, accountSummaryLineSpy, conversationsViewSpy } = vi.hoisted(() => ({
+const { accountCardsSpy, accountListSpy, accountSummaryLineSpy, conversationsViewSpy, weeklyCoverageCardSpy } = vi.hoisted(() => ({
   accountCardsSpy: vi.fn(),
   accountListSpy: vi.fn(),
   accountSummaryLineSpy: vi.fn(),
   conversationsViewSpy: vi.fn(),
+  weeklyCoverageCardSpy: vi.fn(),
 }));
 
 vi.mock("@/features/accounts/hooks/use-accounts", () => ({
@@ -125,6 +126,13 @@ vi.mock("@/features/dashboard/components/weekly-credits-pace-card", () => ({
   WeeklyCreditsPaceCard: () => <div data-testid="weekly-credits-pace-card" />,
 }));
 
+vi.mock("@/features/dashboard/components/weekly-coverage-card", () => ({
+  WeeklyCoverageCard: (props: { coverage: unknown }) => {
+    weeklyCoverageCardSpy(props);
+    return <div data-testid="weekly-coverage-card" />;
+  },
+}));
+
 const useAccountMutationsMock = vi.mocked(useAccountMutations);
 const useDashboardMock = vi.mocked(useDashboard);
 const useDashboardProjectionsMock = vi.mocked(useDashboardProjections);
@@ -157,6 +165,7 @@ describe("DashboardPage", () => {
     accountListSpy.mockReset();
     accountSummaryLineSpy.mockReset();
     conversationsViewSpy.mockReset();
+    weeklyCoverageCardSpy.mockReset();
     useAccountMutationsMock.mockReset();
     useDashboardMock.mockReset();
     useDashboardProjectionsMock.mockReset();
@@ -302,6 +311,43 @@ describe("DashboardPage", () => {
     expect(screen.queryByRole("heading", { name: "5-Hour Credits" })).not.toBeInTheDocument();
     expect(screen.queryByRole("heading", { name: "Weekly Credits" })).not.toBeInTheDocument();
     expect(screen.getByTestId("account-cards")).toBeInTheDocument();
+  });
+
+  it("uses the coverage card when projections include weekly coverage and hides legacy pace", async () => {
+    const overview = mockReadyDashboard();
+    const actual = await vi.importActual<typeof import("@/features/dashboard/utils")>("@/features/dashboard/utils");
+    const pace = actual.buildWeeklyCreditPace([{
+      ...overview.accounts[0],
+      planType: "pro",
+      capacityCreditsSecondary: 100,
+      remainingCreditsSecondary: 80,
+      resetAtSecondary: "2026-10-01T00:00:00Z",
+      windowMinutesSecondary: 10080,
+    }], new Date("2026-09-29T00:00:00Z"));
+    expect(pace).not.toBeNull();
+    const coverage = {
+      status: "learning" as const,
+      generatedAt: "2026-01-01T12:00:00Z",
+      horizonAt: "2026-01-15T12:00:00Z",
+      paceBasis: "current_window_average" as const,
+      routingStrategy: "reset_drain",
+      warnings: ["missing_evidence"],
+      accounts: [],
+      intervals: [],
+      minimumReserveHours: null,
+      minimumReserveAt: null,
+    };
+    buildDashboardViewMock.mockReturnValue({
+      ...actual.buildDashboardView(overview, []),
+      weeklyCreditPace: pace,
+      weeklyCoverage: coverage,
+    });
+
+    renderWithProviders(<DashboardPage />);
+
+    expect(screen.getByTestId("weekly-coverage-card")).toBeInTheDocument();
+    expect(screen.queryByTestId("weekly-credits-pace-card")).not.toBeInTheDocument();
+    expect(weeklyCoverageCardSpy).toHaveBeenCalledWith({ coverage });
   });
 
   it("keeps the page-wide skeleton while overview data is unavailable", () => {

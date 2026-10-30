@@ -22,6 +22,7 @@ import { OverviewTimeframeSelect } from "@/features/dashboard/components/filters
 import { RequestFilters } from "@/features/dashboard/components/filters/request-filters";
 import { RecentRequestsTable } from "@/features/dashboard/components/recent-requests-table";
 import { StatsGrid } from "@/features/dashboard/components/stats-grid";
+import { WeeklyCoverageCard } from "@/features/dashboard/components/weekly-coverage-card";
 import { WeeklyCreditsPaceCard } from "@/features/dashboard/components/weekly-credits-pace-card";
 import { useAuthStore } from "@/features/auth/hooks/use-auth";
 import { useDashboard, useDashboardProjections } from "@/features/dashboard/hooks/use-dashboard";
@@ -412,7 +413,11 @@ export function DashboardPage() {
           <>
             <StatsGrid stats={view.stats} />
 
-          {view.weeklyCreditPace ? <WeeklyCreditsPaceCard pace={view.weeklyCreditPace} /> : null}
+          {view.weeklyCoverage ? (
+            <WeeklyCoverageCard coverage={view.weeklyCoverage} />
+          ) : view.weeklyCreditPace ? (
+            <WeeklyCreditsPaceCard pace={view.weeklyCreditPace} />
+          ) : null}
 
           <section className="space-y-4">
             <div className="flex flex-wrap items-center gap-3">

@@ -1,0 +1,4 @@
+- [x] 1. Implement compact shared timelines, reset markers and one evidence disclosure.
+- [x] 2. Verify ready, limited, stale and excluded semantics and desktop/mobile screenshots.
+- [x] 3. Update main specification/context, validate, deploy UI and verify served assets.
+- [x] 4. Archive the verified change and preserve the working rollback command.

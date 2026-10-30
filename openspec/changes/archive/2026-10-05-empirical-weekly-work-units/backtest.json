@@ -1,0 +1,58 @@
+{
+  "config": {
+    "freshnessHours": 0.08333333333333333,
+    "holdoutDays": 7.0,
+    "lookbackDays": 14.0
+  },
+  "cutoffs": {
+    "calibratedAccountCutoffs": 104,
+    "eligibleAccountCutoffs": 490,
+    "evaluated": 98,
+    "first": "2026-06-22T23:00:00",
+    "insufficientEvidenceCutoffs": 98,
+    "last": "2026-09-28T06:00:00",
+    "learningAccountCutoffs": 183,
+    "limitedAccountCutoffs": 282,
+    "readyAccountCutoffs": 25,
+    "readyPoolCutoffs": 0,
+    "simulatedPoolCutoffs": 0,
+    "stepHours": 24.0,
+    "zeroReadyPoolCutoffs": 76
+  },
+  "limitations": [
+    "Historical account status and plan changes are not retained; current eligible accounts are used as the validation cohort.",
+    "Account attribution is required for work scoring; unmatched or incomplete work is reported as unavailable evidence.",
+    "The metric scores account capacity drawdown, not a guarantee of future routing or provider behavior.",
+    "Only ready estimates are scored; saturation does not measure uncensored drawdown.",
+    "Held-out capacity error is evaluated separately from full-pool interruption timing; the historical request log cannot reproduce sticky-session allocation exactly.",
+    "Only seven-day quota observations are included; five-hour limits and purchased credits are excluded."
+  ],
+  "mode": "read_only_sqlite_transaction",
+  "schemaVersion": 1,
+  "scope": {
+    "eligibleAccountCount": 5,
+    "historyEnd": "2026-10-05T06:22:11.578856",
+    "historyStart": "2026-06-08T22:48:40.278243",
+    "planCounts": {
+      "pro": 4,
+      "promax": 1
+    },
+    "statusCounts": {
+      "active": 5
+    },
+    "weeklySampleCount": 439742,
+    "workBucketCount": 19068
+  },
+  "validation": {
+    "candidateIntervals": 74,
+    "coveragePercent": 58.11,
+    "incompleteIntervals": 30,
+    "meanAbsoluteErrorPercentagePoints": 1.349,
+    "medianAbsoluteErrorPercentagePoints": 0.945,
+    "metric": "absolute percentage-point error for held-out quota drawdown",
+    "p95AbsoluteErrorPercentagePoints": 5.401,
+    "scoredIntervals": 43,
+    "status": "available",
+    "unexplainedIntervals": 1
+  }
+}

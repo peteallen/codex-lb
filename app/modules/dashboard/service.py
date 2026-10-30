@@ -9,9 +9,10 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from app.core import usage as usage_core
 from app.core.config.settings import get_settings
 from app.core.crypto import TokenEncryptor
+from app.core.plan_types import is_pro_family_plan
 from app.core.usage.types import BucketModelAggregate, UsageWindowRow
 from app.core.utils.time import utcnow
-from app.db.models import UsageHistory
+from app.db.models import AccountStatus, UsageHistory
 from app.modules.accounts.mappers import build_account_summaries
 from app.modules.dashboard.builders import (
     DashboardOverviewTimeframeConfig,
@@ -19,6 +20,7 @@ from app.modules.dashboard.builders import (
     build_overview_timeframe,
     resolve_overview_timeframe,
 )
+from app.modules.dashboard.coverage_types import WeeklyCoverageAccountInput, WeeklyQuotaSample
 from app.modules.dashboard.repository import DashboardRepository
 from app.modules.dashboard.schemas import (
     DashboardMetricsComparison,
@@ -29,6 +31,7 @@ from app.modules.dashboard.schemas import (
     DashboardUsageWindows,
     DepletionResponse,
 )
+from app.modules.dashboard.weekly_coverage import WEEKLY_WINDOW_MINUTES, build_weekly_coverage
 from app.modules.dashboard.weekly_pace import build_weekly_credit_pace
 from app.modules.usage.builders import (
     align_bucket_window_start,
@@ -43,6 +46,7 @@ from app.modules.usage.depletion_service import (
     prune_depletion_cache,
 )
 from app.modules.usage.mappers import usage_history_to_window_row
+from app.modules.usage.repository import UsageHistorySnapshot
 
 
 def _parse_weekly_pace_working_days(value: str) -> set[int]:
@@ -266,10 +270,68 @@ class DashboardService:
             working_days=_parse_weekly_pace_working_days(dashboard_settings.weekly_pace_working_days),
             smoothing_window_minutes=dashboard_settings.weekly_pace_smoothing_minutes,
         )
+        coverage_ids = [
+            account.id
+            for account in accounts
+            if is_pro_family_plan(account.plan_type)
+            and account.status in (AccountStatus.ACTIVE, AccountStatus.RATE_LIMITED, AccountStatus.QUOTA_EXCEEDED)
+        ]
+        coverage_since = now - timedelta(days=14)
+        # Coverage needs a preceding window to corroborate rolling capacity;
+        # depletion retains its existing current-window reads independently.
+        coverage_primary = await self._repo.bulk_usage_history_since(coverage_ids, "primary", coverage_since)
+        coverage_secondary = await self._repo.bulk_usage_history_since(coverage_ids, "secondary", coverage_since)
+        work_history = await self._repo.coverage_work_history(coverage_ids, coverage_since, now)
+        summaries_by_id = {summary.account_id: summary for summary in account_summaries}
+        coverage_accounts = [
+            WeeklyCoverageAccountInput(
+                account_id=account.id,
+                label=summaries_by_id[account.id].display_name,
+                plan_type=account.plan_type,
+                status=account.status.value,
+                routing_policy=account.routing_policy,
+                weekly_unavailable_reason=(
+                    "weekly_window_superseded"
+                    if summaries_by_id[account.id].window_minutes_monthly is not None
+                    else None
+                ),
+                quota_history=tuple(
+                    WeeklyQuotaSample(
+                        recorded_at=row.recorded_at,
+                        used_percent=row.used_percent,
+                        reset_at=(
+                            datetime.fromtimestamp(row.reset_at, timezone.utc).replace(tzinfo=None)
+                            if row.reset_at is not None
+                            else None
+                        ),
+                        window_minutes=row.window_minutes,
+                    )
+                    for row in _weekly_coverage_history(coverage_primary, coverage_secondary, account.id)
+                ),
+                work_buckets=tuple(work_history.get(account.id, [])),
+            )
+            for account in accounts
+        ]
+        weekly_coverage = build_weekly_coverage(
+            accounts=coverage_accounts,
+            now=now,
+            routing_strategy=dashboard_settings.routing_strategy,
+            freshness_seconds=max(300, settings.usage_refresh_interval_seconds * 3),
+            prefer_earlier_reset_accounts=dashboard_settings.prefer_earlier_reset_accounts,
+            prefer_earlier_reset_window=dashboard_settings.prefer_earlier_reset_window,
+            single_account_id=(
+                dashboard_settings.single_account_id
+                if dashboard_settings.routing_strategy == "single_account"
+                else None
+            ),
+            relative_availability_power=dashboard_settings.relative_availability_power,
+            relative_availability_top_k=dashboard_settings.relative_availability_top_k,
+        )
         return DashboardProjectionsResponse(
             depletion_primary=pri_depletion,
             depletion_secondary=sec_depletion,
             weekly_credit_pace=weekly_credit_pace,
+            weekly_coverage=weekly_coverage,
         )
 
 
@@ -574,6 +636,28 @@ async def _load_projection_histories(
                 secondary_history[account_id] = rows
 
     return primary_history, secondary_history
+
+
+def _weekly_coverage_history(
+    primary_history: dict[str, list[UsageHistorySnapshot]],
+    secondary_history: dict[str, list[UsageHistorySnapshot]],
+    account_id: str,
+) -> list[UsageHistorySnapshot]:
+    """Select weekly samples by duration, independent of their storage slot.
+
+    The updater has historically placed a seven-day response in either the
+    primary or secondary slot. The caller separately applies current normalized
+    quota eligibility so superseded weekly history cannot restore capacity.
+    """
+
+    by_recorded_at: dict[datetime, UsageHistorySnapshot] = {}
+    for row in (*primary_history.get(account_id, []), *secondary_history.get(account_id, [])):
+        if row.window_minutes != WEEKLY_WINDOW_MINUTES:
+            continue
+        current = by_recorded_at.get(row.recorded_at)
+        if current is None or row.id > current.id:
+            by_recorded_at[row.recorded_at] = row
+    return [by_recorded_at[key] for key in sorted(by_recorded_at)]
 
 
 def _build_depletion_by_window(

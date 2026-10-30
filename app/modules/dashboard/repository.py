@@ -15,6 +15,8 @@ from app.db.models import (
     UsageHistory,
 )
 from app.modules.accounts.repository import AccountsRepository
+from app.modules.dashboard.coverage_repository import CoverageRepository
+from app.modules.dashboard.coverage_types import CoverageWorkBucket
 from app.modules.limit_warmup.repository import LimitWarmupRepository
 from app.modules.request_logs.repository import RequestLogsRepository
 from app.modules.settings.repository import SettingsRepository
@@ -29,6 +31,12 @@ class DashboardRepository:
         self._additional_usage_repo = AdditionalUsageRepository(session)
         self._limit_warmup_repo = LimitWarmupRepository(session)
         self._settings_repo = SettingsRepository(session)
+        self._coverage_repo = CoverageRepository(session)
+
+    async def coverage_work_history(
+        self, account_ids: list[str], since: datetime, until: datetime
+    ) -> dict[str, list[CoverageWorkBucket]]:
+        return await self._coverage_repo.work_history(account_ids, since, until)
 
     async def list_accounts(self) -> list[Account]:
         return await self._accounts_repo.list_accounts()
